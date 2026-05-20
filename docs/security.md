@@ -7,6 +7,7 @@ Mobailmux is a bridge from Mattermost chat messages to a local CLI AI agent. Tre
 - Run Mattermost behind a private network boundary such as a VPN or trusted LAN.
 - Use a dedicated bot token for Mobailmux.
 - Restrict execution to one Mattermost user with `MOBAILMUX_OWNER_USERNAME` or `MOBAILMUX_OWNER_USER_ID`.
+- For the built-in web UI, set a strong `MOBAILMUX_WEB_PASSWORD` and keep the listener on loopback unless it is behind a private access layer.
 - Keep `.env` out of git.
 - Use project-specific workdirs instead of defaulting to your entire home directory.
 - Keep each slot on a separate project or branch when jobs can edit files.

@@ -1,21 +1,21 @@
 # Mobailmux
 
-Mobailmux turns Mattermost channels into mobile control slots for CLI AI agents.
+Mobailmux turns a browser UI or Mattermost channels into mobile control slots for CLI AI agents.
 
-Each slot is a Mattermost channel. Send a message, and Mobailmux runs a Codex job locally, streams command progress back into the channel, and keeps that channel's agent chat until you reset it with `fresh`.
+Each slot is an independent agent lane. Send a message, and Mobailmux runs a Codex job locally, streams command progress back to the UI, and keeps that slot's agent chat until you reset it with `fresh`.
 
 ```text
-Mattermost mobile app
-  -> private Mattermost server
-  -> Mobailmux bot
+Browser or Mattermost
+  -> Mobailmux
   -> codex exec --json
   -> local workspace
 ```
 
-Mobailmux is useful when you want to kick off several independent AI coding jobs from iOS, Android, or any Mattermost client without juggling SSH sessions.
+Mobailmux is useful when you want to kick off several independent AI coding jobs from iOS, Android, desktop, or a small server without juggling SSH sessions.
 
 ## Features
 
+- built-in lightweight web UI
 - Mattermost channel per agent slot
 - multiple slots running in parallel
 - per-channel continuing Codex chat
@@ -24,20 +24,48 @@ Mobailmux is useful when you want to kick off several independent AI coding jobs
 - command start/exit progress from `codex exec --json`
 - optional explicit progress notes through `aiprogress 'message'`
 - owner allowlist so only one Mattermost user can trigger jobs
-- no public callback URL required
+- no public callback URL required for either frontend
 
 ## Status
 
-The current driver is Codex. The code is structured so other CLI agents can be added later, but Codex is the first supported runtime.
+The current driver is Codex. The built-in web UI and Mattermost adapter use the same slot model. The code is structured so other CLI agents can be added later, but Codex is the first supported runtime.
 
 ## Platform Support
 
-- Mobile client: iOS, Android, desktop, or web Mattermost clients.
+- Mobile client: any modern browser, plus iOS, Android, desktop, or web Mattermost clients.
 - Host runner: intended for Linux, macOS, and Windows wherever Python 3.11+ and the configured CLI agent are available.
 - Quickstart scripts: Bash-based, so they target Linux, macOS, or WSL. Native Windows can still run the Python package, but PowerShell bootstrap scripts are not included yet.
 - Background service: the included `scripts/install-user-service.sh` and `systemd/mobailmux.service.example` are Linux/systemd-specific. macOS launchd and Windows service examples are not included yet.
 
 ## Quick Start
+
+### Lightweight Web UI
+
+Prerequisites:
+
+- Python 3.11+
+- Codex CLI installed and logged in with `codex login`
+
+Create config, set a password, install, and run:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+mobailmux web
+```
+
+Open `http://127.0.0.1:8765`, sign in with `MOBAILMUX_WEB_PASSWORD`, choose a slot, and send:
+
+```text
+help
+```
+
+For phone access, put the web UI behind a private VPN, private reverse proxy, or trusted LAN endpoint. Keep the default `127.0.0.1` binding unless you intentionally expose it.
+
+### Mattermost
 
 Prerequisites:
 

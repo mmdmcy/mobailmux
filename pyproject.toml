@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mobailmux"
 version = "0.1.0"
-description = "Mattermost channels as mobile control slots for CLI AI agents."
+description = "Mobile control slots for CLI AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.scripts]
-mobailmux = "mobailmux.app:main"
+mobailmux = "mobailmux.cli:main"
+mobailmux-web = "mobailmux.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
