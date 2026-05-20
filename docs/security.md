@@ -40,3 +40,13 @@ Never commit:
 - private hostnames, private IPs, or personal restore docs
 
 Before publishing, run a secret scanner such as `gitleaks` or `trufflehog`.
+
+## Commit Guardrails
+
+Maintainers should install the repository hook before committing:
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+The hook blocks staged `.env` files, virtualenvs, generated state, known local identifiers, and runs `gitleaks protect --staged` before Git accepts the commit.

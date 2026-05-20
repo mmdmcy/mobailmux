@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+blocked_paths='(^|/)(\.env($|\.)|\.venv/|venv/|__pycache__/|state/|.*\.egg-info/|.*\.pyc$|.*\.sqlite.*$|.*\.log$)'
+blocked_private_content='(/home/[^[:space:]]+|/Users/[^[:space:]]+|/opt/[^[:space:]]+|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|gho_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+)'
+
+mapfile -t staged_paths < <(git diff --cached --name-only --diff-filter=ACMR)
+
+bad_paths=()
+for path in "${staged_paths[@]}"; do
+  if [[ "$path" == ".env.example" ]]; then
+    continue
+  fi
+  if [[ "$path" =~ $blocked_paths ]]; then
+    bad_paths+=("$path")
+  fi
+done
+
+if (( ${#bad_paths[@]} )); then
+  printf 'Blocked commit: private/generated runtime files are staged:\n' >&2
+  printf '  %s\n' "${bad_paths[@]}" >&2
+  printf 'Unstage them and keep them ignored.\n' >&2
+  exit 1
+fi
+
+if bad_content="$(git grep --cached -l -I -E "$blocked_private_content" -- . ':!.env.example' 2>/dev/null || true)"; [[ -n "$bad_content" ]]; then
+  printf 'Blocked commit: staged content contains local/private identifiers:\n' >&2
+  printf '%s\n' "$bad_content" | sed 's/^/  /' >&2
+  exit 1
+fi
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  if [[ "${MOBAILMUX_SKIP_GITLEAKS:-}" == "1" ]]; then
+    printf 'warning: gitleaks not found; skipping staged secret scan because MOBAILMUX_SKIP_GITLEAKS=1\n' >&2
+  else
+    printf 'Blocked commit: gitleaks is not installed, so staged secrets cannot be scanned.\n' >&2
+    printf 'Install gitleaks or rerun with MOBAILMUX_SKIP_GITLEAKS=1 if you have manually reviewed the diff.\n' >&2
+    exit 1
+  fi
+else
+  gitleaks protect --staged --source . --no-banner --redact
+fi
