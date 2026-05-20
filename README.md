@@ -5,14 +5,14 @@ Mobailmux turns Mattermost channels into mobile control slots for CLI AI agents.
 Each slot is a Mattermost channel. Send a message, and Mobailmux runs a Codex job locally, streams command progress back into the channel, and keeps that channel's agent chat until you reset it with `fresh`.
 
 ```text
-iPhone / Mattermost
+Mattermost mobile app
   -> private Mattermost server
   -> Mobailmux bot
   -> codex exec --json
   -> local workspace
 ```
 
-Mobailmux is useful when you want to kick off several independent AI coding jobs from a phone without juggling SSH sessions.
+Mobailmux is useful when you want to kick off several independent AI coding jobs from iOS, Android, or any Mattermost client without juggling SSH sessions.
 
 ## Features
 
@@ -169,4 +169,4 @@ The included Compose file binds Mattermost to `127.0.0.1` by default. For phone 
 
 ## Name
 
-Mobailmux is short for mobile AI multiplexer.
+Mobailmux is short for mobile AI multiplexer. A multiplexer is a tool that routes several independent inputs through one control surface; here, Mattermost channels map to separate local AI agent slots.
