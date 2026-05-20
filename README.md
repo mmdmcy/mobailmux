@@ -183,6 +183,15 @@ MOBAILMUX_SLOT_ONE_WORKDIR=~/code/app
 MOBAILMUX_SLOT_TWO_WORKDIR=~/code/site
 ```
 
+Progress behavior:
+
+```text
+MOBAILMUX_STATUS_SECONDS=60
+MOBAILMUX_MAX_PROGRESS_POSTS=0
+```
+
+`MOBAILMUX_STATUS_SECONDS` controls automatic "still running" updates. `MOBAILMUX_MAX_PROGRESS_POSTS=0` means progress posts are uncapped; set a positive number only if a chat surface gets too noisy.
+
 ## Codex
 
 Mobailmux uses:

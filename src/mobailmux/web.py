@@ -95,7 +95,7 @@ class MobailmuxWeb:
         self.agent_home = cfg("MOBAILMUX_AGENT_HOME")
         self.path_extra = cfg("MOBAILMUX_PATH_EXTRA", "") or ""
         self.status_seconds = int(cfg("MOBAILMUX_STATUS_SECONDS", "60"))
-        self.max_progress_posts = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "80"))
+        self.max_progress_posts = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "0"))
         self.output_snippet_chars = int(cfg("MOBAILMUX_OUTPUT_SNIPPET_CHARS", "1200"))
         self.max_queued_per_slot = int(cfg("MOBAILMUX_MAX_QUEUED_PER_SLOT", "5"))
         self.max_ls_entries = int(cfg("MOBAILMUX_MAX_LS_ENTRIES", "120"))
@@ -521,7 +521,7 @@ class MobailmuxWeb:
             return True
         if lower == "stop":
             if self.kill_worker(slot):
-                self.append_message(slot, "assistant", f"Stopped {slot}.")
+                self.append_message(slot, "assistant", f"Stop requested for {slot}.")
             else:
                 self.append_message(slot, "assistant", f"{slot} is not running.")
             return True
@@ -567,7 +567,7 @@ class MobailmuxWeb:
 
     def progress_post(self, slot: str, counter: dict, message: str) -> None:
         with counter["lock"]:
-            if counter["count"] >= self.max_progress_posts:
+            if self.max_progress_posts > 0 and counter["count"] >= self.max_progress_posts:
                 if not counter.get("suppressed"):
                     self.append_message(slot, "assistant", "Progress post limit reached; suppressing further command updates until completion.")
                     counter["suppressed"] = True
@@ -671,9 +671,11 @@ class MobailmuxWeb:
                 f"You are running from Mobailmux web slot {slot}.\n"
                 f"Current working folder: {workdir}\n"
                 "The web UI already receives automatic command start/exit progress.\n"
-                "For non-trivial requests, send a brief progress note early with: aiprogress 'message'. "
-                "When you finish exploration, find an important issue, start a risky change, or begin verification, "
-                "send a short human-readable progress note by running: aiprogress 'message'. Use this sparingly.\n"
+                "Use aiprogress for human milestone notes, not for every command.\n"
+                "For non-trivial requests, send an early note with the goal and current investigation path. "
+                "For longer work, send another note when exploration finishes, when an important finding changes direction, "
+                "before risky edits, before verification, or after a couple of minutes without a human-readable update. "
+                "Keep notes short and factual.\n"
                 "Keep the final reply concise and include what changed plus any verification run.\n\n"
                 f"User request:\n{message}"
             )
@@ -785,10 +787,10 @@ class MobailmuxWeb:
             if input_tokens is not None or output_tokens is not None:
                 usage_text = f"\n\nUsage total across tool calls: input `{input_tokens}`, cached `{cached_input_tokens}`, output `{output_tokens}`"
         returncode = proc.returncode if proc is not None else 1
-        if returncode == 0:
-            self.append_message(slot, "assistant", f"{slot} done in {elapsed}s.{usage_text}\n\n{final or '(Agent completed without a final message.)'}")
-        elif stop_requested:
+        if stop_requested:
             self.append_message(slot, "assistant", f"{slot} stopped after {elapsed}s.")
+        elif returncode == 0:
+            self.append_message(slot, "assistant", f"{slot} done in {elapsed}s.{usage_text}\n\n{final or '(Agent completed without a final message.)'}")
         else:
             tail = "\n".join(log_tail[-30:]).strip()
             self.append_message(slot, "assistant", f"{slot} failed with exit code {returncode} after {elapsed}s.\n\n```text\n{tail[-3000:]}\n```")

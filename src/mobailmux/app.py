@@ -78,7 +78,7 @@ OWNER_USER_ID = cfg("MOBAILMUX_OWNER_USER_ID")
 BOT_USERNAME = cfg("MOBAILMUX_BOT_USERNAME", "mobailmux")
 POLL_SECONDS = float(cfg("MOBAILMUX_POLL_SECONDS", "2"))
 STATUS_SECONDS = int(cfg("MOBAILMUX_STATUS_SECONDS", "60"))
-MAX_PROGRESS_POSTS = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "80"))
+MAX_PROGRESS_POSTS = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "0"))
 OUTPUT_SNIPPET_CHARS = int(cfg("MOBAILMUX_OUTPUT_SNIPPET_CHARS", "1200"))
 MAX_QUEUED_PER_SLOT = int(cfg("MOBAILMUX_MAX_QUEUED_PER_SLOT", "5"))
 MAX_LS_ENTRIES = int(cfg("MOBAILMUX_MAX_LS_ENTRIES", "120"))
@@ -553,7 +553,7 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         return True
     if lower == "stop":
         if kill_worker(slot):
-            post(channel, f"Stopped {slot}.")
+            post(channel, f"Stop requested for {slot}.")
         else:
             post(channel, f"{slot} is not running.")
         return True
@@ -576,7 +576,7 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
 
 def progress_post(slot: str, channel: str, counter: dict, message: str) -> None:
     with counter["lock"]:
-        if counter["count"] >= MAX_PROGRESS_POSTS:
+        if MAX_PROGRESS_POSTS > 0 and counter["count"] >= MAX_PROGRESS_POSTS:
             if not counter.get("suppressed"):
                 post_slot(slot, channel, "Progress post limit reached; suppressing further command updates until completion.")
                 counter["suppressed"] = True
@@ -701,9 +701,11 @@ def run_codex(slot: str, channel: str, message: str) -> None:
             f"You are running from Mattermost slot {slot}.\n"
             f"Current working folder: {workdir}\n"
             "Mattermost already receives automatic command start/exit progress.\n"
-            "For non-trivial requests, send a brief progress note early with: aiprogress 'message'. "
-            "When you finish exploration, find an important issue, start a risky change, or begin verification, "
-            "send a short human-readable progress note by running: aiprogress 'message'. Use this sparingly.\n"
+            "Use aiprogress for human milestone notes, not for every command.\n"
+            "For non-trivial requests, send an early note with the goal and current investigation path. "
+            "For longer work, send another note when exploration finishes, when an important finding changes direction, "
+            "before risky edits, before verification, or after a couple of minutes without a human-readable update. "
+            "Keep notes short and factual.\n"
             "Keep the final reply concise and include what changed plus any verification run.\n\n"
             f"User request:\n{message}"
         )
@@ -818,10 +820,10 @@ def run_codex(slot: str, channel: str, message: str) -> None:
             usage_text = f"\n\nUsage total across tool calls: input `{input_tokens}`, cached `{cached_input_tokens}`, output `{output_tokens}`"
 
     returncode = proc.returncode if proc is not None else 1
-    if returncode == 0:
-        post_slot(slot, channel, f"{slot} done in {elapsed}s.{usage_text}\n\n{final or '(Agent completed without a final message.)'}")
-    elif stop_requested:
+    if stop_requested:
         post_slot(slot, channel, f"{slot} stopped after {elapsed}s.")
+    elif returncode == 0:
+        post_slot(slot, channel, f"{slot} done in {elapsed}s.{usage_text}\n\n{final or '(Agent completed without a final message.)'}")
     else:
         tail = "\n".join(log_tail[-30:]).strip()
         post_slot(slot, channel, f"{slot} failed with exit code {returncode} after {elapsed}s.\n\n```text\n{tail[-3000:]}\n```")

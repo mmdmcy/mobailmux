@@ -62,6 +62,18 @@ stop
 
 Any other message starts or continues that slot's Codex chat.
 
+## Progress
+
+The web UI shows command start/exit events automatically. Agents can also send human-readable milestone notes with `aiprogress 'message'`.
+
+By default progress posts are uncapped:
+
+```text
+MOBAILMUX_MAX_PROGRESS_POSTS=0
+```
+
+Set a positive value only when you want to cap noisy chat surfaces.
+
 ## Storage
 
 Runtime files are stored under `MOBAILMUX_STATE_DIR`:
