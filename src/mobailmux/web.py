@@ -897,7 +897,10 @@ INDEX_HTML = r"""<!doctype html>
       --overlay: rgba(17, 16, 15, .92);
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
+    html, body {
+      height: 100%;
+      overflow: hidden;
+    }
     body {
       margin: 0;
       background: var(--bg);
@@ -927,9 +930,12 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--active-bg);
     }
     .app {
-      min-height: 100%;
+      height: 100vh;
+      height: 100dvh;
+      min-height: 0;
       display: grid;
-      grid-template-rows: auto auto 1fr auto;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      overflow: hidden;
     }
     header {
       display: flex;
@@ -975,6 +981,8 @@ INDEX_HTML = r"""<!doctype html>
     .messages {
       min-height: 0;
       overflow-y: auto;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
       padding: 14px;
       display: flex;
       flex-direction: column;
@@ -1064,7 +1072,7 @@ INDEX_HTML = r"""<!doctype html>
     @media (min-width: 900px) {
       .app {
         grid-template-columns: 238px 1fr;
-        grid-template-rows: auto 1fr auto;
+        grid-template-rows: auto minmax(0, 1fr) auto;
       }
       header { grid-column: 1 / 3; }
       .slots {
