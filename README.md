@@ -30,12 +30,20 @@ Mobailmux is useful when you want to kick off several independent AI coding jobs
 
 The current driver is Codex. The code is structured so other CLI agents can be added later, but Codex is the first supported runtime.
 
+## Platform Support
+
+- Mobile client: iOS, Android, desktop, or web Mattermost clients.
+- Host runner: intended for Linux, macOS, and Windows wherever Python 3.11+ and the configured CLI agent are available.
+- Quickstart scripts: Bash-based, so they target Linux, macOS, or WSL. Native Windows can still run the Python package, but PowerShell bootstrap scripts are not included yet.
+- Background service: the included `scripts/install-user-service.sh` and `systemd/mobailmux.service.example` are Linux/systemd-specific. macOS launchd and Windows service examples are not included yet.
+
 ## Quick Start
 
 Prerequisites:
 
 - Docker with Docker Compose v2
 - Python 3.11+
+- Bash, `curl`, and `jq` for the included quickstart scripts
 - Codex CLI installed and logged in with `codex login`
 
 Start a local Mattermost, create an admin user, create the bot, and create the slot channels:

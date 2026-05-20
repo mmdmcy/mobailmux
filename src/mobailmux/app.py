@@ -86,7 +86,8 @@ STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_WORKDIR = expand_path(cfg("MOBAILMUX_DEFAULT_WORKDIR", "~") or "~")
 
 CODEX_BIN = cfg("MOBAILMUX_CODEX_BIN", "codex") or "codex"
-CODEX_ARGS = shlex.split(cfg("MOBAILMUX_CODEX_ARGS", "") or "")
+IS_WINDOWS = os.name == "nt"
+CODEX_ARGS = shlex.split(cfg("MOBAILMUX_CODEX_ARGS", "") or "", posix=not IS_WINDOWS)
 AGENT_HOME = cfg("MOBAILMUX_AGENT_HOME")
 PATH_EXTRA = cfg("MOBAILMUX_PATH_EXTRA", "") or ""
 
@@ -313,20 +314,40 @@ def kill_worker(slot: str) -> bool:
     if not proc or proc.poll() is not None:
         return False
     info["stop_requested"] = True
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    except Exception:
-        proc.terminate()
+    terminate_process(proc, force=False)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
+        terminate_process(proc, force=True)
     return True
+
+
+def terminate_process(proc: subprocess.Popen, *, force: bool) -> None:
+    if IS_WINDOWS:
+        if force:
+            proc.kill()
+            return
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception:
+            proc.terminate()
+        return
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+def process_start_options() -> dict:
+    if IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
 
 
 def help_text(slot: str) -> str:
@@ -517,12 +538,16 @@ def command_progress(slot: str, channel: str, event: dict, counter: dict) -> Non
 
 
 def make_progress_helper(temp_dir: Path, progress_file: Path) -> None:
-    helper = temp_dir / "aiprogress"
-    helper.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(progress_file))}\n"
-    )
+    if IS_WINDOWS:
+        helper = temp_dir / "aiprogress.cmd"
+        helper.write_text(f"@echo off\r\n>>\"{progress_file}\" echo %*\r\n")
+    else:
+        helper = temp_dir / "aiprogress"
+        helper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(progress_file))}\n"
+        )
     helper.chmod(0o700)
     progress_file.touch()
 
@@ -597,7 +622,7 @@ def run_codex(slot: str, channel: str, message: str) -> None:
         if PATH_EXTRA:
             path_parts.append(PATH_EXTRA)
         path_parts.append(base_path)
-        env["PATH"] = ":".join(path_parts)
+        env["PATH"] = os.pathsep.join(path_parts)
 
         prompt = (
             f"You are running from Mattermost slot {slot}.\n"
@@ -650,7 +675,7 @@ def run_codex(slot: str, channel: str, message: str) -> None:
             stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            start_new_session=True,
+            **process_start_options(),
         )
         workers[slot] = {"proc": proc, "started": started, "channel": channel, "current_command": None}
         threading.Thread(target=status_watcher, args=(slot, channel, started, done), daemon=True).start()
