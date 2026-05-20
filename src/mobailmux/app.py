@@ -189,6 +189,11 @@ def record_history(slot: str, message: str) -> None:
         del entries[:-60]
 
 
+def clear_history(slot: str) -> None:
+    with history_lock:
+        history[slot] = []
+
+
 def post_slot(slot: str, channel_id: str, message: str) -> None:
     record_history(slot, message)
     post(channel_id, message)
@@ -425,7 +430,7 @@ def help_text(slot: str) -> str:
         "- `pwd` shows the current folder\n"
         "- `ls [path]` lists files without starting an agent job\n"
         "- `cd /path/to/project` sets the folder for future jobs in this channel\n"
-        "- `fresh` resets this channel's agent chat\n"
+        "- `fresh` resets this channel's agent chat and Mobailmux logs\n"
         "- `status` shows whether this slot is busy\n"
         "- `stop` cancels the active job in this slot\n"
         "- any other message continues this channel's agent chat in the current folder\n"
@@ -522,13 +527,14 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         stopped = kill_worker(slot)
         cleared = clear_queued_requests(slot)
         clear_session(slot)
+        clear_history(slot)
         extra = []
         if stopped:
             extra.append("stopped the current job")
         if cleared:
             extra.append(f"cleared {cleared} queued request(s)")
         suffix = f" ({', '.join(extra)})." if extra else "."
-        post(channel, f"{slot} chat reset{suffix} Your next message starts a new agent chat.")
+        post_slot(slot, channel, f"{slot} chat reset{suffix} Previous Mobailmux logs for this slot were cleared. Your next message starts a new agent chat.")
         return True
     if lower == "status":
         session_info = current_session(slot)

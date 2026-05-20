@@ -63,7 +63,7 @@ status
 stop
 ```
 
-Any other message continues that channel's agent chat. `fresh` resets the chat for that channel.
+Any other message continues that channel's agent chat. `fresh` resets the chat for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
 
 Advanced commands:
 

@@ -62,6 +62,8 @@ stop
 
 Any other message starts or continues that slot's Codex chat.
 
+`fresh` also clears the visible transcript for that slot, so long-running slots do not keep growing forever.
+
 ## Progress
 
 The web UI shows command start/exit events automatically. Agents can also send human-readable milestone notes with `aiprogress 'message'`.

@@ -19,7 +19,7 @@ Mobailmux is useful when you want to kick off several independent AI coding jobs
 - Mattermost channel per agent slot
 - multiple slots running in parallel
 - per-channel continuing Codex chat
-- `fresh` reset command
+- `fresh` reset command that starts a new agent chat and clears local slot history
 - `stop`, `status`, `pwd`, `ls`, and `cd` controls
 - command start/exit progress from `codex exec --json`
 - optional explicit progress notes through `aiprogress 'message'`
@@ -146,6 +146,8 @@ stop
 ```
 
 Any other message continues that channel's agent chat in the current folder.
+
+`fresh` starts a new Codex thread for that slot. In the web UI it also clears the visible transcript for that slot. In Mattermost it clears Mobailmux's local `logs` history, but it does not delete existing Mattermost channel posts.
 
 Advanced commands:
 

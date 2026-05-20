@@ -161,6 +161,7 @@ class MobailmuxWeb:
         return {
             "initialized_at": int(time.time() * 1000),
             "last_seen": {},
+            "message_resets": {},
             "sessions": {},
             "workdirs": {slot: config.default_workdir for slot, config in self.slots.items()},
         }
@@ -184,6 +185,21 @@ class MobailmuxWeb:
         with self.event_cond:
             self.event_cond.notify_all()
         return payload
+
+    def clear_slot_messages(self, slot: str) -> None:
+        now = int(time.time() * 1000)
+        with self.db_lock:
+            with self.connect_db() as db:
+                db.execute("delete from messages where slot = ?", (slot,))
+        with self.state_lock:
+            self.state.setdefault("message_resets", {})[slot] = now
+            self.save_state()
+        with self.event_cond:
+            self.event_cond.notify_all()
+
+    def message_resets(self) -> dict:
+        with self.state_lock:
+            return dict(self.state.setdefault("message_resets", {}))
 
     def messages_since(self, after: int = 0, limit: int = 250) -> list[dict]:
         with self.db_lock:
@@ -386,7 +402,7 @@ class MobailmuxWeb:
             "- `pwd` shows the current folder\n"
             "- `ls [path]` lists files without starting an agent job\n"
             "- `cd /path/to/project` sets the folder for future jobs in this slot\n"
-            "- `fresh` resets this slot's agent chat\n"
+            "- `fresh` resets this slot's agent chat and clears its visible transcript\n"
             "- `status` shows whether this slot is busy\n"
             "- `stop` cancels the active job in this slot\n"
             "- any other message continues this slot's agent chat in the current folder\n"
@@ -493,13 +509,14 @@ class MobailmuxWeb:
             stopped = self.kill_worker(slot)
             cleared = self.clear_queued_requests(slot)
             self.clear_session(slot)
+            self.clear_slot_messages(slot)
             extra = []
             if stopped:
                 extra.append("stopped the current job")
             if cleared:
                 extra.append(f"cleared {cleared} queued request(s)")
             suffix = f" ({', '.join(extra)})." if extra else "."
-            self.append_message(slot, "assistant", f"{slot} chat reset{suffix} Your next message starts a new agent chat.")
+            self.append_message(slot, "assistant", f"{slot} chat reset{suffix} Previous messages for this slot were cleared. Your next message starts a new agent chat.")
             return True
         if lower == "status":
             item = self.slot_status(slot)
@@ -812,6 +829,7 @@ class MobailmuxWeb:
         return {
             "slots": [self.slot_status(slot) for slot in self.slots],
             "messages": self.recent_messages(),
+            "message_resets": self.message_resets(),
         }
 
 
@@ -1122,7 +1140,7 @@ INDEX_HTML = r"""<!doctype html>
     </form>
   </div>
   <script>
-    const state = { slots: [], messages: [], activeSlot: null, seen: new Set(), lastSeq: 0, events: null };
+    const state = { slots: [], messages: [], activeSlot: null, seen: new Set(), lastSeq: 0, events: null, messageResets: {} };
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const timeText = (ms) => new Date(ms).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
@@ -1192,9 +1210,23 @@ INDEX_HTML = r"""<!doctype html>
       state.messages.sort((a, b) => a.seq - b.seq);
     }
 
+    function rebuildSeen() {
+      state.seen = new Set(state.messages.map(message => message.seq));
+    }
+
+    function applyMessageResets(resets = {}) {
+      Object.entries(resets).forEach(([slot, version]) => {
+        if (state.messageResets[slot] === version) return;
+        state.messageResets[slot] = version;
+        state.messages = state.messages.filter(message => message.slot !== slot);
+        rebuildSeen();
+      });
+    }
+
     async function loadState() {
       const data = await request('/api/state');
       state.slots = data.slots;
+      applyMessageResets(data.message_resets);
       mergeMessages(data.messages);
       hideLogin();
       render();
@@ -1210,6 +1242,7 @@ INDEX_HTML = r"""<!doctype html>
       source.addEventListener('update', (event) => {
         const data = JSON.parse(event.data);
         if (data.slots) state.slots = data.slots;
+        if (data.message_resets) applyMessageResets(data.message_resets);
         if (data.messages) mergeMessages(data.messages);
         render();
       });
@@ -1369,7 +1402,11 @@ class Handler(BaseHTTPRequestHandler):
                 messages = self.runtime.messages_since(after)
                 if messages:
                     after = max(int(item["seq"]) for item in messages)
-                payload = {"messages": messages, "slots": [self.runtime.slot_status(slot) for slot in self.runtime.slots]}
+                payload = {
+                    "messages": messages,
+                    "slots": [self.runtime.slot_status(slot) for slot in self.runtime.slots],
+                    "message_resets": self.runtime.message_resets(),
+                }
                 data = json.dumps(payload)
                 self.wfile.write(f"event: update\ndata: {data}\n\n".encode())
                 self.wfile.flush()
