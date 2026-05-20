@@ -880,16 +880,21 @@ INDEX_HTML = r"""<!doctype html>
   <title>Mobailmux</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --line: #d9dee7;
-      --text: #111827;
-      --muted: #667085;
-      --accent: #0f766e;
-      --accent-dark: #115e59;
-      --danger: #b42318;
-      --code: #f1f5f9;
+      color-scheme: dark;
+      --bg: #11100f;
+      --panel: #1c1b19;
+      --panel-alt: #171615;
+      --line: #3a3630;
+      --text: #f2eee8;
+      --muted: #aaa39a;
+      --accent: #2dd4bf;
+      --accent-dark: #14b8a6;
+      --danger: #f87171;
+      --input: #121110;
+      --user-bg: #132d2a;
+      --user-line: #24776d;
+      --active-bg: #123b36;
+      --overlay: rgba(17, 16, 15, .92);
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -909,17 +914,17 @@ INDEX_HTML = r"""<!doctype html>
       padding: 7px 11px;
       cursor: pointer;
     }
-    button:hover { border-color: #aeb7c5; }
+    button:hover { border-color: #716a60; }
     button.primary {
       background: var(--accent);
       border-color: var(--accent);
-      color: #ffffff;
+      color: #081311;
     }
     button.primary:hover { background: var(--accent-dark); }
     button.active {
       border-color: var(--accent);
-      color: var(--accent-dark);
-      background: #e6f3f1;
+      color: var(--text);
+      background: var(--active-bg);
     }
     .app {
       min-height: 100%;
@@ -952,7 +957,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow-x: auto;
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
-      background: #fbfcfe;
+      background: var(--panel-alt);
     }
     .slot {
       flex: 0 0 auto;
@@ -986,8 +991,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .message.user {
       align-self: flex-end;
-      border-color: #bdd7ff;
-      background: #eef6ff;
+      border-color: var(--user-line);
+      background: var(--user-bg);
     }
     .message.assistant {
       align-self: flex-start;
@@ -1029,7 +1034,7 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 7px;
       padding: 10px;
-      background: #ffffff;
+      background: var(--input);
       color: var(--text);
     }
     .login {
@@ -1037,7 +1042,7 @@ INDEX_HTML = r"""<!doctype html>
       inset: 0;
       display: none;
       place-items: center;
-      background: rgba(246, 247, 249, .92);
+      background: var(--overlay);
       padding: 16px;
     }
     .login.visible { display: grid; }
