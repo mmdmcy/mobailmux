@@ -1,5 +1,7 @@
 # Mattermost Setup
 
+Mattermost is optional. Use it when you want Mobailmux inside a full chat app with mobile and desktop clients. For the lightest setup, use the built-in web UI instead.
+
 Mobailmux needs:
 
 - one Mattermost team
@@ -37,6 +39,31 @@ The quickstart script:
 
 The Compose stack binds to `127.0.0.1:8065` by default. For phone access, expose it only on a trusted private interface, VPN, or LAN.
 
+## Run Mobailmux
+
+Install and run the Mattermost adapter:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+mobailmux
+```
+
+On Linux with systemd user services:
+
+```bash
+scripts/install-user-service.sh
+```
+
+Useful service commands:
+
+```bash
+systemctl --user status mobailmux.service
+systemctl --user restart mobailmux.service
+journalctl --user -u mobailmux.service -f
+```
+
 ## Manual Setup
 
 If you prefer to do it manually:
@@ -46,6 +73,15 @@ If you prefer to do it manually:
 3. Create channels such as `agent-one`, `agent-two`, and `agent-three`.
 4. Add the bot and your user to those channels.
 5. Put the token and channel names in `.env`.
+
+Required Mattermost values:
+
+```text
+MOBAILMUX_MATTERMOST_URL=https://mattermost.example.com
+MOBAILMUX_TEAM_NAME=agents
+MOBAILMUX_OWNER_USERNAME=your-mattermost-username
+MOBAILMUX_BOT_TOKEN=<bot-token>
+```
 
 ## Channel Commands
 
@@ -63,7 +99,7 @@ status
 stop
 ```
 
-Any other message continues that channel's agent chat. `fresh` resets the chat for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
+Any other message continues that channel's agent chat.
 
 Advanced commands:
 
@@ -75,9 +111,15 @@ queue
 clearqueue
 ```
 
+`fresh` resets the Codex thread for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
+
 ## Progress
 
-Mattermost receives command start/exit updates automatically. Agents can also send human-readable milestone notes with `aiprogress 'message'`.
+Mattermost receives command start/exit updates automatically from `codex exec --json`. Agents can also send human-readable milestone notes with:
+
+```bash
+aiprogress 'message'
+```
 
 By default progress posts are uncapped:
 

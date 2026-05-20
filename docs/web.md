@@ -2,6 +2,8 @@
 
 Mobailmux includes a lightweight browser UI for installs where Mattermost is unnecessary or too large.
 
+The web UI is served by the Mobailmux Python process. It provides the same slots, commands, Codex thread handling, command progress, `aiprogress` notes, queueing, and `fresh` reset behavior as the Mattermost adapter.
+
 ## Run
 
 ```bash
@@ -26,7 +28,7 @@ MOBAILMUX_WEB_HOST=127.0.0.1
 MOBAILMUX_WEB_PORT=8765
 ```
 
-Keep the service on loopback unless you are putting it behind a private VPN, trusted LAN, or reverse proxy with TLS.
+Keep the service on loopback unless you are putting it behind a private VPN, trusted LAN, or reverse proxy with TLS. If you bind to a private interface for phone access, keep password auth enabled.
 
 ## Background Service
 
@@ -42,11 +44,19 @@ The generated service reads the clone's `.env` file and runs:
 mobailmux web
 ```
 
+Useful service commands:
+
+```bash
+systemctl --user status mobailmux-web.service
+systemctl --user restart mobailmux-web.service
+journalctl --user -u mobailmux-web.service -f
+```
+
 The template at `systemd/mobailmux-web.service.example` is for manual installs.
 
 ## Commands
 
-The web UI accepts the same slot commands as the Mattermost adapter:
+The web UI accepts commands as plain messages:
 
 ```text
 help
@@ -60,13 +70,27 @@ status
 stop
 ```
 
-Any other message starts or continues that slot's Codex chat.
+Any other message starts or continues that slot's Codex chat in the current folder.
 
-`fresh` also clears the visible transcript for that slot, so long-running slots do not keep growing forever.
+Advanced commands:
+
+```text
+logs
+model
+next <request>
+queue
+clearqueue
+```
+
+`fresh` starts a new Codex thread and clears the visible transcript for that slot, so long-running slots do not keep growing forever. `cd` changes the slot's workdir; if a saved thread belongs to a different workdir, Mobailmux resets the thread.
 
 ## Progress
 
-The web UI shows command start/exit events automatically. Agents can also send human-readable milestone notes with `aiprogress 'message'`.
+The web UI shows command start/exit events automatically from `codex exec --json`. Agents can also send human-readable milestone notes with:
+
+```bash
+aiprogress 'message'
+```
 
 By default progress posts are uncapped:
 
@@ -85,5 +109,7 @@ state.json
 web.sqlite3
 web-cookie-secret
 ```
+
+`state.json` stores slot workdirs, saved Codex thread ids, and visible transcript reset markers. `web.sqlite3` stores the web UI transcript. `web-cookie-secret` signs login cookies.
 
 Do not commit these files.

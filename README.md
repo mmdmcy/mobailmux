@@ -11,42 +11,47 @@ Browser or Mattermost
   -> local workspace
 ```
 
-Mobailmux is useful when you want to kick off several independent AI coding jobs from iOS, Android, desktop, or a small server without juggling SSH sessions.
+Use it when you want to kick off several independent AI coding jobs from iOS, Android, desktop, or a small server without juggling SSH or tmux sessions.
+
+## Current Shape
+
+- Codex is the only implemented agent driver.
+- The built-in web UI is the lightest frontend and does not require Docker.
+- Mattermost is optional for teams or people who want a full chat app.
+- Both frontends use the same slot model, Codex prompt, workdir state, progress stream, and `fresh` reset behavior.
+- The web UI is dark by default and keeps the message composer fixed while only the transcript scrolls.
 
 ## Features
 
-- built-in lightweight web UI
-- Mattermost channel per agent slot
+- built-in lightweight browser UI
+- optional Mattermost channel per slot
 - multiple slots running in parallel
-- per-channel continuing Codex chat
+- continuing Codex thread per slot
 - `fresh` reset command that starts a new agent chat and clears local slot history
 - `stop`, `status`, `pwd`, `ls`, and `cd` controls
+- queued follow-up requests with `next <request>`
 - command start/exit progress from `codex exec --json`
-- optional explicit progress notes through `aiprogress 'message'`
-- owner allowlist so only one Mattermost user can trigger jobs
-- no public callback URL required for either frontend
-
-## Status
-
-The current driver is Codex. The built-in web UI and Mattermost adapter use the same slot model. The code is structured so other CLI agents can be added later, but Codex is the first supported runtime.
+- explicit human progress notes through `aiprogress 'message'`
+- uncapped progress posts by default
+- owner allowlist for Mattermost
+- no Telegram, public webhook, or callback URL required
 
 ## Platform Support
 
 - Mobile client: any modern browser, plus iOS, Android, desktop, or web Mattermost clients.
 - Host runner: intended for Linux, macOS, and Windows wherever Python 3.11+ and the configured CLI agent are available.
-- Quickstart scripts: Bash-based, so they target Linux, macOS, or WSL. Native Windows can still run the Python package, but PowerShell bootstrap scripts are not included yet.
-- Background service: the included install scripts and systemd examples are Linux/systemd-specific. macOS launchd and Windows service examples are not included yet.
+- Quickstart scripts: Bash-based, so they target Linux, macOS, or WSL.
+- Background services: included install scripts and systemd examples are Linux/systemd-specific.
+- Native Windows can run the Python package, but PowerShell bootstrap/service scripts are not included yet.
 
-## Quick Start
-
-### Lightweight Web UI
+## Quick Start: Web UI
 
 Prerequisites:
 
 - Python 3.11+
 - Codex CLI installed and logged in with `codex login`
 
-Create config, set a password, install, and run:
+Create config, set a web password, install, and run:
 
 ```bash
 cp .env.example .env
@@ -57,27 +62,34 @@ pip install -e .
 mobailmux web
 ```
 
-Or install the web UI as a user systemd service:
-
-```bash
-scripts/install-web-user-service.sh
-```
-
 Open `http://127.0.0.1:8765`, sign in with `MOBAILMUX_WEB_PASSWORD`, choose a slot, and send:
 
 ```text
 help
 ```
 
-For phone access, put the web UI behind a private VPN, private reverse proxy, or trusted LAN endpoint. Keep the default `127.0.0.1` binding unless you intentionally expose it.
+For phone access, keep Mobailmux behind a private VPN, trusted LAN, or reverse proxy with TLS. Keep the default loopback bind unless you intentionally expose it to a private interface.
 
-### Mattermost
+On Linux with systemd user services:
+
+```bash
+scripts/install-web-user-service.sh
+systemctl --user status mobailmux-web.service
+```
+
+The service reads the clone's `.env` file and runs:
+
+```bash
+mobailmux web
+```
+
+## Optional: Mattermost
 
 Prerequisites:
 
-- Docker with Docker Compose v2
+- Docker with Docker Compose v2 for the included Mattermost stack
 - Python 3.11+
-- Bash, `curl`, and `jq` for the included quickstart scripts
+- Bash, `curl`, and `jq` for the included setup scripts
 - Codex CLI installed and logged in with `codex login`
 
 Start a local Mattermost, create an admin user, create the bot, and create the slot channels:
@@ -87,27 +99,21 @@ cp .env.example .env
 scripts/quickstart-docker.sh
 ```
 
-Install Mobailmux:
+Install and run Mobailmux:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
-```
-
-Run it:
-
-```bash
 mobailmux
 ```
 
-Or install it as a user systemd service:
+On Linux with systemd user services:
 
 ```bash
 scripts/install-user-service.sh
+systemctl --user status mobailmux.service
 ```
-
-The installer writes a user service with paths based on the current clone. `systemd/mobailmux.service.example` is only a template for manual installs.
 
 Open Mattermost, join `agent-one`, `agent-two`, or `agent-three`, and send:
 
@@ -115,21 +121,13 @@ Open Mattermost, join `agent-one`, `agent-two`, or `agent-three`, and send:
 help
 ```
 
-## Existing Mattermost
+If you already have Mattermost, skip Docker Compose, fill in the Mattermost values in `.env`, then run:
 
-If you already have Mattermost, skip Docker Compose and fill in `.env` manually:
-
-```text
-MOBAILMUX_MATTERMOST_URL=https://mattermost.example.com
-MOBAILMUX_TEAM_NAME=agents
-MOBAILMUX_OWNER_USERNAME=your-mattermost-username
-MOBAILMUX_ADMIN_USERNAME=admin
-MOBAILMUX_ADMIN_PASSWORD=<admin-password>
+```bash
+scripts/bootstrap-mattermost.sh
 ```
 
-Then run `scripts/bootstrap-mattermost.sh` to create the team, bot token, and slot channels.
-
-## Channel Commands
+## Slot Commands
 
 Type commands as normal messages, not slash commands:
 
@@ -145,9 +143,7 @@ status
 stop
 ```
 
-Any other message continues that channel's agent chat in the current folder.
-
-`fresh` starts a new Codex thread for that slot. In the web UI it also clears the visible transcript for that slot. In Mattermost it clears Mobailmux's local `logs` history, but it does not delete existing Mattermost channel posts.
+Any other message starts or continues that slot's Codex chat in the current folder.
 
 Advanced commands:
 
@@ -159,22 +155,26 @@ queue
 clearqueue
 ```
 
+`fresh` starts a new Codex thread for that slot. In the web UI it also clears the visible transcript for that slot. In Mattermost it clears Mobailmux's local `logs` history, but it does not delete existing Mattermost channel posts.
+
+`cd` changes the slot's workdir. If the workdir changes while a Codex thread is saved, Mobailmux resets that slot's thread so future work starts in the new folder.
+
 ## Configuration
 
-Required runtime values:
+Shared values:
 
 ```text
-MOBAILMUX_MATTERMOST_URL=http://mattermost.example.local
-MOBAILMUX_TEAM_NAME=agents
-MOBAILMUX_OWNER_USERNAME=your-mattermost-username
-MOBAILMUX_BOT_TOKEN=<bot-token>
 MOBAILMUX_SLOTS=one:agent-one,two:agent-two,three:agent-three
+MOBAILMUX_DEFAULT_WORKDIR=~
+MOBAILMUX_STATE_DIR=~/.local/state/mobailmux
+MOBAILMUX_CODEX_BIN=codex
+MOBAILMUX_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
 ```
 
 Slot format:
 
 ```text
-name:channel[:default_workdir]
+name:label-or-channel[:default_workdir]
 ```
 
 Examples:
@@ -185,6 +185,23 @@ MOBAILMUX_SLOT_ONE_WORKDIR=~/code/app
 MOBAILMUX_SLOT_TWO_WORKDIR=~/code/site
 ```
 
+Web values:
+
+```text
+MOBAILMUX_WEB_HOST=127.0.0.1
+MOBAILMUX_WEB_PORT=8765
+MOBAILMUX_WEB_PASSWORD=<strong-password>
+```
+
+Mattermost values:
+
+```text
+MOBAILMUX_MATTERMOST_URL=http://mattermost.example.local
+MOBAILMUX_TEAM_NAME=agents
+MOBAILMUX_OWNER_USERNAME=your-mattermost-username
+MOBAILMUX_BOT_TOKEN=<bot-token>
+```
+
 Progress behavior:
 
 ```text
@@ -192,9 +209,9 @@ MOBAILMUX_STATUS_SECONDS=60
 MOBAILMUX_MAX_PROGRESS_POSTS=0
 ```
 
-`MOBAILMUX_STATUS_SECONDS` controls automatic "still running" updates. `MOBAILMUX_MAX_PROGRESS_POSTS=0` means progress posts are uncapped; set a positive number only if a chat surface gets too noisy.
+`MOBAILMUX_STATUS_SECONDS` controls automatic "still running" updates. `MOBAILMUX_MAX_PROGRESS_POSTS=0` means command progress and `aiprogress` notes are uncapped. Set a positive number only if a chat surface gets too noisy.
 
-## Codex
+## Codex Runtime
 
 Mobailmux uses:
 
@@ -202,7 +219,7 @@ Mobailmux uses:
 codex exec --json --output-last-message <file>
 ```
 
-If a channel already has a saved Codex thread, Mobailmux uses:
+If a slot already has a saved Codex thread in the same workdir, Mobailmux uses:
 
 ```bash
 codex exec resume --json <thread-id>
@@ -216,12 +233,26 @@ MOBAILMUX_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
 
 That is powerful and risky. Read [docs/security.md](docs/security.md) before using it.
 
+## State And Storage
+
+Mobailmux stores runtime state under `MOBAILMUX_STATE_DIR`:
+
+```text
+state.json
+web.sqlite3
+web-cookie-secret
+```
+
+`state.json` stores slot workdirs, saved Codex thread ids, and visible transcript reset markers. `web.sqlite3` stores the web UI transcript. Mattermost channel history lives in Mattermost; Mobailmux only keeps a small in-memory `logs` buffer for that adapter.
+
+Do not commit runtime state, `.env`, virtualenvs, or service data directories.
+
 ## Privacy
 
-Mobailmux does not need Telegram or a public webhook. It polls Mattermost over the URL you configure. The recommended deployment is a private Mattermost instance reachable only over a VPN, private network, or trusted LAN.
+Mobailmux does not need Telegram or a public webhook. The web UI is served locally by Mobailmux. The Mattermost adapter polls the Mattermost URL you configure.
 
-The included Compose file binds Mattermost to `127.0.0.1` by default. For phone access, put it behind a private VPN or change `MOBAILMUX_MATTERMOST_BIND` to a trusted private interface address.
+The recommended deployment is private network access only: loopback, trusted LAN, private VPN, or a reverse proxy with TLS and access control. The included Mattermost Compose file binds to `127.0.0.1` by default.
 
 ## Name
 
-Mobailmux is short for mobile AI multiplexer. A multiplexer is a tool that routes several independent inputs through one control surface; here, Mattermost channels map to separate local AI agent slots.
+Mobailmux is short for mobile AI multiplexer. A multiplexer routes several independent inputs through one control surface; here, browser slots or Mattermost channels map to separate local AI agent lanes.
