@@ -28,6 +28,22 @@ MOBAILMUX_WEB_PORT=8765
 
 Keep the service on loopback unless you are putting it behind a private VPN, trusted LAN, or reverse proxy with TLS.
 
+## Background Service
+
+On Linux with systemd user services, install and start the web UI with:
+
+```bash
+scripts/install-web-user-service.sh
+```
+
+The generated service reads the clone's `.env` file and runs:
+
+```bash
+mobailmux web
+```
+
+The template at `systemd/mobailmux-web.service.example` is for manual installs.
+
 ## Commands
 
 The web UI accepts the same slot commands as the Mattermost adapter:

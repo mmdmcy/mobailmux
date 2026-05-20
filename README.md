@@ -35,7 +35,7 @@ The current driver is Codex. The built-in web UI and Mattermost adapter use the 
 - Mobile client: any modern browser, plus iOS, Android, desktop, or web Mattermost clients.
 - Host runner: intended for Linux, macOS, and Windows wherever Python 3.11+ and the configured CLI agent are available.
 - Quickstart scripts: Bash-based, so they target Linux, macOS, or WSL. Native Windows can still run the Python package, but PowerShell bootstrap scripts are not included yet.
-- Background service: the included `scripts/install-user-service.sh` and `systemd/mobailmux.service.example` are Linux/systemd-specific. macOS launchd and Windows service examples are not included yet.
+- Background service: the included install scripts and systemd examples are Linux/systemd-specific. macOS launchd and Windows service examples are not included yet.
 
 ## Quick Start
 
@@ -55,6 +55,12 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 mobailmux web
+```
+
+Or install the web UI as a user systemd service:
+
+```bash
+scripts/install-web-user-service.sh
 ```
 
 Open `http://127.0.0.1:8765`, sign in with `MOBAILMUX_WEB_PASSWORD`, choose a slot, and send:
