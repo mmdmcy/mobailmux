@@ -55,6 +55,8 @@ Type commands as plain messages, not slash commands:
 help
 slots
 pwd
+ls
+ls src
 cd /path/to/project
 fresh
 status

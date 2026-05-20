@@ -20,7 +20,7 @@ Mobailmux is useful when you want to kick off several independent AI coding jobs
 - multiple slots running in parallel
 - per-channel continuing Codex chat
 - `fresh` reset command
-- `stop`, `status`, `pwd`, and `cd` controls
+- `stop`, `status`, `pwd`, `ls`, and `cd` controls
 - command start/exit progress from `codex exec --json`
 - optional explicit progress notes through `aiprogress 'message'`
 - owner allowlist so only one Mattermost user can trigger jobs
@@ -103,6 +103,8 @@ Type commands as normal messages, not slash commands:
 help
 slots
 pwd
+ls
+ls src
 cd /path/to/project
 fresh
 status

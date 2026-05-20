@@ -81,6 +81,7 @@ STATUS_SECONDS = int(cfg("MOBAILMUX_STATUS_SECONDS", "60"))
 MAX_PROGRESS_POSTS = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "80"))
 OUTPUT_SNIPPET_CHARS = int(cfg("MOBAILMUX_OUTPUT_SNIPPET_CHARS", "1200"))
 MAX_QUEUED_PER_SLOT = int(cfg("MOBAILMUX_MAX_QUEUED_PER_SLOT", "5"))
+MAX_LS_ENTRIES = int(cfg("MOBAILMUX_MAX_LS_ENTRIES", "120"))
 STATE_DIR = Path(expand_path(cfg("MOBAILMUX_STATE_DIR", "~/.local/state/mobailmux") or "~/.local/state/mobailmux"))
 STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_WORKDIR = expand_path(cfg("MOBAILMUX_DEFAULT_WORKDIR", "~") or "~")
@@ -238,6 +239,73 @@ def resolve(path: str, base: str) -> str:
     return str(Path(expanded).resolve())
 
 
+def parse_ls_args(raw: str) -> tuple[bool, str | None, str | None]:
+    try:
+        args = shlex.split(raw, posix=not IS_WINDOWS)
+    except ValueError as exc:
+        return False, None, f"Could not parse `ls` arguments: {exc}"
+
+    show_hidden = False
+    targets = []
+    for arg in args:
+        if arg == "--all":
+            show_hidden = True
+            continue
+        if arg.startswith("-") and arg != "-":
+            flags = arg[1:]
+            if flags and set(flags) <= {"a", "l", "h"}:
+                show_hidden = show_hidden or "a" in flags
+                continue
+            return False, None, f"Unsupported `ls` option: `{arg}`. Supported: `-a`, `-l`, `-la`, `--all`."
+        targets.append(arg)
+
+    if len(targets) > 1:
+        return False, None, "Usage: `ls [path]`"
+    return show_hidden, targets[0] if targets else None, None
+
+
+def list_path_text(slot: str, raw_args: str) -> str:
+    show_hidden, target_arg, error = parse_ls_args(raw_args)
+    if error:
+        return error
+
+    target = Path(resolve(target_arg or ".", current_workdir(slot)))
+    if not target.exists():
+        return f"Path does not exist: `{target}`"
+    if target.is_file():
+        return f"{slot} file:\n```text\n{target.name}\n```"
+    if not target.is_dir():
+        return f"Path is not a directory: `{target}`"
+
+    rows = []
+    try:
+        for child in target.iterdir():
+            if not show_hidden and child.name.startswith("."):
+                continue
+            try:
+                is_dir = child.is_dir()
+                is_link = child.is_symlink()
+            except OSError:
+                is_dir = False
+                is_link = False
+            suffix = "/" if is_dir else "@" if is_link else ""
+            rows.append((0 if is_dir else 1, child.name.lower(), f"{child.name}{suffix}"))
+    except PermissionError:
+        return f"Permission denied: `{target}`"
+    except OSError as exc:
+        return f"Could not list `{target}`: {exc}"
+
+    rows.sort()
+    names = [row[2] for row in rows]
+    omitted = max(0, len(names) - MAX_LS_ENTRIES)
+    names = names[:MAX_LS_ENTRIES]
+    if omitted:
+        names.append(f"... {omitted} more")
+    if not names:
+        names = ["(empty)"]
+    return f"{slot} listing `{target}`:\n```text\n" + "\n".join(names) + "\n```"
+
+
 def owner_user_id() -> str:
     if OWNER_USER_ID:
         return OWNER_USER_ID
@@ -355,6 +423,7 @@ def help_text(slot: str) -> str:
         f"{slot} commands:\n"
         "- `slots` shows all slot states\n"
         "- `pwd` shows the current folder\n"
+        "- `ls [path]` lists files without starting an agent job\n"
         "- `cd /path/to/project` sets the folder for future jobs in this channel\n"
         "- `fresh` resets this channel's agent chat\n"
         "- `status` shows whether this slot is busy\n"
@@ -438,6 +507,10 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         return True
     if lower == "pwd":
         post(channel, f"{slot} folder: `{current_workdir(slot)}`")
+        return True
+    match = re.fullmatch(r"ls(?:\s+(.*))?", text, flags=re.IGNORECASE)
+    if match:
+        post(channel, list_path_text(slot, match.group(1) or ""))
         return True
     if lower in {"model", "settings"}:
         post(channel, agent_settings_text())
