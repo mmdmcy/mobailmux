@@ -1,0 +1,16 @@
+[Unit]
+Description=Mobailmux Mattermost agent slots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/mobailmux
+Environment=PYTHONUNBUFFERED=1
+Environment=MOBAILMUX_ENV=/path/to/mobailmux/.env
+ExecStart=/path/to/mobailmux/.venv/bin/mobailmux
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
