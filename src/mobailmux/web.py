@@ -396,8 +396,18 @@ class MobailmuxWeb:
         return f"{slot} listing `{target}`:\n```text\n" + "\n".join(names) + "\n```"
 
     def help_text(self, slot: str) -> str:
+        slot_lines = ["Available slots:"]
+        for name, slot_cfg in self.slots.items():
+            if slot_cfg.label == name:
+                slot_lines.append(f"- `{name}`")
+            else:
+                slot_lines.append(f"- `{name}` labeled `{slot_cfg.label}`")
         return (
-            f"{slot} commands:\n"
+            f"Mobailmux help for `{slot}`\n\n"
+            + "\n".join(slot_lines)
+            + "\n\n"
+            + "Type commands as normal messages:\n"
+            "- `help` or `commands` shows this help\n"
             "- `slots` shows all slot states\n"
             "- `pwd` shows the current folder\n"
             "- `ls [path]` lists files without starting an agent job\n"
@@ -405,8 +415,12 @@ class MobailmuxWeb:
             "- `fresh` resets this slot's agent chat and clears its visible transcript\n"
             "- `status` shows whether this slot is busy\n"
             "- `stop` cancels the active job in this slot\n"
-            "- any other message continues this slot's agent chat in the current folder\n"
-            "\nAdvanced commands: `logs`, `model`, `next <request>`, `queue`, `clearqueue`."
+            "- `logs` shows recent Mobailmux events for this slot\n"
+            "- `model` shows the Codex command/model settings\n"
+            "- `next <request>` queues one follow-up request for this slot\n"
+            "- `queue` shows queued requests\n"
+            "- `clearqueue` clears queued requests\n"
+            "- any other message continues this slot's agent chat in the current folder"
         )
 
     def codex_config_path(self) -> Path:

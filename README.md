@@ -121,6 +121,14 @@ Open Mattermost, join `agent-one`, `agent-two`, or `agent-three`, and send:
 help
 ```
 
+For a direct mobile setup, the slot and channel names can be the same. For example:
+
+```text
+MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
+```
+
+Then each Mattermost channel is its own Codex lane: `aione`, `aitwo`, and `aithree`.
+
 If you already have Mattermost, skip Docker Compose, fill in the Mattermost values in `.env`, then run:
 
 ```bash
@@ -132,28 +140,23 @@ scripts/bootstrap-mattermost.sh
 Type commands as normal messages, not slash commands:
 
 ```text
-help
+help              show command help and configured slots
+commands          same as help
 slots
 pwd
-ls
-ls src
+ls [path]
 cd /path/to/project
 fresh
 status
 stop
-```
-
-Any other message starts or continues that slot's Codex chat in the current folder.
-
-Advanced commands:
-
-```text
 logs
 model
 next <request>
 queue
 clearqueue
 ```
+
+Any other message starts or continues that slot's Codex chat in the current folder.
 
 `fresh` starts a new Codex thread for that slot. In the web UI it also clears the visible transcript for that slot. In Mattermost it clears Mobailmux's local `logs` history, but it does not delete existing Mattermost channel posts.
 

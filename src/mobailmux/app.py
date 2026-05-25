@@ -423,9 +423,22 @@ def process_start_options() -> dict:
     return {"start_new_session": True}
 
 
+def slot_overview_text() -> str:
+    lines = ["Available slots:"]
+    for name, slot_cfg in SLOTS.items():
+        if slot_cfg.channel == name:
+            lines.append(f"- `{name}`")
+        else:
+            lines.append(f"- `{name}` in Mattermost channel `{slot_cfg.channel}`")
+    return "\n".join(lines)
+
+
 def help_text(slot: str) -> str:
     return (
-        f"{slot} commands:\n"
+        f"Mobailmux help for `{slot}`\n\n"
+        f"{slot_overview_text()}\n\n"
+        "Type commands as normal messages, not slash commands:\n"
+        "- `help` or `commands` shows this help\n"
         "- `slots` shows all slot states\n"
         "- `pwd` shows the current folder\n"
         "- `ls [path]` lists files without starting an agent job\n"
@@ -433,8 +446,13 @@ def help_text(slot: str) -> str:
         "- `fresh` resets this channel's agent chat and Mobailmux logs\n"
         "- `status` shows whether this slot is busy\n"
         "- `stop` cancels the active job in this slot\n"
-        "- any other message continues this channel's agent chat in the current folder\n"
-        "\nProgress posts show command/tool starts and exits. Advanced commands: `logs`, `model`, `next <request>`, `queue`, `clearqueue`."
+        "- `logs` shows recent Mobailmux events for this slot\n"
+        "- `model` shows the Codex command/model settings\n"
+        "- `next <request>` queues one follow-up request for this slot\n"
+        "- `queue` shows queued requests\n"
+        "- `clearqueue` clears queued requests\n"
+        "- any other message continues this channel's agent chat in the current folder\n\n"
+        "Progress posts show command/tool starts and exits automatically."
     )
 
 

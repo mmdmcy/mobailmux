@@ -88,27 +88,28 @@ MOBAILMUX_BOT_TOKEN=<bot-token>
 Type commands as plain messages, not slash commands:
 
 ```text
-help
+help              show command help and configured slots
+commands          same as help
 slots
 pwd
-ls
-ls src
+ls [path]
 cd /path/to/project
 fresh
 status
 stop
-```
-
-Any other message continues that channel's agent chat.
-
-Advanced commands:
-
-```text
 logs
 model
 next <request>
 queue
 clearqueue
+```
+
+Any other message continues that channel's agent chat.
+
+For direct mobile channel names, configure slots with the same name as the Mattermost channel:
+
+```text
+MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
 ```
 
 `fresh` resets the Codex thread for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.

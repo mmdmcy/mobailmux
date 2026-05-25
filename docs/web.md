@@ -59,28 +59,23 @@ The template at `systemd/mobailmux-web.service.example` is for manual installs.
 The web UI accepts commands as plain messages:
 
 ```text
-help
+help              show command help and configured slots
+commands          same as help
 slots
 pwd
-ls
-ls src
+ls [path]
 cd /path/to/project
 fresh
 status
 stop
-```
-
-Any other message starts or continues that slot's Codex chat in the current folder.
-
-Advanced commands:
-
-```text
 logs
 model
 next <request>
 queue
 clearqueue
 ```
+
+Any other message starts or continues that slot's Codex chat in the current folder.
 
 `fresh` starts a new Codex thread and clears the visible transcript for that slot, so long-running slots do not keep growing forever. `cd` changes the slot's workdir; if a saved thread belongs to a different workdir, Mobailmux resets the thread.
 
