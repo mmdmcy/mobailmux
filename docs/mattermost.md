@@ -112,6 +112,8 @@ For direct mobile channel names, configure slots with the same name as the Matte
 MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
 ```
 
+Mobailmux also watches a Mattermost channel named `slots` when it exists. That channel is status-only: type `slots` there to see every slot state. It will not start Codex jobs.
+
 `fresh` resets the Codex thread for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
 
 ## Progress

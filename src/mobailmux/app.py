@@ -76,6 +76,7 @@ TEAM_NAME = required_cfg("MOBAILMUX_TEAM_NAME")
 OWNER_USERNAME = cfg("MOBAILMUX_OWNER_USERNAME")
 OWNER_USER_ID = cfg("MOBAILMUX_OWNER_USER_ID")
 BOT_USERNAME = cfg("MOBAILMUX_BOT_USERNAME", "mobailmux")
+SLOTS_CHANNEL = cfg("MOBAILMUX_SLOTS_CHANNEL", "slots") or ""
 POLL_SECONDS = float(cfg("MOBAILMUX_POLL_SECONDS", "2"))
 STATUS_SECONDS = int(cfg("MOBAILMUX_STATUS_SECONDS", "60"))
 MAX_PROGRESS_POSTS = int(cfg("MOBAILMUX_MAX_PROGRESS_POSTS", "0"))
@@ -335,6 +336,16 @@ def channel_id(team: str, channel_name: str) -> str:
     return channel["id"]
 
 
+def optional_channel_id(team: str, channel_name: str) -> str | None:
+    try:
+        return channel_id(team, channel_name)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 404:
+            return None
+        raise
+
+
 def current_workdir(slot: str) -> str:
     with state_lock:
         return state.setdefault("workdirs", {}).get(slot) or SLOTS[slot].default_workdir
@@ -509,6 +520,15 @@ def slot_status_line(slot: str) -> str:
 
 def all_slots_status() -> str:
     return "Slots:\n```text\n" + "\n".join(slot_status_line(slot) for slot in SLOTS) + "\n```"
+
+
+def slots_channel_help() -> str:
+    return (
+        "This is the Mobailmux `slots` channel.\n\n"
+        "Type `slots` to show all slot states.\n"
+        "Use the work channels to run jobs:\n"
+        + "\n".join(f"- `{slot_cfg.channel}`" for slot_cfg in SLOTS.values())
+    )
 
 
 def history_text(slot: str) -> str:
@@ -924,6 +944,40 @@ def poll_loop(slot: str, channel: str, owner: str, bot: str) -> None:
         time.sleep(POLL_SECONDS)
 
 
+def poll_slots_channel(channel: str, owner: str, bot: str) -> None:
+    state_key = f"channel:{SLOTS_CHANNEL}"
+    if get_last_seen(state_key) == 0:
+        update_last_seen(state_key, int(time.time() * 1000))
+    while not stop_event.is_set():
+        since = get_last_seen(state_key)
+        try:
+            data = api("GET", f"/api/v4/channels/{channel}/posts", params={"since": since})
+            order = data.get("order", [])
+            posts = data.get("posts", {})
+            for post_id in reversed(order):
+                item = posts.get(post_id)
+                if not item:
+                    continue
+                create_at = int(item.get("create_at") or 0)
+                update_last_seen(state_key, create_at)
+                if item.get("user_id") == bot:
+                    continue
+                if item.get("user_id") != owner:
+                    continue
+                if item.get("type"):
+                    continue
+                message = item.get("message", "").strip().lower()
+                if message in {"slots", "status", "list", "overview"}:
+                    post(channel, all_slots_status())
+                elif message in {"help", "commands"}:
+                    post(channel, slots_channel_help())
+                elif message:
+                    post(channel, "This channel only shows slot status. Type `slots`, or use a work channel to run jobs.")
+        except Exception as exc:
+            print(f"[{SLOTS_CHANNEL}] poll error: {exc}", flush=True)
+        time.sleep(POLL_SECONDS)
+
+
 def main() -> None:
     def on_signal(_signum, _frame):
         stop_event.set()
@@ -937,11 +991,20 @@ def main() -> None:
     bot = bot_user_id()
     team = team_id()
     channels = {slot: channel_id(team, slot_cfg.channel) for slot, slot_cfg in SLOTS.items()}
+    work_channel_names = {slot_cfg.channel for slot_cfg in SLOTS.values()}
+    slots_channel = None
+    if SLOTS_CHANNEL and SLOTS_CHANNEL not in work_channel_names:
+        slots_channel = optional_channel_id(team, SLOTS_CHANNEL)
+        if not slots_channel:
+            print(f"mobailmux slots channel `{SLOTS_CHANNEL}` not found; skipping status channel", flush=True)
 
     threading.Thread(target=dispatcher, daemon=True).start()
     for slot, channel in channels.items():
         threading.Thread(target=poll_loop, args=(slot, channel, owner, bot), daemon=True).start()
+    if slots_channel:
+        threading.Thread(target=poll_slots_channel, args=(slots_channel, owner, bot), daemon=True).start()
 
-    print(f"mobailmux running for {', '.join(channels)}", flush=True)
+    status_channel_text = f"; status channel {SLOTS_CHANNEL}" if slots_channel else ""
+    print(f"mobailmux running for {', '.join(channels)}{status_channel_text}", flush=True)
     while not stop_event.is_set():
         time.sleep(1)

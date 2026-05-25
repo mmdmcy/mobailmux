@@ -129,6 +129,8 @@ MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
 
 Then each Mattermost channel is its own Codex lane: `aione`, `aitwo`, and `aithree`.
 
+Mobailmux also looks for a Mattermost channel named `slots`. If that channel exists, it is status-only: type `slots` there to see the current state of every lane. It will not start Codex jobs.
+
 If you already have Mattermost, skip Docker Compose, fill in the Mattermost values in `.env`, then run:
 
 ```bash
@@ -203,6 +205,7 @@ MOBAILMUX_MATTERMOST_URL=http://mattermost.example.local
 MOBAILMUX_TEAM_NAME=agents
 MOBAILMUX_OWNER_USERNAME=your-mattermost-username
 MOBAILMUX_BOT_TOKEN=<bot-token>
+MOBAILMUX_SLOTS_CHANNEL=slots
 ```
 
 Progress behavior:

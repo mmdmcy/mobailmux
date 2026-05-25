@@ -34,6 +34,7 @@ set +a
 : "${MOBAILMUX_BOT_USERNAME:=mobailmux}"
 : "${MOBAILMUX_BOT_DISPLAY_NAME:=Mobailmux}"
 : "${MOBAILMUX_BOT_DESCRIPTION:=Mattermost slots for CLI AI agents}"
+: "${MOBAILMUX_SLOTS_CHANNEL:=slots}"
 : "${MOBAILMUX_SLOTS:=one:agent-one,two:agent-two,three:agent-three}"
 
 BASE="${MOBAILMUX_MATTERMOST_URL%/}"
@@ -239,5 +240,9 @@ for item in "${slots[@]}"; do
   }
   ensure_channel "$token" "$team_id" "$owner_user_id" "$bot_user_id" "$slot_name" "$channel_name"
 done
+
+if [[ -n "${MOBAILMUX_SLOTS_CHANNEL:-}" ]]; then
+  ensure_channel "$token" "$team_id" "$owner_user_id" "$bot_user_id" "Slots" "$MOBAILMUX_SLOTS_CHANNEL"
+fi
 
 echo "Done. Mobailmux Mattermost channels are ready."
