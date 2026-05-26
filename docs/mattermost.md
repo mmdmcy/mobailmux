@@ -85,26 +85,28 @@ MOBAILMUX_BOT_TOKEN=<bot-token>
 
 ## Channel Commands
 
-Type commands as plain messages, not slash commands:
+Use `!` for Mobailmux command shortcuts. Mattermost slash commands are not used. Plain messages go to the agent.
 
 ```text
-help              show command help and configured slots
-commands          same as help
-slots
-pwd
-ls [path]
-cd /path/to/project
-fresh
-status
-stop
-logs
-model
-next <request>
-queue
-clearqueue
+!help              show command help and configured slots
+!commands          same as help
+!slots
+!pwd
+!ls [path]
+!cd [path]
+!fresh
+!status
+!stop
+!logs
+!model
+!next <request>
+!queue
+!clearqueue
 ```
 
 Any other message continues that channel's agent chat.
+
+`!cd` changes the channel's workdir, and `!cd` with no path goes to your home folder. If the workdir changes while a Codex thread is saved, Mobailmux resets that channel's thread so future work starts in the new folder.
 
 For direct mobile channel names, configure slots with the same name as the Mattermost channel:
 
@@ -112,9 +114,9 @@ For direct mobile channel names, configure slots with the same name as the Matte
 MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
 ```
 
-Mobailmux also watches a Mattermost channel named `slots` when it exists. That channel is status-only: type `slots` there to see every slot state. It will not start Codex jobs.
+Mobailmux also watches a Mattermost channel named `slots` when it exists. That channel is status-only: type `!slots` there to see every slot state. It will not start Codex jobs.
 
-`fresh` resets the Codex thread for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
+`!fresh` resets the Codex thread for that channel and clears Mobailmux's local `logs` history for the slot. It does not delete existing posts from the Mattermost channel.
 
 ## Progress
 

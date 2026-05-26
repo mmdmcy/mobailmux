@@ -2,7 +2,7 @@
 
 Mobailmux includes a lightweight browser UI for installs where Mattermost is unnecessary or too large.
 
-The web UI is served by the Mobailmux Python process. It provides the same slots, commands, Codex thread handling, command progress, `aiprogress` notes, queueing, and `fresh` reset behavior as the Mattermost adapter.
+The web UI is served by the Mobailmux Python process. It provides the same slots, commands, Codex thread handling, command progress, `aiprogress` notes, queueing, and `!fresh` reset behavior as the Mattermost adapter.
 
 ## Run
 
@@ -56,28 +56,28 @@ The template at `systemd/mobailmux-web.service.example` is for manual installs.
 
 ## Commands
 
-The web UI accepts commands as plain messages:
+The web UI accepts `!` command shortcuts. Plain messages go to the agent.
 
 ```text
-help              show command help and configured slots
-commands          same as help
-slots
-pwd
-ls [path]
-cd /path/to/project
-fresh
-status
-stop
-logs
-model
-next <request>
-queue
-clearqueue
+!help              show command help and configured slots
+!commands          same as help
+!slots
+!pwd
+!ls [path]
+!cd [path]
+!fresh
+!status
+!stop
+!logs
+!model
+!next <request>
+!queue
+!clearqueue
 ```
 
 Any other message starts or continues that slot's Codex chat in the current folder.
 
-`fresh` starts a new Codex thread and clears the visible transcript for that slot, so long-running slots do not keep growing forever. `cd` changes the slot's workdir; if a saved thread belongs to a different workdir, Mobailmux resets the thread.
+`!fresh` starts a new Codex thread and clears the visible transcript for that slot, so long-running slots do not keep growing forever. `!cd` changes the slot's workdir, and `!cd` with no path goes to your home folder; if a saved thread belongs to a different workdir, Mobailmux resets the thread.
 
 ## Progress
 

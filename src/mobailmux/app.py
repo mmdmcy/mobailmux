@@ -15,6 +15,8 @@ from pathlib import Path
 
 import requests
 
+from .commands import cd_target_arg, parse_command_message, queue_request_arg, unknown_command_text
+
 
 ENV_FILE = Path(os.environ.get("MOBAILMUX_ENV", ".env"))
 
@@ -448,20 +450,20 @@ def help_text(slot: str) -> str:
     return (
         f"Mobailmux help for `{slot}`\n\n"
         f"{slot_overview_text()}\n\n"
-        "Type commands as normal messages, not slash commands:\n"
-        "- `help` or `commands` shows this help\n"
-        "- `slots` shows all slot states\n"
-        "- `pwd` shows the current folder\n"
-        "- `ls [path]` lists files without starting an agent job\n"
-        "- `cd /path/to/project` sets the folder for future jobs in this channel\n"
-        "- `fresh` resets this channel's agent chat and Mobailmux logs\n"
-        "- `status` shows whether this slot is busy\n"
-        "- `stop` cancels the active job in this slot\n"
-        "- `logs` shows recent Mobailmux events for this slot\n"
-        "- `model` shows the Codex command/model settings\n"
-        "- `next <request>` queues one follow-up request for this slot\n"
-        "- `queue` shows queued requests\n"
-        "- `clearqueue` clears queued requests\n"
+        "Type command shortcuts with `!`, not Mattermost slash commands. Plain messages go to the agent.\n"
+        "- `!help` or `!commands` shows this help\n"
+        "- `!slots` shows all slot states\n"
+        "- `!pwd` shows the current folder\n"
+        "- `!ls [path]` lists files without starting an agent job\n"
+        "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
+        "- `!fresh` resets this channel's agent chat and Mobailmux logs\n"
+        "- `!status` shows whether this slot is busy\n"
+        "- `!stop` cancels the active job in this slot\n"
+        "- `!logs` shows recent Mobailmux events for this slot\n"
+        "- `!model` shows the Codex command/model settings\n"
+        "- `!next <request>` queues one follow-up request for this slot\n"
+        "- `!queue` shows queued requests\n"
+        "- `!clearqueue` clears queued requests\n"
         "- any other message continues this channel's agent chat in the current folder\n\n"
         "Progress posts show command/tool starts and exits automatically."
     )
@@ -525,7 +527,7 @@ def all_slots_status() -> str:
 def slots_channel_help() -> str:
     return (
         "This is the Mobailmux `slots` channel.\n\n"
-        "Type `slots` to show all slot states.\n"
+        "Type `!slots` to show all slot states.\n"
         "Use the work channels to run jobs:\n"
         + "\n".join(f"- `{slot_cfg.channel}`" for slot_cfg in SLOTS.values())
     )
@@ -540,7 +542,10 @@ def history_text(slot: str) -> str:
 
 
 def handle_control_message(slot: str, channel: str, message: str) -> bool:
-    text = message.strip()
+    command = parse_command_message(message)
+    if not command.explicit:
+        return False
+    text = command.text
     lower = text.lower()
     if lower in {"help", "commands"}:
         post(channel, help_text(slot))
@@ -559,7 +564,7 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         post(channel, agent_settings_text())
         return True
     if lower in {"mode", "session"}:
-        post(channel, f"No mode needed. Just keep talking in {slot}; send `fresh` when you want a new agent chat.")
+        post(channel, f"No mode needed. Just keep talking in {slot}; send `!fresh` when you want a new agent chat.")
         return True
     if lower in {"fresh", "new"}:
         stopped = kill_worker(slot)
@@ -601,9 +606,9 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         else:
             post(channel, f"{slot} is not running.")
         return True
-    match = re.fullmatch(r"(?:cd|folder|workdir)\s+(.+)", text, flags=re.IGNORECASE)
-    if match:
-        target = resolve(match.group(1), current_workdir(slot))
+    target_arg = cd_target_arg(text)
+    if target_arg is not None:
+        target = resolve(target_arg, current_workdir(slot))
         if not Path(target).is_dir():
             post(channel, f"Folder does not exist: `{target}`")
             return True
@@ -901,19 +906,26 @@ def dispatcher() -> None:
             continue
         if handle_control_message(slot, channel, message):
             continue
-        queue_match = re.fullmatch(r"(?:next|queue)\s+(.+)", message, flags=re.IGNORECASE | re.DOTALL)
+        command = parse_command_message(message)
+        queue_arg = queue_request_arg(command.text) if command.explicit else None
         if worker_running(slot):
-            if queue_match:
-                queued, count = queue_request(slot, queue_match.group(1).strip())
+            if queue_arg is not None:
+                queued, count = queue_request(slot, queue_arg)
                 if queued:
                     post(channel, f"Queued request for {slot}. Queue length: `{count}`.")
                 else:
-                    post(channel, f"{slot} queue is full (`{count}`). Use `queue` or `clearqueue`.")
+                    post(channel, f"{slot} queue is full (`{count}`). Use `!queue` or `!clearqueue`.")
                 continue
-            post(channel, f"{slot} is already running. Use another slot, send `next <request>` to queue one, or send `stop` here first.")
+            if command.explicit:
+                post(channel, unknown_command_text(command.text))
+                continue
+            post(channel, f"{slot} is already running. Use another slot, send `!next <request>` to queue one, or send `!stop` here first.")
             continue
-        if queue_match:
-            message = queue_match.group(1).strip()
+        if queue_arg is not None:
+            message = queue_arg
+        elif command.explicit:
+            post(channel, unknown_command_text(command.text))
+            continue
         start_worker(slot, channel, message)
 
 
@@ -966,13 +978,19 @@ def poll_slots_channel(channel: str, owner: str, bot: str) -> None:
                     continue
                 if item.get("type"):
                     continue
-                message = item.get("message", "").strip().lower()
-                if message in {"slots", "status", "list", "overview"}:
+                message = item.get("message", "").strip()
+                command = parse_command_message(message)
+                if not command.explicit:
+                    if message:
+                        post(channel, "This channel only accepts Mobailmux shortcuts. Type `!slots` or `!help`.")
+                    continue
+                text = command.text.lower()
+                if text in {"slots", "status", "list", "overview"}:
                     post(channel, all_slots_status())
-                elif message in {"help", "commands"}:
+                elif text in {"help", "commands"}:
                     post(channel, slots_channel_help())
-                elif message:
-                    post(channel, "This channel only shows slot status. Type `slots`, or use a work channel to run jobs.")
+                elif text:
+                    post(channel, unknown_command_text(command.text))
         except Exception as exc:
             print(f"[{SLOTS_CHANNEL}] poll error: {exc}", flush=True)
         time.sleep(POLL_SECONDS)

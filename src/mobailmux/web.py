@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .commands import cd_target_arg, parse_command_message, queue_request_arg, unknown_command_text
+
 
 ENV_FILE = Path(os.environ.get("MOBAILMUX_ENV", ".env"))
 
@@ -406,20 +408,20 @@ class MobailmuxWeb:
             f"Mobailmux help for `{slot}`\n\n"
             + "\n".join(slot_lines)
             + "\n\n"
-            + "Type commands as normal messages:\n"
-            "- `help` or `commands` shows this help\n"
-            "- `slots` shows all slot states\n"
-            "- `pwd` shows the current folder\n"
-            "- `ls [path]` lists files without starting an agent job\n"
-            "- `cd /path/to/project` sets the folder for future jobs in this slot\n"
-            "- `fresh` resets this slot's agent chat and clears its visible transcript\n"
-            "- `status` shows whether this slot is busy\n"
-            "- `stop` cancels the active job in this slot\n"
-            "- `logs` shows recent Mobailmux events for this slot\n"
-            "- `model` shows the Codex command/model settings\n"
-            "- `next <request>` queues one follow-up request for this slot\n"
-            "- `queue` shows queued requests\n"
-            "- `clearqueue` clears queued requests\n"
+            + "Type command shortcuts with `!`. Plain messages go to the agent.\n"
+            "- `!help` or `!commands` shows this help\n"
+            "- `!slots` shows all slot states\n"
+            "- `!pwd` shows the current folder\n"
+            "- `!ls [path]` lists files without starting an agent job\n"
+            "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
+            "- `!fresh` resets this slot's agent chat and clears its visible transcript\n"
+            "- `!status` shows whether this slot is busy\n"
+            "- `!stop` cancels the active job in this slot\n"
+            "- `!logs` shows recent Mobailmux events for this slot\n"
+            "- `!model` shows the Codex command/model settings\n"
+            "- `!next <request>` queues one follow-up request for this slot\n"
+            "- `!queue` shows queued requests\n"
+            "- `!clearqueue` clears queued requests\n"
             "- any other message continues this slot's agent chat in the current folder"
         )
 
@@ -501,7 +503,10 @@ class MobailmuxWeb:
         return f"{slot} recent events:\n```text\n" + "\n".join(lines) + "\n```"
 
     def handle_control_message(self, slot: str, message: str) -> bool:
-        text = message.strip()
+        command = parse_command_message(message)
+        if not command.explicit:
+            return False
+        text = command.text
         lower = text.lower()
         if lower in {"help", "commands"}:
             self.append_message(slot, "assistant", self.help_text(slot))
@@ -556,9 +561,9 @@ class MobailmuxWeb:
             else:
                 self.append_message(slot, "assistant", f"{slot} is not running.")
             return True
-        match = re.fullmatch(r"(?:cd|folder|workdir)\s+(.+)", text, flags=re.IGNORECASE)
-        if match:
-            target = self.resolve(match.group(1), self.current_workdir(slot))
+        target_arg = cd_target_arg(text)
+        if target_arg is not None:
+            target = self.resolve(target_arg, self.current_workdir(slot))
             if not Path(target).is_dir():
                 self.append_message(slot, "assistant", f"Folder does not exist: `{target}`")
                 return True
@@ -581,19 +586,26 @@ class MobailmuxWeb:
         self.append_message(slot, "user", message)
         if self.handle_control_message(slot, message):
             return
-        queue_match = re.fullmatch(r"(?:next|queue)\s+(.+)", message, flags=re.IGNORECASE | re.DOTALL)
+        command = parse_command_message(message)
+        queue_arg = queue_request_arg(command.text) if command.explicit else None
         if self.worker_running(slot):
-            if queue_match:
-                queued, count = self.queue_request(slot, queue_match.group(1).strip())
+            if queue_arg is not None:
+                queued, count = self.queue_request(slot, queue_arg)
                 if queued:
                     self.append_message(slot, "assistant", f"Queued request for {slot}. Queue length: `{count}`.")
                 else:
-                    self.append_message(slot, "assistant", f"{slot} queue is full (`{count}`). Use `queue` or `clearqueue`.")
+                    self.append_message(slot, "assistant", f"{slot} queue is full (`{count}`). Use `!queue` or `!clearqueue`.")
                 return
-            self.append_message(slot, "assistant", f"{slot} is already running. Use another slot, send `next <request>` to queue one, or send `stop` here first.")
+            if command.explicit:
+                self.append_message(slot, "assistant", unknown_command_text(command.text))
+                return
+            self.append_message(slot, "assistant", f"{slot} is already running. Use another slot, send `!next <request>` to queue one, or send `!stop` here first.")
             return
-        if queue_match:
-            message = queue_match.group(1).strip()
+        if queue_arg is not None:
+            message = queue_arg
+        elif command.explicit:
+            self.append_message(slot, "assistant", unknown_command_text(command.text))
+            return
         self.start_worker(slot, message)
 
     def progress_post(self, slot: str, counter: dict, message: str) -> None:
@@ -1132,15 +1144,15 @@ INDEX_HTML = r"""<!doctype html>
     <section class="messages" id="messages"></section>
     <section class="composer">
       <div class="quick">
-        <button data-cmd="status">status</button>
-        <button data-cmd="pwd">pwd</button>
-        <button data-cmd="ls">ls</button>
-        <button data-cmd="slots">slots</button>
-        <button data-cmd="fresh">fresh</button>
-        <button data-cmd="stop">stop</button>
+        <button data-cmd="!status">status</button>
+        <button data-cmd="!pwd">pwd</button>
+        <button data-cmd="!ls">ls</button>
+        <button data-cmd="!slots">slots</button>
+        <button data-cmd="!fresh">fresh</button>
+        <button data-cmd="!stop">stop</button>
       </div>
       <form class="compose-row" id="composer">
-        <textarea id="input" autocomplete="off" placeholder="Message current slot"></textarea>
+        <textarea id="input" autocomplete="off" placeholder="Message current slot or !help"></textarea>
         <button class="primary" type="submit">Send</button>
       </form>
     </section>
