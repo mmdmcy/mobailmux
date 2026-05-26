@@ -65,6 +65,16 @@ class WebCommandHandlingTest(unittest.TestCase):
         self.assertEqual(self.runtime.current_session("one"), {})
         self.assertIn(f"Folder kept at `{self.project_workdir}`", self.runtime.recent_messages()[-1]["message"])
 
+    def test_status_reports_session_folder(self) -> None:
+        self.assertTrue(self.runtime.handle_control_message("one", f"!cd {self.project_workdir}"))
+        self.runtime.set_session("one", "thread-id", str(self.project_workdir))
+
+        self.assertTrue(self.runtime.handle_control_message("one", "!status"))
+
+        message = self.runtime.recent_messages()[-1]["message"]
+        self.assertIn(f"Current folder: `{self.project_workdir}`", message)
+        self.assertIn(f"Session folder: `{self.project_workdir}`", message)
+
 
 if __name__ == "__main__":
     unittest.main()

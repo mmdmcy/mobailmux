@@ -464,7 +464,7 @@ def help_text(slot: str) -> str:
         "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
         "- `!fresh` resets this channel's agent chat, folder, and Mobailmux logs\n"
         "- `!stayfresh` resets this channel's agent chat and Mobailmux logs, keeping the current folder\n"
-        "- `!status` shows whether this slot is busy\n"
+        "- `!status` shows whether this slot is busy and which folder it is using\n"
         "- `!stop` cancels the active job in this slot\n"
         "- `!logs` shows recent Mobailmux events for this slot\n"
         "- `!model` shows the Codex command/model settings\n"
@@ -593,12 +593,15 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         session_info = current_session(slot)
         session_text = "chat saved" if session_info.get("thread_id") else "new chat"
         queue_text = f", queued `{queue_length(slot)}`"
+        workdir = current_workdir(slot)
+        info = workers.get(slot) or {}
+        session_workdir = info.get("workdir") or session_info.get("workdir") or workdir
+        folder_text = f"Current folder: `{workdir}`. Session folder: `{session_workdir}`."
         if worker_running(slot):
-            info = workers.get(slot) or {}
             current = info.get("current_command") or "working"
-            post(channel, f"{slot} is running in `{current_workdir(slot)}` ({session_text}{queue_text}). Current: `{truncate(current, 700)}`")
+            post(channel, f"{slot} is running ({session_text}{queue_text}). {folder_text} Current: `{truncate(current, 700)}`")
         else:
-            post(channel, f"{slot} is idle in `{current_workdir(slot)}` ({session_text}{queue_text}).")
+            post(channel, f"{slot} is idle ({session_text}{queue_text}). {folder_text}")
         return True
     if lower in {"log", "logs", "tail"}:
         post(channel, history_text(slot))
@@ -811,7 +814,7 @@ def run_codex(slot: str, channel: str, message: str) -> None:
             bufsize=1,
             **process_start_options(),
         )
-        workers[slot] = {"proc": proc, "started": started, "channel": channel, "current_command": None}
+        workers[slot] = {"proc": proc, "started": started, "channel": channel, "current_command": None, "workdir": workdir}
         threading.Thread(target=status_watcher, args=(slot, channel, started, done), daemon=True).start()
         threading.Thread(target=progress_file_watcher, args=(slot, channel, progress_file, progress_counter, done), daemon=True).start()
         try:

@@ -421,7 +421,7 @@ class MobailmuxWeb:
             "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
             "- `!fresh` resets this slot's agent chat, folder, and visible transcript\n"
             "- `!stayfresh` resets this slot's agent chat and visible transcript, keeping the current folder\n"
-            "- `!status` shows whether this slot is busy\n"
+            "- `!status` shows whether this slot is busy and which folder it is using\n"
             "- `!stop` cancels the active job in this slot\n"
             "- `!logs` shows recent Mobailmux events for this slot\n"
             "- `!model` shows the Codex command/model settings\n"
@@ -464,7 +464,10 @@ class MobailmuxWeb:
     def slot_status(self, slot: str) -> dict:
         running = self.worker_running(slot)
         session_info = self.current_session(slot)
-        current = (self.workers.get(slot) or {}).get("current_command")
+        info = self.workers.get(slot) or {}
+        current = info.get("current_command")
+        workdir = self.current_workdir(slot)
+        session_workdir = info.get("workdir") or session_info.get("workdir") or workdir
         return {
             "name": slot,
             "label": self.slots[slot].label,
@@ -472,7 +475,8 @@ class MobailmuxWeb:
             "state": "running" if running else "idle",
             "chat": "chat saved" if session_info.get("thread_id") else "new chat",
             "queued": self.queue_length(slot),
-            "workdir": self.current_workdir(slot),
+            "workdir": workdir,
+            "session_workdir": session_workdir,
             "current_command": current,
         }
 
@@ -548,11 +552,12 @@ class MobailmuxWeb:
             return True
         if lower == "status":
             item = self.slot_status(slot)
+            folder_text = f"Current folder: `{item['workdir']}`. Session folder: `{item['session_workdir']}`."
             if item["running"]:
                 current = item["current_command"] or "working"
-                self.append_message(slot, "assistant", f"{slot} is running in `{item['workdir']}` ({item['chat']}, queued `{item['queued']}`). Current: `{truncate(current, 700)}`")
+                self.append_message(slot, "assistant", f"{slot} is running ({item['chat']}, queued `{item['queued']}`). {folder_text} Current: `{truncate(current, 700)}`")
             else:
-                self.append_message(slot, "assistant", f"{slot} is idle in `{item['workdir']}` ({item['chat']}, queued `{item['queued']}`).")
+                self.append_message(slot, "assistant", f"{slot} is idle ({item['chat']}, queued `{item['queued']}`). {folder_text}")
             return True
         if lower in {"log", "logs", "tail"}:
             self.append_message(slot, "assistant", self.history_text(slot))
@@ -775,7 +780,7 @@ class MobailmuxWeb:
             except FileNotFoundError:
                 self.append_message(slot, "assistant", f"Codex command not found: `{self.codex_bin}`")
                 return
-            self.workers[slot] = {"proc": proc, "started": started, "current_command": None}
+            self.workers[slot] = {"proc": proc, "started": started, "current_command": None, "workdir": workdir}
             threading.Thread(target=self.status_watcher, args=(slot, started, done), daemon=True).start()
             threading.Thread(target=self.progress_file_watcher, args=(slot, progress_file, progress_counter, done), daemon=True).start()
             try:

@@ -35,6 +35,7 @@ class MattermostCommandHandlingTest(unittest.TestCase):
         sys.modules.pop("mobailmux.app", None)
         self.app = importlib.import_module("mobailmux.app")
         self.posts: list[str] = []
+        self.app.post = lambda channel, message: self.posts.append(message)
         self.app.post_slot = lambda slot, channel, message: self.posts.append(message)
 
     def tearDown(self) -> None:
@@ -65,6 +66,15 @@ class MattermostCommandHandlingTest(unittest.TestCase):
         self.assertEqual(self.app.current_workdir("one"), str(self.project_workdir))
         self.assertEqual(self.app.current_session("one"), {})
         self.assertIn(f"Folder kept at `{self.project_workdir}`", self.posts[-1])
+
+    def test_status_reports_session_folder(self) -> None:
+        self.app.set_workdir("one", str(self.project_workdir))
+        self.app.set_session("one", "thread-id", str(self.project_workdir))
+
+        self.assertTrue(self.app.handle_control_message("one", "channel-id", "!status"))
+
+        self.assertIn(f"Current folder: `{self.project_workdir}`", self.posts[-1])
+        self.assertIn(f"Session folder: `{self.project_workdir}`", self.posts[-1])
 
 
 if __name__ == "__main__":
