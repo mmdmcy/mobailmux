@@ -16,11 +16,11 @@ Mobailmux is a bridge from a chat/browser control surface to a local CLI AI agen
 
 The built-in web UI uses password auth and a signed HTTP-only cookie. It does not provide TLS by itself. Keep it on `127.0.0.1`, a private interface, or behind a TLS reverse proxy.
 
-The web transcript is stored locally in `MOBAILMUX_STATE_DIR/web.sqlite3`. `!fresh` deletes the visible transcript for that slot from this local database.
+The web transcript is stored locally in `MOBAILMUX_STATE_DIR/web.sqlite3`. `!fresh` and `!stayfresh` delete the visible transcript for that slot from this local database.
 
 ## Mattermost Notes
 
-Mattermost channel history is stored by Mattermost, not by Mobailmux. `!fresh` resets Mobailmux's Codex thread and local `logs` buffer, but it does not delete old Mattermost posts.
+Mattermost channel history is stored by Mattermost, not by Mobailmux. `!fresh` and `!stayfresh` reset Mobailmux's Codex thread and local `logs` buffer, but they do not delete old Mattermost posts.
 
 The included Compose stack binds Mattermost to `127.0.0.1` by default. For phone access, expose it only through a trusted private network or VPN.
 

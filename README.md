@@ -2,7 +2,7 @@
 
 Mobailmux turns a browser UI or Mattermost channels into mobile control slots for CLI AI agents.
 
-Each slot is an independent agent lane. Send a message, and Mobailmux runs a Codex job locally, streams command progress back to the UI, and keeps that slot's agent chat until you reset it with `!fresh`.
+Each slot is an independent agent lane. Send a message, and Mobailmux runs a Codex job locally, streams command progress back to the UI, and keeps that slot's agent chat until you reset it with `!fresh` or `!stayfresh`.
 
 ```text
 Browser or Mattermost
@@ -18,7 +18,7 @@ Use it when you want to kick off several independent AI coding jobs from iOS, An
 - Codex is the only implemented agent driver.
 - The built-in web UI is the lightest frontend and does not require Docker.
 - Mattermost is optional for teams or people who want a full chat app.
-- Both frontends use the same slot model, Codex prompt, workdir state, progress stream, and `!fresh` reset behavior.
+- Both frontends use the same slot model, Codex prompt, workdir state, progress stream, and fresh-session reset behavior.
 - The web UI is dark by default and keeps the message composer fixed while only the transcript scrolls.
 
 ## Features
@@ -27,7 +27,7 @@ Use it when you want to kick off several independent AI coding jobs from iOS, An
 - optional Mattermost channel per slot
 - multiple slots running in parallel
 - continuing Codex thread per slot
-- `!fresh` reset command that starts a new agent chat and clears local slot history
+- `!fresh` and `!stayfresh` reset commands that start a new agent chat and clear local slot history
 - `!stop`, `!status`, `!pwd`, `!ls`, and `!cd` controls
 - queued follow-up requests with `!next <request>`
 - command start/exit progress from `codex exec --json`
@@ -149,6 +149,7 @@ Use `!` for Mobailmux command shortcuts. Mattermost slash commands are not used.
 !ls [path]
 !cd [path]
 !fresh
+!stayfresh
 !status
 !stop
 !logs
@@ -160,7 +161,7 @@ Use `!` for Mobailmux command shortcuts. Mattermost slash commands are not used.
 
 Any other message starts or continues that slot's Codex chat in the current folder.
 
-`!fresh` starts a new Codex thread for that slot. In the web UI it also clears the visible transcript for that slot. In Mattermost it clears Mobailmux's local `logs` history, but it does not delete existing Mattermost channel posts.
+`!fresh` starts a new Codex thread for that slot and resets the slot folder to its configured default. `!stayfresh` starts a new Codex thread while keeping the slot's current folder. In the web UI both commands clear the visible transcript for that slot. In Mattermost they clear Mobailmux's local `logs` history, but do not delete existing Mattermost channel posts.
 
 `!cd` changes the slot's workdir, and `!cd` with no path goes to your home folder. If the workdir changes while a Codex thread is saved, Mobailmux resets that slot's thread so future work starts in the new folder.
 

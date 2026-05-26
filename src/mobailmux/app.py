@@ -359,6 +359,12 @@ def set_workdir(slot: str, workdir: str) -> None:
         save_state(state)
 
 
+def reset_workdir(slot: str) -> str:
+    workdir = SLOTS[slot].default_workdir
+    set_workdir(slot, workdir)
+    return workdir
+
+
 def current_session(slot: str) -> dict:
     with state_lock:
         return dict(state.setdefault("sessions", {}).get(slot, {}))
@@ -456,7 +462,8 @@ def help_text(slot: str) -> str:
         "- `!pwd` shows the current folder\n"
         "- `!ls [path]` lists files without starting an agent job\n"
         "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
-        "- `!fresh` resets this channel's agent chat and Mobailmux logs\n"
+        "- `!fresh` resets this channel's agent chat, folder, and Mobailmux logs\n"
+        "- `!stayfresh` resets this channel's agent chat and Mobailmux logs, keeping the current folder\n"
         "- `!status` shows whether this slot is busy\n"
         "- `!stop` cancels the active job in this slot\n"
         "- `!logs` shows recent Mobailmux events for this slot\n"
@@ -564,12 +571,14 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         post(channel, agent_settings_text())
         return True
     if lower in {"mode", "session"}:
-        post(channel, f"No mode needed. Just keep talking in {slot}; send `!fresh` when you want a new agent chat.")
+        post(channel, f"No mode needed. Just keep talking in {slot}; send `!fresh` or `!stayfresh` when you want a new agent chat.")
         return True
-    if lower in {"fresh", "new"}:
+    if lower in {"fresh", "new", "stayfresh"}:
+        keep_workdir = lower == "stayfresh"
         stopped = kill_worker(slot)
         cleared = clear_queued_requests(slot)
         clear_session(slot)
+        workdir = current_workdir(slot) if keep_workdir else reset_workdir(slot)
         clear_history(slot)
         extra = []
         if stopped:
@@ -577,7 +586,8 @@ def handle_control_message(slot: str, channel: str, message: str) -> bool:
         if cleared:
             extra.append(f"cleared {cleared} queued request(s)")
         suffix = f" ({', '.join(extra)})." if extra else "."
-        post_slot(slot, channel, f"{slot} chat reset{suffix} Previous Mobailmux logs for this slot were cleared. Your next message starts a new agent chat.")
+        folder_text = f"Folder kept at `{workdir}`." if keep_workdir else f"Folder reset to `{workdir}`."
+        post_slot(slot, channel, f"{slot} chat reset{suffix} {folder_text} Previous Mobailmux logs for this slot were cleared. Your next message starts a new agent chat.")
         return True
     if lower == "status":
         session_info = current_session(slot)

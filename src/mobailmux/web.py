@@ -247,6 +247,11 @@ class MobailmuxWeb:
             self.state.setdefault("workdirs", {})[slot] = workdir
             self.save_state()
 
+    def reset_workdir(self, slot: str) -> str:
+        workdir = self.slots[slot].default_workdir
+        self.set_workdir(slot, workdir)
+        return workdir
+
     def current_session(self, slot: str) -> dict:
         with self.state_lock:
             return dict(self.state.setdefault("sessions", {}).get(slot, {}))
@@ -414,7 +419,8 @@ class MobailmuxWeb:
             "- `!pwd` shows the current folder\n"
             "- `!ls [path]` lists files without starting an agent job\n"
             "- `!cd [path]` sets the folder for future jobs; no path goes to your home folder\n"
-            "- `!fresh` resets this slot's agent chat and clears its visible transcript\n"
+            "- `!fresh` resets this slot's agent chat, folder, and visible transcript\n"
+            "- `!stayfresh` resets this slot's agent chat and visible transcript, keeping the current folder\n"
             "- `!status` shows whether this slot is busy\n"
             "- `!stop` cancels the active job in this slot\n"
             "- `!logs` shows recent Mobailmux events for this slot\n"
@@ -524,10 +530,12 @@ class MobailmuxWeb:
         if lower in {"model", "settings"}:
             self.append_message(slot, "assistant", self.agent_settings_text())
             return True
-        if lower in {"fresh", "new"}:
+        if lower in {"fresh", "new", "stayfresh"}:
+            keep_workdir = lower == "stayfresh"
             stopped = self.kill_worker(slot)
             cleared = self.clear_queued_requests(slot)
             self.clear_session(slot)
+            workdir = self.current_workdir(slot) if keep_workdir else self.reset_workdir(slot)
             self.clear_slot_messages(slot)
             extra = []
             if stopped:
@@ -535,7 +543,8 @@ class MobailmuxWeb:
             if cleared:
                 extra.append(f"cleared {cleared} queued request(s)")
             suffix = f" ({', '.join(extra)})." if extra else "."
-            self.append_message(slot, "assistant", f"{slot} chat reset{suffix} Previous messages for this slot were cleared. Your next message starts a new agent chat.")
+            folder_text = f"Folder kept at `{workdir}`." if keep_workdir else f"Folder reset to `{workdir}`."
+            self.append_message(slot, "assistant", f"{slot} chat reset{suffix} {folder_text} Previous messages for this slot were cleared. Your next message starts a new agent chat.")
             return True
         if lower == "status":
             item = self.slot_status(slot)
@@ -1149,6 +1158,7 @@ INDEX_HTML = r"""<!doctype html>
         <button data-cmd="!ls">ls</button>
         <button data-cmd="!slots">slots</button>
         <button data-cmd="!fresh">fresh</button>
+        <button data-cmd="!stayfresh">stayfresh</button>
         <button data-cmd="!stop">stop</button>
       </div>
       <form class="compose-row" id="composer">
