@@ -13,6 +13,17 @@ Browser or Mattermost
 
 Use it when you want to kick off several independent AI coding jobs from iOS, Android, desktop, or a small server without juggling SSH or tmux sessions.
 
+## Repository Layout
+
+Mobailmux is organized into independent surfaces:
+
+- `commands/` - upstream terminal interface for tmux-backed Codex sessions.
+- `src/mobailmux/web.py`, `docs/web.md`, and `web/` - browser UI surface.
+- `src/mobailmux/app.py`, `docs/mattermost.md`, and `mattermost/` - Mattermost connector surface.
+
+The command package is the upstream contract for direct terminal automation.
+Run `mbx commands` for the live command list.
+
 ## Current Shape
 
 - Codex is the only implemented agent driver.
@@ -124,10 +135,10 @@ help
 For a direct mobile setup, the slot and channel names can be the same. For example:
 
 ```text
-MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
+MOBAILMUX_SLOTS=one:one,two:two,three:three
 ```
 
-Then each Mattermost channel is its own Codex lane: `aione`, `aitwo`, and `aithree`.
+Then each Mattermost channel is its own Codex lane: `one`, `two`, and `three`.
 
 Mobailmux also looks for a Mattermost channel named `slots`. If that channel exists, it is status-only: type `slots` there to see the current state of every lane. It will not start Codex jobs.
 

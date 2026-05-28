@@ -112,7 +112,7 @@ Any other message continues that channel's agent chat.
 For direct mobile channel names, configure slots with the same name as the Mattermost channel:
 
 ```text
-MOBAILMUX_SLOTS=aione:aione,aitwo:aitwo,aithree:aithree
+MOBAILMUX_SLOTS=one:one,two:two,three:three
 ```
 
 Mobailmux also watches a Mattermost channel named `slots` when it exists. That channel is status-only: type `!slots` there to see every slot state. It will not start Codex jobs.

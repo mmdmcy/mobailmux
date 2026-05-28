@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+program="$(basename "$0")"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mbx start <slot> [options] [directory] [prompt...]
+  mbx new <slot> [options] [directory] [prompt...]
+  mbx resume <slot> [options] [directory]
+  mbx stop <slot|all>
+  mbx list
+  mbx commands
+  mbx check
+
+Slots:
+  one, two, three, four, five, six, seven, eight, nine
+  1, 2, 3, 4, 5, 6, 7, 8, 9
+
+Options:
+  -C, --cd, --dir <dir>  Project directory.
+  --safe                 Use normal Codex approvals.
+  --unsafe               Bypass Codex approvals and sandbox. Default.
+  --restart              Replace an existing slot before starting.
+  --no-attach            Start without attaching to tmux.
+  --dry-run              Print what would run.
+  -h, --help             Show help.
+
+Examples:
+  mbx start one
+  mbx start two ~/projects/example "check git status"
+  mbx resume one
+  mbx stop one
+  mbx list
+EOF
+}
+
+commands() {
+  cat <<'EOF'
+Commands:
+  mbx start <slot> [directory] [prompt...]
+      Attach to a running slot, start Codex in an idle slot, or create it.
+
+  mbx new <slot> [directory] [prompt...]
+      Stop the slot if it exists, then start a fresh Codex session.
+
+  mbx resume <slot> [directory]
+      Run codex resume --last in a new or idle slot.
+
+  mbx stop <slot>
+      Stop one slot.
+
+  mbx stop all
+      Stop all numbered slots.
+
+  mbx list
+      Show running slots, tmux session names, commands, and directories.
+
+  mbx check
+      Check the installed and latest Codex versions without changing npm config.
+
+  mbx commands
+      Show this command list.
+EOF
+}
+
+die() {
+  echo "$program: $*" >&2
+  exit 1
+}
+
+need_tmux() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+}
+
+slot_number() {
+  case "${1:-}" in
+    1|one) echo 1 ;;
+    2|two) echo 2 ;;
+    3|three) echo 3 ;;
+    4|four) echo 4 ;;
+    5|five) echo 5 ;;
+    6|six) echo 6 ;;
+    7|seven) echo 7 ;;
+    8|eight) echo 8 ;;
+    9|nine) echo 9 ;;
+    *) return 1 ;;
+  esac
+}
+
+slot_label() {
+  case "$1" in
+    1) echo one ;;
+    2) echo two ;;
+    3) echo three ;;
+    4) echo four ;;
+    5) echo five ;;
+    6) echo six ;;
+    7) echo seven ;;
+    8) echo eight ;;
+    9) echo nine ;;
+    *) return 1 ;;
+  esac
+}
+
+session_name() {
+  echo "${MBX_SESSION_PREFIX:-codex}-$1"
+}
+
+attach_session() {
+  local session="$1"
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$session"
+  else
+    exec tmux attach-session -t "$session"
+  fi
+}
+
+current_codex_version() {
+  codex --version 2>/dev/null | awk '{print $2}' | head -1
+}
+
+latest_codex_version() {
+  timeout 5 npm view @openai/codex version --min-release-age=0 2>/dev/null | tr -d '"[:space:]'
+}
+
+check_codex_update() {
+  local current latest
+  current="$(current_codex_version || true)"
+  latest="$(latest_codex_version || true)"
+
+  if [[ -z "$current" ]]; then
+    echo "Codex is not available on PATH."
+    return 1
+  fi
+
+  echo "Codex current: $current"
+
+  if [[ -z "$latest" ]]; then
+    echo "Codex latest:  unable to check npm right now"
+    return 0
+  fi
+
+  echo "Codex latest:  $latest"
+  echo "Npm gate:      min-release-age=14 remains enabled globally"
+
+  if [[ "$latest" != "$current" ]]; then
+    echo "Update note:   update Codex after the release has aged in, or deliberately bypass the npm gate for Codex only."
+  else
+    echo "Update note:   already current"
+  fi
+}
+
+maybe_codex_update_notice() {
+  [[ "${MBX_NO_UPDATE_CHECK:-}" == "1" ]] && return 0
+
+  local cache_dir cache_file now last interval current latest
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mbx"
+  cache_file="$cache_dir/codex-latest"
+  interval="${MBX_UPDATE_CHECK_INTERVAL:-86400}"
+  now="$(date +%s)"
+  last=0
+
+  if [[ -f "$cache_file" ]]; then
+    last="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+  fi
+
+  if (( now - last > interval )); then
+    mkdir -p "$cache_dir"
+    latest="$(latest_codex_version || true)"
+    if [[ -n "$latest" ]]; then
+      printf '%s\n' "$latest" > "$cache_file"
+    fi
+  elif [[ -f "$cache_file" ]]; then
+    latest="$(head -1 "$cache_file" 2>/dev/null || true)"
+  else
+    latest=""
+  fi
+
+  [[ -n "${latest:-}" ]] || return 0
+  current="$(current_codex_version || true)"
+  [[ -n "$current" ]] || return 0
+
+  if [[ "$latest" != "$current" ]]; then
+    echo "Codex update available: $current -> $latest. Check npm's release age before updating."
+  fi
+}
+
+codex_command_array() {
+  local output_name="$1"
+  shift
+  local -n output="$output_name"
+  local workdir="$1"
+  local mode="$2"
+  local unsafe="$3"
+  shift 3
+
+  if [[ "$mode" == "resume" && "$unsafe" == "1" ]]; then
+    output=(codex --dangerously-bypass-approvals-and-sandbox --cd "$workdir" resume --last)
+  elif [[ "$mode" == "resume" ]]; then
+    output=(codex --cd "$workdir" resume --last)
+  elif [[ "$unsafe" == "1" ]]; then
+    if command -v codexunsafe >/dev/null 2>&1; then
+      output=(codexunsafe --cd "$workdir")
+    else
+      output=(codex --dangerously-bypass-approvals-and-sandbox --cd "$workdir")
+    fi
+  else
+    output=(codex --cd "$workdir")
+  fi
+
+  if [[ $# -gt 0 ]]; then
+    output+=("$*")
+  fi
+}
+
+codex_command_line() {
+  local codex_cmd=()
+  codex_command_array codex_cmd "$@"
+
+  printf '%q ' "${codex_cmd[@]}"
+}
+
+exec_codex_command() {
+  local codex_cmd=()
+  codex_command_array codex_cmd "$@"
+  exec "${codex_cmd[@]}"
+}
+
+resolve_workdir() {
+  local workdir="$1"
+  if [[ -z "$workdir" ]]; then
+    pwd -P
+    return 0
+  fi
+
+  [[ -d "$workdir" ]] || die "directory does not exist: $workdir"
+  cd "$workdir" && pwd -P
+}
+
+list_slots() {
+  need_tmux
+
+  local found=0
+  local session attached slot label command path
+
+  while IFS='|' read -r session attached; do
+    [[ "$session" =~ ^${MBX_SESSION_PREFIX:-codex}-([1-9])$ ]] || continue
+    slot="${BASH_REMATCH[1]}"
+    label="$(slot_label "$slot")"
+    command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+    path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
+    if (( ! found )); then
+      printf '%-6s %-9s %-8s %-12s %s\n' "slot" "state" "session" "command" "path"
+    fi
+    if [[ "$attached" == "1" ]]; then
+      printf '%-6s %-9s %-8s %-12s %s\n' "$label" "attached" "$session" "${command:-unknown}" "${path:-unknown}"
+    else
+      printf '%-6s %-9s %-8s %-12s %s\n' "$label" "detached" "$session" "${command:-unknown}" "${path:-unknown}"
+    fi
+    found=1
+  done < <(tmux list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null || true)
+
+  (( found )) || echo "No mbx sessions are running."
+}
+
+stop_slot() {
+  local slot="$1"
+  local session label
+  session="$(session_name "$slot")"
+  label="$(slot_label "$slot")"
+
+  need_tmux
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux kill-session -t "$session"
+    echo "Stopped $label ($session)"
+  else
+    echo "$label is not running."
+  fi
+}
+
+stop_all_slots() {
+  need_tmux
+
+  local found=0
+  local session slot
+
+  while IFS=: read -r session _; do
+    [[ "$session" =~ ^${MBX_SESSION_PREFIX:-codex}-([1-9])$ ]] || continue
+    slot="${BASH_REMATCH[1]}"
+    tmux kill-session -t "$session"
+    echo "Stopped $(slot_label "$slot") ($session)"
+    found=1
+  done < <(tmux ls 2>/dev/null || true)
+
+  (( found )) || echo "No mbx sessions are running."
+}
+
+run_slot() {
+  local action="$1"
+  local slot="$2"
+  shift 2
+
+  local workdir_arg=""
+  local unsafe=1
+  local restart=0
+  local attach=1
+  local dry_run=0
+  local prompt_parts=()
+
+  [[ "$action" == "new" ]] && restart=1
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -C|--cd|--dir)
+        [[ $# -ge 2 ]] || die "$1 requires a directory"
+        workdir_arg="$2"
+        shift 2
+        ;;
+      --safe)
+        unsafe=0
+        shift
+        ;;
+      --unsafe)
+        unsafe=1
+        shift
+        ;;
+      --restart)
+        restart=1
+        shift
+        ;;
+      --no-attach)
+        attach=0
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          prompt_parts+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$workdir_arg" && -d "$1" ]]; then
+          workdir_arg="$1"
+        else
+          prompt_parts+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  need_tmux
+
+  local session label workdir mode cmdline
+  session="$(session_name "$slot")"
+  label="$(slot_label "$slot")"
+  workdir="$(resolve_workdir "$workdir_arg")"
+  mode="start"
+  [[ "$action" == "resume" ]] && mode="resume"
+
+  if [[ "$action" == "resume" && "${#prompt_parts[@]}" -gt 0 ]]; then
+    die "resume does not accept a prompt; use 'mbx start $label ...' or 'mbx new $label ...'"
+  fi
+
+  cmdline="$(codex_command_line "$workdir" "$mode" "$unsafe" "${prompt_parts[@]}")"
+
+  if (( dry_run )); then
+    echo "slot:    $label"
+    echo "session: $session"
+    echo "workdir: $workdir"
+    echo "command: $cmdline"
+    return 0
+  fi
+
+  maybe_codex_update_notice
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    if (( restart )); then
+      tmux kill-session -t "$session"
+    elif [[ "$action" == "resume" ]]; then
+      if [[ -n "${TMUX:-}" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null || true)" == "$session" ]]; then
+        exec_codex_command "$workdir" "$mode" "$unsafe"
+      fi
+
+      local current
+      current="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+      case "$current" in
+        bash|zsh|fish|sh)
+          tmux send-keys -t "$session" "$cmdline" C-m
+          ;;
+      esac
+
+      if (( attach )); then
+        attach_session "$session"
+      else
+        echo "Resume sent to $label ($session)"
+      fi
+      return 0
+    else
+      local current
+      current="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+      case "$current" in
+        bash|zsh|fish|sh)
+          if [[ -n "${TMUX:-}" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null || true)" == "$session" ]]; then
+            exec_codex_command "$workdir" "$mode" "$unsafe" "${prompt_parts[@]}"
+          fi
+
+          tmux send-keys -t "$session" "$cmdline" C-m
+          if (( attach )); then
+            attach_session "$session"
+          else
+            echo "Started Codex in idle $label ($session) from $workdir"
+          fi
+          return 0
+          ;;
+      esac
+
+      echo "$label is already running as $session. Attaching. Use 'mbx new $label' to restart it."
+      if (( attach )); then
+        attach_session "$session"
+      fi
+      return 0
+    fi
+  fi
+
+  tmux new-session -d -s "$session" -n "$session" -c "$workdir"
+  tmux set-option -t "$session" remain-on-exit on >/dev/null
+  tmux send-keys -t "$session" "$cmdline" C-m
+
+  if [[ "$action" == "resume" ]]; then
+    echo "Started $label ($session) with Codex resume in $workdir"
+  else
+    echo "Started $label ($session) in $workdir"
+  fi
+
+  if (( attach )); then
+    attach_session "$session"
+  fi
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    ""|-h|--help|help)
+      usage
+      ;;
+    list|ls)
+      list_slots
+      ;;
+    commands|cmds)
+      commands
+      ;;
+    check)
+      check_codex_update
+      ;;
+    stop)
+      [[ $# -ge 2 ]] || die "stop needs a slot or all"
+      if [[ "$2" == "all" ]]; then
+        stop_all_slots
+      else
+        local slot
+        slot="$(slot_number "$2")" || die "unknown slot: $2"
+        stop_slot "$slot"
+      fi
+      ;;
+    start|new|resume)
+      [[ $# -ge 2 ]] || die "$command needs a slot"
+      local slot
+      slot="$(slot_number "$2")" || die "unknown slot: $2"
+      shift 2
+      run_slot "$command" "$slot" "$@"
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
