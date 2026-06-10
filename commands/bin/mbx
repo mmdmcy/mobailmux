@@ -6,17 +6,19 @@ program="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  mbx start <slot> [options] [directory] [prompt...]
-  mbx new <slot> [options] [directory] [prompt...]
-  mbx resume <slot> [options] [directory]
+  mbx start|s <slot> [options] [directory] [prompt...]
+  mbx new|n <slot> [options] [directory] [prompt...]
+  mbx resume|r <slot> [options] [directory]
   mbx stop <slot|all>
+  mbx status|slots|sessions [slot|all]
   mbx list
-  mbx commands
+  mbx help|command|commands
   mbx check
 
 Slots:
-  one, two, three, four, five, six, seven, eight, nine
-  1, 2, 3, 4, 5, 6, 7, 8, 9
+  A slot is a named Codex session backed by tmux.
+  a, b, c, d, e, f, g, h, i
+  legacy aliases: one..nine and 1..9
 
 Options:
   -C, --cd, --dir <dir>  Project directory.
@@ -28,10 +30,11 @@ Options:
   -h, --help             Show help.
 
 Examples:
-  mbx start one
-  mbx start two ~/projects/example "check git status"
-  mbx resume one
-  mbx stop one
+  mbx start a
+  mbx s b ~/projects/example "check git status"
+  mbx r a
+  mbx stop a
+  mbx status
   mbx list
 EOF
 }
@@ -40,12 +43,15 @@ commands() {
   cat <<'EOF'
 Commands:
   mbx start <slot> [directory] [prompt...]
+  mbx s <slot> [directory] [prompt...]
       Attach to a running slot, start Codex in an idle slot, or create it.
 
   mbx new <slot> [directory] [prompt...]
+  mbx n <slot> [directory] [prompt...]
       Stop the slot if it exists, then start a fresh Codex session.
 
   mbx resume <slot> [directory]
+  mbx r <slot> [directory]
       Run codex resume --last in a new or idle slot.
 
   mbx stop <slot>
@@ -54,12 +60,19 @@ Commands:
   mbx stop all
       Stop all numbered slots.
 
+  mbx status [slot|all]
+  mbx sessions [slot|all]
+  mbx slots [slot|all]
+      Show every available session name, plus running tmux state when present.
+
   mbx list
-      Show running slots, tmux session names, commands, and directories.
+      Show only currently running sessions.
 
   mbx check
       Check the installed and latest Codex versions without changing npm config.
 
+  mbx help
+  mbx command
   mbx commands
       Show this command list.
 EOF
@@ -75,31 +88,33 @@ need_tmux() {
 }
 
 slot_number() {
-  case "${1:-}" in
-    1|one) echo 1 ;;
-    2|two) echo 2 ;;
-    3|three) echo 3 ;;
-    4|four) echo 4 ;;
-    5|five) echo 5 ;;
-    6|six) echo 6 ;;
-    7|seven) echo 7 ;;
-    8|eight) echo 8 ;;
-    9|nine) echo 9 ;;
+  local value="${1:-}"
+  value="${value,,}"
+  case "$value" in
+    a|1|one) echo 1 ;;
+    b|2|two) echo 2 ;;
+    c|3|three) echo 3 ;;
+    d|4|four) echo 4 ;;
+    e|5|five) echo 5 ;;
+    f|6|six) echo 6 ;;
+    g|7|seven) echo 7 ;;
+    h|8|eight) echo 8 ;;
+    i|9|nine) echo 9 ;;
     *) return 1 ;;
   esac
 }
 
 slot_label() {
   case "$1" in
-    1) echo one ;;
-    2) echo two ;;
-    3) echo three ;;
-    4) echo four ;;
-    5) echo five ;;
-    6) echo six ;;
-    7) echo seven ;;
-    8) echo eight ;;
-    9) echo nine ;;
+    1) echo a ;;
+    2) echo b ;;
+    3) echo c ;;
+    4) echo d ;;
+    5) echo e ;;
+    6) echo f ;;
+    7) echo g ;;
+    8) echo h ;;
+    9) echo i ;;
     *) return 1 ;;
   esac
 }
@@ -239,6 +254,20 @@ resolve_workdir() {
   cd "$workdir" && pwd -P
 }
 
+print_status_header() {
+  printf '%-6s %-10s %-8s %-12s %s\n' "name" "state" "tmux" "command" "path"
+}
+
+print_status_row() {
+  local label="$1"
+  local state="$2"
+  local session="$3"
+  local command="$4"
+  local path="$5"
+
+  printf '%-6s %-10s %-8s %-12s %s\n' "$label" "$state" "$session" "$command" "$path"
+}
+
 list_slots() {
   need_tmux
 
@@ -252,17 +281,54 @@ list_slots() {
     command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
     path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
     if (( ! found )); then
-      printf '%-6s %-9s %-8s %-12s %s\n' "slot" "state" "session" "command" "path"
+      print_status_header
     fi
     if [[ "$attached" == "1" ]]; then
-      printf '%-6s %-9s %-8s %-12s %s\n' "$label" "attached" "$session" "${command:-unknown}" "${path:-unknown}"
+      print_status_row "$label" "attached" "$session" "${command:-unknown}" "${path:-unknown}"
     else
-      printf '%-6s %-9s %-8s %-12s %s\n' "$label" "detached" "$session" "${command:-unknown}" "${path:-unknown}"
+      print_status_row "$label" "detached" "$session" "${command:-unknown}" "${path:-unknown}"
     fi
     found=1
   done < <(tmux list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null || true)
 
-  (( found )) || echo "No mbx sessions are running."
+  (( found )) || echo "No mbx sessions are running. Use 'mbx status' to see available session names."
+}
+
+status_slots() {
+  local requested="${1:-all}"
+  local slots=()
+  local slot
+
+  need_tmux
+
+  if [[ "$requested" == "all" || -z "$requested" ]]; then
+    slots=(1 2 3 4 5 6 7 8 9)
+  else
+    slot="$(slot_number "$requested")" || die "unknown slot: $requested"
+    slots=("$slot")
+  fi
+
+  print_status_header
+
+  local label session attached command path state
+  for slot in "${slots[@]}"; do
+    label="$(slot_label "$slot")"
+    session="$(session_name "$slot")"
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+      attached="$(tmux display-message -p -t "$session" '#{session_attached}' 2>/dev/null || true)"
+      command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+      path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
+      if [[ "$attached" == "1" ]]; then
+        state="attached"
+      else
+        state="detached"
+      fi
+      print_status_row "$label" "$state" "$session" "${command:-unknown}" "${path:-unknown}"
+    else
+      print_status_row "$label" "available" "$session" "-" "-"
+    fi
+  done
 }
 
 stop_slot() {
@@ -456,20 +522,40 @@ run_slot() {
 main() {
   local command="${1:-}"
   case "$command" in
-    ""|-h|--help|help)
+    ""|-h|--help)
       usage
       ;;
     list|ls)
+      [[ $# -eq 1 ]] || die "$command does not accept arguments. Use 'mbx status <slot>' for one session."
       list_slots
       ;;
-    commands|cmds)
+    status|sessions|slots)
+      shift
+      case "${1:-}" in
+        -h|--help|help)
+          commands
+          exit 0
+          ;;
+      esac
+      [[ $# -le 1 ]] || die "$command accepts at most one slot or all"
+      status_slots "${1:-all}"
+      ;;
+    help|command|commands|cmd|cmds)
+      [[ $# -eq 1 ]] || die "$command does not accept arguments"
       commands
       ;;
     check)
+      [[ $# -eq 1 ]] || die "check does not accept arguments"
       check_codex_update
       ;;
     stop)
-      [[ $# -ge 2 ]] || die "stop needs a slot or all"
+      case "${2:-}" in
+        -h|--help|help)
+          commands
+          exit 0
+          ;;
+      esac
+      [[ $# -eq 2 ]] || die "stop needs exactly one slot or all"
       if [[ "$2" == "all" ]]; then
         stop_all_slots
       else
@@ -478,15 +564,27 @@ main() {
         stop_slot "$slot"
       fi
       ;;
-    start|new|resume)
+    start|s|new|n|resume|r)
+      case "${2:-}" in
+        -h|--help|help)
+          usage
+          exit 0
+          ;;
+      esac
+      local action="$command"
+      case "$action" in
+        s) action="start" ;;
+        n) action="new" ;;
+        r) action="resume" ;;
+      esac
       [[ $# -ge 2 ]] || die "$command needs a slot"
       local slot
       slot="$(slot_number "$2")" || die "unknown slot: $2"
       shift 2
-      run_slot "$command" "$slot" "$@"
+      run_slot "$action" "$slot" "$@"
       ;;
     *)
-      die "unknown command: $command"
+      die "unknown command: $command. Run 'mbx help' for commands."
       ;;
   esac
 }
