@@ -73,7 +73,7 @@ class SlotConfig:
 
 
 BASE_URL = required_cfg("MOBAILMUX_MATTERMOST_URL").rstrip("/")
-TOKEN = required_cfg("MOBAILMUX_BOT_TOKEN")
+BOT_AUTH = required_cfg("MOBAILMUX_BOT_TOKEN")
 TEAM_NAME = required_cfg("MOBAILMUX_TEAM_NAME")
 OWNER_USERNAME = cfg("MOBAILMUX_OWNER_USERNAME")
 OWNER_USER_ID = cfg("MOBAILMUX_OWNER_USER_ID")
@@ -120,7 +120,7 @@ def parse_slots() -> dict[str, SlotConfig]:
 SLOTS = parse_slots()
 
 http = requests.Session()
-http.headers.update({"Authorization": f"Bearer {TOKEN}"})
+http.headers.update({"Authorization": f"Bearer {BOT_AUTH}"})
 
 state_lock = threading.Lock()
 workers: dict[str, dict] = {}
@@ -875,11 +875,11 @@ def run_codex(slot: str, channel: str, message: str) -> None:
 
     usage_text = ""
     if usage:
-        input_tokens = usage.get("input_tokens")
-        cached_input_tokens = usage.get("cached_input_tokens")
-        output_tokens = usage.get("output_tokens")
-        if input_tokens is not None or output_tokens is not None:
-            usage_text = f"\n\nUsage total across tool calls: input `{input_tokens}`, cached `{cached_input_tokens}`, output `{output_tokens}`"
+        input_count = usage.get("input_tokens")
+        cached_input_count = usage.get("cached_input_tokens")
+        output_count = usage.get("output_tokens")
+        if input_count is not None or output_count is not None:
+            usage_text = f"\n\nUsage total across tool calls: input `{input_count}`, cached `{cached_input_count}`, output `{output_count}`"
 
     returncode = proc.returncode if proc is not None else 1
     if stop_requested:

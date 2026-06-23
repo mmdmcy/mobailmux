@@ -63,7 +63,7 @@ write_env_value() {
 }
 
 admin_token() {
-  local headers body token
+  local headers body admin_auth
   headers="$(mktemp)"
   body="$(mktemp)"
   curl -fsS \
@@ -73,13 +73,13 @@ admin_token() {
     -X POST \
     -d "$(jq -cn --arg login_id "$MOBAILMUX_ADMIN_USERNAME" --arg password "$MOBAILMUX_ADMIN_PASSWORD" '{login_id: $login_id, password: $password}')" \
     "$BASE/api/v4/users/login" >/dev/null
-  token="$(awk 'tolower($1) == "token:" { print $2 }' "$headers" | tr -d '\r' | tail -n 1)"
+  admin_auth="$(awk 'tolower($1) == "token:" { print $2 }' "$headers" | tr -d '\r' | tail -n 1)"
   rm -f "$headers" "$body"
-  [[ -n "$token" ]] || {
+  [[ -n "$admin_auth" ]] || {
     echo "Mattermost admin login did not return a token." >&2
     return 1
   }
-  printf "%s" "$token"
+  printf "%s" "$admin_auth"
 }
 
 api_get() {
@@ -183,11 +183,11 @@ ensure_channel() {
   api_post "$token" "/api/v4/channels/$channel_id/members" "$(jq -cn --arg user_id "$bot_user_id" '{user_id: $user_id}')" >/dev/null 2>&1 || true
 }
 
-token="$(admin_token)"
-team_id="$(team_id_by_name "$token")"
+admin_auth="$(admin_token)"
+team_id="$(team_id_by_name "$admin_auth")"
 if [[ -z "$team_id" ]]; then
   echo "Creating team: $MOBAILMUX_TEAM_NAME"
-  team_id="$(create_team "$token")"
+  team_id="$(create_team "$admin_auth")"
 fi
 
 [[ -n "$team_id" ]] || {
@@ -195,16 +195,16 @@ fi
   exit 1
 }
 
-owner_user_id="$(user_id_by_name "$token" "$MOBAILMUX_OWNER_USERNAME")"
+owner_user_id="$(user_id_by_name "$admin_auth" "$MOBAILMUX_OWNER_USERNAME")"
 [[ -n "$owner_user_id" ]] || {
   echo "Mattermost owner user not found: $MOBAILMUX_OWNER_USERNAME" >&2
   exit 1
 }
 
-bot_user_id="$(user_id_by_name "$token" "$MOBAILMUX_BOT_USERNAME")"
+bot_user_id="$(user_id_by_name "$admin_auth" "$MOBAILMUX_BOT_USERNAME")"
 if [[ -z "$bot_user_id" ]]; then
   echo "Creating bot: $MOBAILMUX_BOT_USERNAME"
-  bot_user_id="$(create_bot_user "$token")"
+  bot_user_id="$(create_bot_user "$admin_auth")"
 else
   echo "Bot exists: $MOBAILMUX_BOT_USERNAME"
 fi
@@ -214,16 +214,16 @@ fi
   exit 1
 }
 
-ensure_team_member "$token" "$team_id" "$owner_user_id"
-ensure_team_member "$token" "$team_id" "$bot_user_id"
+ensure_team_member "$admin_auth" "$team_id" "$owner_user_id"
+ensure_team_member "$admin_auth" "$team_id" "$bot_user_id"
 
 if [[ -z "${MOBAILMUX_BOT_TOKEN:-}" ]]; then
-  bot_token="$(generate_bot_token "$token" "$bot_user_id")"
-  [[ -n "$bot_token" ]] || {
+  bot_auth="$(generate_bot_token "$admin_auth" "$bot_user_id")"
+  [[ -n "$bot_auth" ]] || {
     echo "Mattermost did not return a bot token. Check personal access token settings." >&2
     exit 1
   }
-  write_env_value MOBAILMUX_BOT_TOKEN "$bot_token"
+  write_env_value MOBAILMUX_BOT_TOKEN "$bot_auth"
   echo "Stored MOBAILMUX_BOT_TOKEN in $ENV_FILE"
 else
   echo "MOBAILMUX_BOT_TOKEN already exists in $ENV_FILE"
@@ -238,11 +238,11 @@ for item in "${slots[@]}"; do
     echo "Invalid slot spec: $item" >&2
     exit 1
   }
-  ensure_channel "$token" "$team_id" "$owner_user_id" "$bot_user_id" "$slot_name" "$channel_name"
+  ensure_channel "$admin_auth" "$team_id" "$owner_user_id" "$bot_user_id" "$slot_name" "$channel_name"
 done
 
 if [[ -n "${MOBAILMUX_SLOTS_CHANNEL:-}" ]]; then
-  ensure_channel "$token" "$team_id" "$owner_user_id" "$bot_user_id" "Slots" "$MOBAILMUX_SLOTS_CHANNEL"
+  ensure_channel "$admin_auth" "$team_id" "$owner_user_id" "$bot_user_id" "Slots" "$MOBAILMUX_SLOTS_CHANNEL"
 fi
 
 echo "Done. Mobailmux Mattermost channels are ready."

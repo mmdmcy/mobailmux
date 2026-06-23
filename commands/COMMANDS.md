@@ -32,8 +32,8 @@ mbx commands
 default. `mbx list` shows only currently running sessions. A slot is a named
 Codex session backed by tmux.
 
-Slots use letter names `a` through `i`, matching Plugdeck Agents. Legacy
-aliases `one` through `nine` and `1` through `9` still work.
+Slots use letter names `a` through `i`. Legacy aliases `one` through `nine`
+and `1` through `9` still work.
 
 ## Working Directory Rule
 

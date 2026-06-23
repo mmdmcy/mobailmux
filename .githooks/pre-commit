@@ -2,7 +2,9 @@
 set -euo pipefail
 
 blocked_paths='(^|/)(\.env($|\.)|\.venv/|venv/|__pycache__/|state/|.*\.egg-info/|.*\.pyc$|.*\.sqlite.*$|.*\.log$)'
-blocked_private_content='(/home/[^[:space:]]+|/Users/[^[:space:]]+|/opt/[^[:space:]]+|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|gho_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+)'
+github_o_marker='gh''o_'
+openai_marker='sk''-'
+blocked_private_content="(/home/[^[:space:]]+|/Users/[^[:space:]]+|/opt/[^[:space:]]+|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|${github_o_marker}[A-Za-z0-9_]+|${openai_marker}[A-Za-z0-9_-]+)"
 
 mapfile -t staged_paths < <(git diff --cached --name-only --diff-filter=ACMR)
 

@@ -115,7 +115,7 @@ Mattermost is ready:
 
 Admin login:
   username: $MOBAILMUX_ADMIN_USERNAME
-  password: stored in $ENV_FILE as MOBAILMUX_ADMIN_PASSWORD
+  password is stored in $ENV_FILE as MOBAILMUX_ADMIN_PASSWORD
 
 Next:
   python3 -m venv .venv

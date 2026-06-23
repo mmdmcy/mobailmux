@@ -44,8 +44,8 @@ mbx command
 mbx commands
 ```
 
-A slot is a named Codex session backed by tmux. Slots use the same letter names
-as Plugdeck Agents. The old word and number aliases still work:
+A slot is a named Codex session backed by tmux. Slots use letter names by
+default. The old word and number aliases still work:
 
 ```bash
 mbx start a

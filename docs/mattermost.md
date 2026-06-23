@@ -1,6 +1,6 @@
 # Mattermost Setup
 
-Mattermost is optional. Use it when you want Mobailmux inside a full chat app with mobile and desktop clients. For the lightest setup, use the built-in web UI instead.
+Mattermost is optional. Use it when you want Mobailmux inside a full chat app with mobile and desktop clients. For the browser agents surface, run the Rust web service from the repo root.
 
 Mobailmux needs:
 

@@ -15,7 +15,6 @@ dependencies = [
 
 [project.scripts]
 mobailmux = "mobailmux.cli:main"
-mobailmux-web = "mobailmux.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
