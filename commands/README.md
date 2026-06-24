@@ -89,9 +89,9 @@ mbx start d --dry-run ~/Documents/github/example
 If a slot exists but is idle at a shell prompt, `mbx start <slot>` starts Codex
 inside that idle slot from the directory where you ran `mbx`.
 
-Internally, sessions keep the existing `codex-1` through `codex-9` tmux names,
-with `a` mapped to `codex-1`, so existing running sessions remain manageable
-during the migration.
+Internally, new sessions use `codex-1` through `codex-9`, with `a` mapped to
+`codex-1`. During migration, `mbx` also detects existing `plugdeck-a` through
+`plugdeck-i` sessions so old running slots remain manageable.
 
 See [COMMANDS.md](COMMANDS.md) for the command contract used by downstream
 Mobailmux packages.

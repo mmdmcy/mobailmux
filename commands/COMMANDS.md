@@ -35,6 +35,9 @@ Codex session backed by tmux.
 Slots use letter names `a` through `i`. Legacy aliases `one` through `nine`
 and `1` through `9` still work.
 
+New tmux sessions use `codex-1` through `codex-9`. Existing migration-era
+`plugdeck-a` through `plugdeck-i` sessions are still detected and managed.
+
 ## Working Directory Rule
 
 When no directory is provided, `mbx start`, `mbx new`, and `mbx resume` use the

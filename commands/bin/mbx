@@ -123,6 +123,40 @@ session_name() {
   echo "${MBX_SESSION_PREFIX:-codex}-$1"
 }
 
+legacy_session_name() {
+  local label
+  label="$(slot_label "$1")" || return 1
+  echo "plugdeck-$label"
+}
+
+session_slot() {
+  local session="$1"
+  local prefix="${MBX_SESSION_PREFIX:-codex}"
+  if [[ "$session" =~ ^${prefix}-([1-9])$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${MBX_INCLUDE_LEGACY_PLUGDECK_SESSIONS:-1}" == "1" && "$session" =~ ^plugdeck-([a-i])$ ]]; then
+    slot_number "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+session_for_slot() {
+  local slot="$1"
+  local session legacy
+  session="$(session_name "$slot")"
+  legacy="$(legacy_session_name "$slot")"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo "$session"
+  elif [[ "${MBX_INCLUDE_LEGACY_PLUGDECK_SESSIONS:-1}" == "1" ]] && tmux has-session -t "$legacy" 2>/dev/null; then
+    echo "$legacy"
+  else
+    echo "$session"
+  fi
+}
+
 attach_session() {
   local session="$1"
   if [[ -n "${TMUX:-}" ]]; then
@@ -169,6 +203,7 @@ check_codex_update() {
 
 maybe_codex_update_notice() {
   [[ "${MBX_NO_UPDATE_CHECK:-}" == "1" ]] && return 0
+  [[ "${MBX_UPDATE_CHECK_ON_START:-0}" == "1" ]] || return 0
 
   local cache_dir cache_file now last interval current latest
   cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mbx"
@@ -275,8 +310,7 @@ list_slots() {
   local session attached slot label command path
 
   while IFS='|' read -r session attached; do
-    [[ "$session" =~ ^${MBX_SESSION_PREFIX:-codex}-([1-9])$ ]] || continue
-    slot="${BASH_REMATCH[1]}"
+    slot="$(session_slot "$session")" || continue
     label="$(slot_label "$slot")"
     command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
     path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
@@ -313,7 +347,7 @@ status_slots() {
   local label session attached command path state
   for slot in "${slots[@]}"; do
     label="$(slot_label "$slot")"
-    session="$(session_name "$slot")"
+    session="$(session_for_slot "$slot")"
 
     if tmux has-session -t "$session" 2>/dev/null; then
       attached="$(tmux display-message -p -t "$session" '#{session_attached}' 2>/dev/null || true)"
@@ -334,10 +368,10 @@ status_slots() {
 stop_slot() {
   local slot="$1"
   local session label
-  session="$(session_name "$slot")"
   label="$(slot_label "$slot")"
 
   need_tmux
+  session="$(session_for_slot "$slot")"
 
   if tmux has-session -t "$session" 2>/dev/null; then
     tmux kill-session -t "$session"
@@ -354,8 +388,7 @@ stop_all_slots() {
   local session slot
 
   while IFS=: read -r session _; do
-    [[ "$session" =~ ^${MBX_SESSION_PREFIX:-codex}-([1-9])$ ]] || continue
-    slot="${BASH_REMATCH[1]}"
+    slot="$(session_slot "$session")" || continue
     tmux kill-session -t "$session"
     echo "Stopped $(slot_label "$slot") ($session)"
     found=1
@@ -433,9 +466,9 @@ run_slot() {
   need_tmux
 
   local session label workdir mode cmdline
-  session="$(session_name "$slot")"
   label="$(slot_label "$slot")"
   workdir="$(resolve_workdir "$workdir_arg")"
+  session="$(session_for_slot "$slot")"
   mode="start"
   [[ "$action" == "resume" ]] && mode="resume"
 
