@@ -583,10 +583,63 @@ async fn agents_page(
   }});
   document.querySelector("[data-codex-close]")?.addEventListener("click", () => codexPanel?.close());
   const browserPanel = document.getElementById("conversationDrawer");
+  const closestElement = (target, selector) => target instanceof Element ? target.closest(selector) : null;
+  const lockPageScroll = () => {{
+    if (document.body.classList.contains("modal-scroll-locked")) return;
+    const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
+    document.body.dataset.scrollLockY = String(scrollY);
+    document.body.style.top = "-" + scrollY + "px";
+    document.body.classList.add("modal-scroll-locked");
+  }};
+  const unlockPageScroll = () => {{
+    if (!document.body.classList.contains("modal-scroll-locked")) return;
+    const scrollY = Number(document.body.dataset.scrollLockY || "0");
+    document.body.classList.remove("modal-scroll-locked");
+    document.body.style.top = "";
+    delete document.body.dataset.scrollLockY;
+    window.scrollTo(0, scrollY);
+  }};
+  const showLockedDialog = (panel) => {{
+    if (panel && typeof panel.showModal === "function") {{
+      panel.showModal();
+      lockPageScroll();
+    }}
+  }};
   document.querySelector("[data-browser-open]")?.addEventListener("click", () => {{
-    if (browserPanel && typeof browserPanel.showModal === "function") browserPanel.showModal();
+    showLockedDialog(browserPanel);
   }});
+  browserPanel?.addEventListener("close", unlockPageScroll);
   document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
+  let browserTouchY = 0;
+  document.addEventListener("touchstart", (event) => {{
+    if (!browserPanel?.open || event.touches.length !== 1) return;
+    browserTouchY = event.touches[0].clientY;
+  }}, {{passive:true}});
+  document.addEventListener("touchmove", (event) => {{
+    if (!browserPanel?.open || event.touches.length !== 1) return;
+    const scrollTarget = closestElement(event.target, ".browser-scroll");
+    if (!scrollTarget) {{
+      event.preventDefault();
+      return;
+    }}
+    const y = event.touches[0].clientY;
+    const delta = y - browserTouchY;
+    browserTouchY = y;
+    const atTop = scrollTarget.scrollTop <= 0;
+    const atBottom = Math.ceil(scrollTarget.scrollTop + scrollTarget.clientHeight) >= scrollTarget.scrollHeight;
+    if ((atTop && delta > 0) || (atBottom && delta < 0)) event.preventDefault();
+  }}, {{passive:false}});
+  document.addEventListener("wheel", (event) => {{
+    if (!browserPanel?.open) return;
+    const scrollTarget = closestElement(event.target, ".browser-scroll");
+    if (!scrollTarget) {{
+      event.preventDefault();
+      return;
+    }}
+    const atTop = scrollTarget.scrollTop <= 0;
+    const atBottom = Math.ceil(scrollTarget.scrollTop + scrollTarget.clientHeight) >= scrollTarget.scrollHeight;
+    if ((atTop && event.deltaY < 0) || (atBottom && event.deltaY > 0)) event.preventDefault();
+  }}, {{passive:false}});
   document.querySelectorAll("[data-load-more]").forEach((button) => {{
     button.addEventListener("click", () => {{
       const group = button.closest("[data-project-group]");

@@ -3,6 +3,7 @@
 *{box-sizing:border-box}
 html,body{min-height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
+body.modal-scroll-locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 a{color:inherit;text-decoration:none}
 button,input,select,textarea{font:inherit;font-size:16px}
 button,.button{min-height:42px;border:0;border-radius:7px;background:var(--accent);color:#fff;padding:0 15px;font-weight:700;cursor:pointer}
@@ -44,11 +45,11 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .message-log{color:var(--muted);font-size:13px}
 .empty{align-self:center;justify-self:center;color:var(--muted);text-align:center}
 .attachment-link{display:inline-flex;align-items:center;min-height:34px;border:1px solid var(--line);border-radius:6px;padding:0 9px;margin-top:8px;color:var(--accent2);font-weight:800;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.browser-drawer{position:fixed;inset:0 auto 0 0;width:min(430px,100vw);height:100dvh;max-height:none;margin:0;border:0;border-right:1px solid var(--line);background:var(--panel);color:var(--fg);padding:0}
-.browser-drawer::backdrop{background:rgba(0,0,0,.38)}
+.browser-drawer{position:fixed;inset:0 auto 0 0;width:min(430px,100vw);height:100dvh;max-height:none;margin:0;border:0;border-right:1px solid var(--line);background:var(--panel);color:var(--fg);padding:0;overflow:hidden;overscroll-behavior:contain}
+.browser-drawer::backdrop{background:rgba(0,0,0,.38);touch-action:none}
 .browser-drawer header{height:56px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 12px;border-bottom:1px solid var(--line)}
 .browser-drawer header span{color:var(--muted);font-size:13px;font-weight:700}
-.browser-scroll{height:calc(100dvh - 56px);overflow:auto;padding:10px;display:grid;align-content:start;gap:10px}
+.browser-scroll{height:calc(100dvh - 56px);overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px;display:grid;align-content:start;gap:10px}
 .browser-project{border-bottom:1px solid var(--line);padding-bottom:10px;display:grid;gap:7px}
 .browser-project:last-child{border-bottom:0}
 .browser-project-head{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:30px;color:var(--muted)}

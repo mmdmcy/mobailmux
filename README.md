@@ -14,6 +14,8 @@ and stop Codex work.
 - Existing `commands/bin/mbx` tmux helper remains available for terminal slots.
 - Private-by-default: run behind localhost, LAN, VPN, or tailnet access.
 
+For a source/runtime map, see `docs/where-things-live.md`.
+
 ## Run The Rust Web UI
 
 ```sh
