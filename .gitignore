@@ -1,6 +1,11 @@
 .env
 .env.*
 !.env.example
+AGENTS.md
+private/
+docs/private/
+.codex/
+.claude/
 /target/
 .DS_Store
 __pycache__/
@@ -16,4 +21,6 @@ build/
 *.log
 *.sqlite*
 state/
+data/
+uploads/
 node_modules/
