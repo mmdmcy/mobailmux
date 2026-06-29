@@ -21,6 +21,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
             "/agents/slots/{id}/conversation",
             post(crate::agent_conversation_load),
         )
+        .route("/agents/slots/state", get(crate::agent_slots_state))
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
         .route("/agents/attachments/{id}", get(crate::agent_attachment))
         .route("/agents/codex/reset", post(crate::codex_reset_post))

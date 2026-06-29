@@ -9,14 +9,14 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, Utc};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    cmp::Reverse,
-    collections::HashMap,
+    cmp::{Ordering, Reverse},
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, BufRead, Read, Write},
     net::SocketAddr,
@@ -38,10 +38,28 @@ mod codex_reset_ledger;
 mod db_migrations;
 mod modules;
 
+#[derive(Copy, Clone, Serialize)]
+struct AgentCommandSpec {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    takes_arg: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ComposerSuggestion {
+    kind: &'static str,
+    name: String,
+    insert: String,
+    description: String,
+    takes_arg: bool,
+}
+
 const DEFAULT_AGENT_SLOTS: &str = "codex";
 const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
 const MAX_AGENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_AGENT_SLOT_CHARS: usize = 32;
+const MAX_AGENT_GOAL_CHARS: usize = 4000;
 const MAX_CODEX_CONVERSATIONS: usize = 120;
 const MAX_CODEX_TRANSCRIPT_MESSAGES: usize = 80;
 const CODEX_SESSION_SCAN_LIMIT: usize = 180;
@@ -54,6 +72,88 @@ const CODEX_APP_SERVER_WRITE_SETTLE: StdDuration = StdDuration::from_secs(5);
 const SESSION_COOKIE: &str = "mobailmux_session";
 const SESSION_DAYS: i64 = 30;
 const PAGE_CSS: &str = include_str!("page.css");
+const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
+    AgentCommandSpec {
+        name: "goal",
+        usage: "/goal <objective>",
+        description: "Set or show this slot's goal",
+        takes_arg: true,
+    },
+    AgentCommandSpec {
+        name: "clear-goal",
+        usage: "/clear-goal",
+        description: "Clear this slot's goal",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "status",
+        usage: "/status",
+        description: "Show slot status and Codex usage",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "usage",
+        usage: "/usage",
+        description: "Show Codex usage and limits",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "model",
+        usage: "/model",
+        description: "Show the Codex command settings",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "slots",
+        usage: "/slots",
+        description: "Show all slots",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "pwd",
+        usage: "/pwd",
+        description: "Show this slot's folder",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "cd",
+        usage: "/cd <folder>",
+        description: "Change this slot's folder",
+        takes_arg: true,
+    },
+    AgentCommandSpec {
+        name: "ls",
+        usage: "/ls [path]",
+        description: "List files from the slot folder",
+        takes_arg: true,
+    },
+    AgentCommandSpec {
+        name: "stop",
+        usage: "/stop",
+        description: "Stop the running Codex job",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "fresh",
+        usage: "/fresh",
+        description: "Reset chat, folder, and saved Codex thread",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "stayfresh",
+        usage: "/stayfresh",
+        description: "Reset chat and saved thread, keep folder",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "help",
+        usage: "/help",
+        description: "Show commands",
+        takes_arg: false,
+    },
+];
+const AGENT_COMMAND_ALIASES: &[&str] =
+    &["commands", "list", "overview", "limits", "settings", "new"];
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -158,6 +258,7 @@ struct CodexProject {
     name: String,
     trusted: bool,
     conversation_count: usize,
+    latest_activity: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +559,7 @@ struct AgentSlotRow {
     id: i64,
     name: String,
     workdir: String,
+    goal: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -471,6 +573,7 @@ struct AgentAttachmentSummary {
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentMessageRow {
+    id: i64,
     role: String,
     body: String,
     created_at: String,
@@ -484,6 +587,20 @@ struct AgentSlotPoll {
     message_count: usize,
     messages_html: String,
     active_status: String,
+}
+
+#[derive(Serialize)]
+struct AgentSlotSummary {
+    id: i64,
+    name: String,
+    running: bool,
+    current: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct AgentSlotsPoll {
+    slots: Vec<AgentSlotSummary>,
 }
 
 async fn agents_page(
@@ -544,14 +661,19 @@ async fn agents_page(
     } else {
         messages.len()
     };
+    let slot_rail = agent_slot_rail_html(&state, &slots, active_slot.id);
     let usage_dialog = codex_usage_dialog(&state.config, codex.usage.as_ref(), codex_loaded);
     let viewing_transcript = selected_thread.is_some();
+    let composer_suggestions_json = agent_composer_suggestions_json(&state.config);
+    let active_running = agent_run_for(&state, active_slot.id).is_some();
+    let cancel_disabled = if active_running { "" } else { " disabled" };
     page(
         "Agents",
         &format!(
             r##"
 <nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost" data-browser-open>Browse</button><button type="button" class="ghost" data-codex-open>Usage</button><strong>Agents</strong></div></nav>
-<main class="chat-shell agent-shell agent-single">
+<main class="chat-shell agent-shell">
+  {slot_rail}
   <section class="chat-pane agent-pane">
     <header class="chat-head">
       <div class="chat-title"><strong>{active_title}</strong><span>{active_slot_workdir}</span></div>
@@ -561,9 +683,13 @@ async fn agents_page(
     <section class="agent-compose-wrap">
       <form action="/agents" method="post" enctype="multipart/form-data" class="agent-composer">
         <input name="slot_id" type="hidden" value="{}">
+        <input name="edit_message_id" id="editMessageId" type="hidden" value="">
         <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message Codex"></textarea>
+        <div class="command-suggestions" id="commandSuggestions" role="listbox" hidden></div>
+        <div class="edit-strip" id="editStrip" hidden><span>Editing message</span><button type="button" class="ghost" data-edit-clear>Discard</button></div>
         <label class="file-pill"><input name="attachment" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,application/pdf,text/*"><span>Attach</span></label>
-        <button type="submit">Send</button>
+        <button type="submit" name="control" value="stop" class="ghost cancel-button" data-cancel-button{cancel_disabled}>Cancel</button>
+        <button type="submit" data-send-button>Send</button>
       </form>
     </section>
   </section>
@@ -575,13 +701,59 @@ async fn agents_page(
   const list = document.querySelector("[data-agent-messages]");
   const status = document.querySelector("[data-agent-status]");
   const count = document.querySelector("[data-agent-count]");
+  const form = document.querySelector(".agent-composer");
   const input = document.getElementById("agentBody");
+  const editMessageId = document.getElementById("editMessageId");
+  const editStrip = document.getElementById("editStrip");
+  const sendButton = document.querySelector("[data-send-button]");
+  const cancelButton = document.querySelector("[data-cancel-button]");
+  const suggestionBox = document.getElementById("commandSuggestions");
+  const composerSuggestions = {composer_suggestions_json};
+  let selectedSuggestion = 0;
   const viewingTranscript = {viewing_transcript};
-  const codexPanel = document.getElementById("codexPanel");
-  document.querySelector("[data-codex-open]")?.addEventListener("click", () => {{
-    if (codexPanel && typeof codexPanel.showModal === "function") codexPanel.showModal();
+  const activeSlotId = "{}";
+  const slotRows = new Map();
+  document.querySelectorAll("[data-slot-row]").forEach((row) => {{
+    const id = row.getAttribute("data-slot-id");
+    if (!id) return;
+    const entry = {{
+      row,
+      status: row.querySelector("[data-slot-status]"),
+      badge: row.querySelector("[data-slot-badge]"),
+      wasRunning: row.getAttribute("data-slot-running") === "true"
+    }};
+    row.addEventListener("click", () => {{
+      row.classList.remove("done");
+      if (entry.badge) entry.badge.hidden = true;
+    }});
+    slotRows.set(id, entry);
   }});
-  document.querySelector("[data-codex-close]")?.addEventListener("click", () => codexPanel?.close());
+  function syncDialogLock() {{
+    const locked = Array.from(document.querySelectorAll("dialog")).some((dialog) => dialog.open);
+    document.documentElement.classList.toggle("drawer-open", locked);
+    document.body.classList.toggle("drawer-open", locked);
+  }}
+  function openDialog(dialog) {{
+    if (!dialog) return;
+    if (!dialog.open) {{
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+    }}
+    syncDialogLock();
+  }}
+  function closeDialog(dialog) {{
+    if (!dialog) return;
+    if (typeof dialog.close === "function") dialog.close();
+    else dialog.removeAttribute("open");
+    syncDialogLock();
+  }}
+  document.querySelectorAll("dialog").forEach((dialog) => {{
+    dialog.addEventListener("close", syncDialogLock);
+    dialog.addEventListener("cancel", () => setTimeout(syncDialogLock, 0));
+  }});
+  const codexPanel = document.getElementById("codexPanel");
+  document.querySelector("[data-codex-open]")?.addEventListener("click", () => openDialog(codexPanel));
+  document.querySelector("[data-codex-close]")?.addEventListener("click", () => closeDialog(codexPanel));
   const browserPanel = document.getElementById("conversationDrawer");
   const closestElement = (target, selector) => target instanceof Element ? target.closest(selector) : null;
   const lockPageScroll = () => {{
@@ -599,16 +771,22 @@ async fn agents_page(
     delete document.body.dataset.scrollLockY;
     window.scrollTo(0, scrollY);
   }};
-  const showLockedDialog = (panel) => {{
-    if (panel && typeof panel.showModal === "function") {{
-      panel.showModal();
-      lockPageScroll();
+  const openLockedDialog = (dialog) => {{
+    if (!dialog) return;
+    if (!dialog.open) {{
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
     }}
+    lockPageScroll();
+    syncDialogLock();
   }};
   document.querySelector("[data-browser-open]")?.addEventListener("click", () => {{
-    showLockedDialog(browserPanel);
+    openLockedDialog(browserPanel);
   }});
-  browserPanel?.addEventListener("close", unlockPageScroll);
+  browserPanel?.addEventListener("close", () => {{
+    unlockPageScroll();
+    syncDialogLock();
+  }});
   document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
   let browserTouchY = 0;
   document.addEventListener("touchstart", (event) => {{
@@ -653,8 +831,141 @@ async fn agents_page(
     if (!ok) event.preventDefault();
   }});
   let dirty = false;
-  input.addEventListener("input", () => {{ dirty = input.value.length > 0; }});
+  function activeCompletionToken() {{
+    if (!input) return null;
+    const value = input.value;
+    const cursor = input.selectionStart ?? value.length;
+    const before = value.slice(0, cursor);
+    const match = before.match(/(^|[\s([{{])([/!#$])([A-Za-z0-9:_-]*)$/);
+    if (!match) return null;
+    const symbol = match[2];
+    const kind = symbol === "$" ? "skill" : symbol === "#" ? "plugin" : "command";
+    return {{
+      start: before.length - match[2].length - match[3].length,
+      end: cursor,
+      symbol,
+      kind,
+      typed: match[3].toLowerCase()
+    }};
+  }}
+  function matchingSuggestions() {{
+    const token = activeCompletionToken();
+    if (!token) return [];
+    return composerSuggestions
+      .filter((item) => item.kind === token.kind)
+      .filter((item) => {{
+        const typed = token.typed;
+        if (!typed) return true;
+        const haystack = `${{item.name}} ${{item.description}} ${{item.insert}}`.toLowerCase();
+        return haystack.includes(typed);
+      }})
+      .slice(0, 24)
+      .map((item) => ({{...item, token}}));
+  }}
+  function suggestionInsert(item) {{
+    if (item.kind === "command") return `${{item.token.symbol}}${{item.name}}`;
+    return item.insert;
+  }}
+  function applyCommandSuggestion(item) {{
+    if (!input || !item || !item.token) return;
+    const insert = suggestionInsert(item);
+    const before = input.value.slice(0, item.token.start);
+    const after = input.value.slice(item.token.end).replace(/^\s+/, "");
+    const spacer = item.takes_arg ? " " : "";
+    input.value = `${{before}}${{insert}}${{spacer}}${{after}}`;
+    const caret = before.length + insert.length + spacer.length;
+    input.focus();
+    input.setSelectionRange(caret, caret);
+    dirty = input.value.length > 0;
+    renderCommandSuggestions();
+  }}
+  function renderCommandSuggestions() {{
+    if (!suggestionBox) return;
+    const matches = matchingSuggestions();
+    if (!matches.length) {{
+      suggestionBox.hidden = true;
+      suggestionBox.innerHTML = "";
+      return;
+    }}
+    selectedSuggestion = Math.min(selectedSuggestion, matches.length - 1);
+    suggestionBox.hidden = false;
+    suggestionBox.innerHTML = "";
+    matches.forEach((command, index) => {{
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "command-suggestion" + (index === selectedSuggestion ? " active" : "");
+      button.setAttribute("role", "option");
+      const label = command.kind === "command" ? `${{command.token.symbol}}${{command.name}}` : command.insert;
+      button.innerHTML = `<strong>${{label}}</strong><span>${{command.kind}} | ${{command.description}}</span>`;
+      button.addEventListener("click", (event) => {{
+        event.preventDefault();
+        selectedSuggestion = index;
+        applyCommandSuggestion(command);
+      }});
+      suggestionBox.appendChild(button);
+      if (index === selectedSuggestion) button.scrollIntoView({{block:"nearest"}});
+    }});
+  }}
+  function setEditMode(id, body) {{
+    if (!input || !editMessageId) return;
+    editMessageId.value = id;
+    input.value = body || "";
+    dirty = input.value.length > 0;
+    if (editStrip) editStrip.hidden = false;
+    if (sendButton) sendButton.textContent = "Save";
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    input.scrollIntoView({{block:"nearest"}});
+    renderCommandSuggestions();
+  }}
+  function clearEditMode() {{
+    if (editMessageId) editMessageId.value = "";
+    if (editStrip) editStrip.hidden = true;
+    if (sendButton) sendButton.textContent = "Send";
+    if (input) {{
+      input.value = "";
+      dirty = false;
+      renderCommandSuggestions();
+      input.focus();
+    }}
+  }}
+  document.querySelector("[data-edit-clear]")?.addEventListener("click", clearEditMode);
+  list?.addEventListener("click", (event) => {{
+    const button = event.target.closest("[data-edit-message]");
+    if (!button) return;
+    event.preventDefault();
+    setEditMode(button.getAttribute("data-edit-message"), button.getAttribute("data-edit-body") || "");
+  }});
+  form?.addEventListener("submit", (event) => {{
+    if (event.submitter?.getAttribute("name") === "control") {{
+      dirty = false;
+    }}
+  }});
+  input.addEventListener("input", () => {{
+    dirty = input.value.length > 0;
+    selectedSuggestion = 0;
+    renderCommandSuggestions();
+  }});
   input.addEventListener("focus", () => setTimeout(() => input.scrollIntoView({{block:"nearest"}}), 80));
+  input.addEventListener("keydown", (event) => {{
+    if (!suggestionBox || suggestionBox.hidden) return;
+    const matches = matchingSuggestions();
+    if (!matches.length) return;
+    if (event.key === "ArrowDown") {{
+      event.preventDefault();
+      selectedSuggestion = (selectedSuggestion + 1) % matches.length;
+      renderCommandSuggestions();
+    }} else if (event.key === "ArrowUp") {{
+      event.preventDefault();
+      selectedSuggestion = (selectedSuggestion + matches.length - 1) % matches.length;
+      renderCommandSuggestions();
+    }} else if (event.key === "Tab" || event.key === "ArrowRight") {{
+      event.preventDefault();
+      applyCommandSuggestion(matches[selectedSuggestion]);
+    }} else if (event.key === "Escape") {{
+      suggestionBox.hidden = true;
+    }}
+  }});
   async function poll() {{
     if (!list || dirty || document.activeElement === input) {{
       setTimeout(poll, 1800);
@@ -668,6 +979,7 @@ async fn agents_page(
         list.innerHTML = data.messages_html;
         status.textContent = data.active_status || (data.running ? (data.current || "running") : "idle");
         count.textContent = data.message_count + " messages";
+        if (cancelButton) cancelButton.disabled = !data.running;
         if (nearBottom) list.scrollTop = list.scrollHeight;
         setTimeout(poll, data.running ? 1200 : 4000);
         return;
@@ -675,12 +987,53 @@ async fn agents_page(
     }} catch (_) {{}}
     setTimeout(poll, 4000);
   }}
+  function renderSlotStates(slots) {{
+    let anyRunning = false;
+    for (const slot of slots || []) {{
+      const id = String(slot.id);
+      const entry = slotRows.get(id);
+      if (!entry) continue;
+      const label = slot.running ? (slot.current || "running") : (slot.status || "idle");
+      anyRunning = anyRunning || !!slot.running;
+      if (entry.status) entry.status.textContent = label;
+      if (id === activeSlotId && cancelButton) cancelButton.disabled = !slot.running;
+      entry.row.setAttribute("data-slot-running", slot.running ? "true" : "false");
+      entry.row.classList.toggle("running", !!slot.running);
+      if (slot.running) {{
+        entry.row.classList.remove("done");
+        if (entry.badge) entry.badge.hidden = true;
+      }} else if (entry.wasRunning) {{
+        entry.row.classList.add("done");
+        if (entry.badge) {{
+          entry.badge.textContent = "done";
+          entry.badge.hidden = false;
+        }}
+        if (id === activeSlotId && status) status.textContent = "done";
+      }}
+      entry.wasRunning = !!slot.running;
+    }}
+    return anyRunning;
+  }}
+  async function pollSlots() {{
+    try {{
+      const response = await fetch("/agents/slots/state", {{cache:"no-store"}});
+      if (response.ok) {{
+        const data = await response.json();
+        const anyRunning = renderSlotStates(data.slots || []);
+        setTimeout(pollSlots, anyRunning ? 1200 : 4000);
+        return;
+      }}
+    }} catch (_) {{}}
+    setTimeout(pollSlots, 5000);
+  }}
   if (list) list.scrollTop = list.scrollHeight;
+  setTimeout(pollSlots, 1000);
   if (!viewingTranscript) setTimeout(poll, 1200);
 }})();
 </script>
 "##,
             html_escape(&runtime.label),
+            active_slot.id,
             active_slot.id,
             active_slot.id
         ),
@@ -812,7 +1165,9 @@ async fn agent_message_create(
         return response;
     }
     let mut slot_id = None;
+    let mut edit_message_id = None;
     let mut body = String::new();
+    let mut control = String::new();
     let mut upload = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -821,6 +1176,16 @@ async fn agent_message_create(
             "slot_id" => {
                 if let Ok(text) = field.text().await {
                     slot_id = text.trim().parse::<i64>().ok();
+                }
+            }
+            "edit_message_id" => {
+                if let Ok(text) = field.text().await {
+                    edit_message_id = text.trim().parse::<i64>().ok().filter(|id| *id > 0);
+                }
+            }
+            "control" => {
+                if let Ok(text) = field.text().await {
+                    control = text.trim().to_ascii_lowercase();
                 }
             }
             "body" => {
@@ -860,6 +1225,19 @@ async fn agent_message_create(
     let Some(slot) = slot else {
         return Redirect::to("/agents").into_response();
     };
+    if control == "stop" {
+        let stopped = stop_agent_job(&state, slot.id);
+        append_agent_assistant(
+            &state,
+            slot.id,
+            if stopped {
+                "Stop requested."
+            } else {
+                "This slot is not running."
+            },
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
     let body = body.trim().to_string();
     if body.len() > MAX_AGENT_MESSAGE_CHARS {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
@@ -870,6 +1248,39 @@ async fn agent_message_create(
         None
     };
     if body.is_empty() && attachment_id.is_none() {
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    if let Some(message_id) = edit_message_id {
+        if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+            append_agent_assistant(&state, slot.id, "Cancel the running job before editing.");
+            return Redirect::to(&agent_location(Some(slot.id))).into_response();
+        }
+        let existing_attachment_id = {
+            let db = state.db.lock().unwrap();
+            agent_user_message_attachment_id(&db, slot.id, message_id).unwrap_or(None)
+        };
+        let Some(existing_attachment_id) = existing_attachment_id else {
+            return Redirect::to(&agent_location(Some(slot.id))).into_response();
+        };
+        let final_attachment_id = attachment_id.or(existing_attachment_id);
+        {
+            let db = state.db.lock().unwrap();
+            let _ = update_agent_user_message(&db, slot.id, message_id, &body, attachment_id);
+            let _ = delete_agent_messages_after(&db, slot.id, message_id);
+            let _ = db.execute(
+                "DELETE FROM agent_sessions WHERE slot_id = ?1",
+                params![slot.id],
+            );
+        }
+        if handle_agent_control(&state, &slot, &body) {
+            return Redirect::to(&agent_location(Some(slot.id))).into_response();
+        }
+        let request_body = if body.is_empty() {
+            "Please inspect the attached file.".to_string()
+        } else {
+            body
+        };
+        start_agent_job(state.clone(), slot.id, request_body, final_attachment_id);
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     {
@@ -886,7 +1297,7 @@ async fn agent_message_create(
             slot.id,
             "assistant",
             &format!(
-                "{} is already running. Use another slot or send `!stop` first.",
+                "{} is already running. Use Cancel, another slot, or `/stop` first.",
                 slot.name
             ),
             None,
@@ -930,6 +1341,21 @@ async fn agent_slot_state(
         active_status,
     })
     .into_response()
+}
+
+async fn agent_slots_state(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(response) = raw_guard(&state, &headers) {
+        return response;
+    }
+    let slots = {
+        let db = state.db.lock().unwrap();
+        list_agent_slots(&db).unwrap_or_default()
+    };
+    let summaries = slots
+        .iter()
+        .map(|slot| agent_slot_summary(&state, slot))
+        .collect();
+    Json(AgentSlotsPoll { slots: summaries }).into_response()
 }
 
 async fn agent_attachment(
@@ -1021,6 +1447,30 @@ fn agent_run_for(state: &AppState, slot_id: i64) -> Option<AgentRun> {
     state.agent_jobs.lock().unwrap().get(&slot_id).cloned()
 }
 
+fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> AgentSlotSummary {
+    if let Some(run) = agent_run_for(state, slot.id) {
+        let label = if run.current.trim().is_empty() {
+            run.status.clone()
+        } else {
+            run.current.clone()
+        };
+        return AgentSlotSummary {
+            id: slot.id,
+            name: slot.name.clone(),
+            running: true,
+            current: label.clone(),
+            status: label,
+        };
+    }
+    AgentSlotSummary {
+        id: slot.id,
+        name: slot.name.clone(),
+        running: false,
+        current: String::new(),
+        status: "idle".into(),
+    }
+}
+
 fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotRuntime {
     if let Some(run) = agent_run_for(state, slot.id) {
         let label = if run.current.trim().is_empty() {
@@ -1035,57 +1485,260 @@ fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotRuntime {
     }
 }
 
+fn agent_slot_rail_html(state: &AppState, slots: &[AgentSlotRow], active_id: i64) -> String {
+    let rows = slots
+        .iter()
+        .map(|slot| {
+            let summary = agent_slot_summary(state, slot);
+            let active_class = if slot.id == active_id { " active" } else { "" };
+            let running_class = if summary.running { " running" } else { "" };
+            format!(
+                r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}">
+  <a class="channel-link" href="/agents?slot={}" aria-label="Open {}">
+    <strong>{}</strong>
+    <span data-slot-status>{}</span>
+    <span class="slot-badge" data-slot-badge hidden></span>
+  </a>
+</div>"#,
+                summary.id,
+                if summary.running { "true" } else { "false" },
+                summary.id,
+                html_escape(&summary.name),
+                html_escape(&summary.name),
+                html_escape(&summary.status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<aside class="channel-rail" aria-label="Agent sessions">
+  <div class="rail-title">Sessions</div>
+  <div class="channel-list">{rows}</div>
+</aside>"#
+    )
+}
+
 fn agent_messages_html(messages: &[AgentMessageRow]) -> String {
     if messages.is_empty() {
         return r#"<p class="empty">No messages in this slot yet.</p>"#.into();
     }
-    messages
-        .iter()
-        .rev()
-        .map(|message| {
-            let avatar = if message.role == "user" { "U" } else { "A" };
-            let body = if message.body.trim().is_empty() {
-                String::new()
-            } else {
-                format!(
-                    r#"<p>{}</p>"#,
-                    html_escape(&message.body).replace('\n', "<br>")
-                )
-            };
-            let attachment = message
-                .attachment
-                .as_ref()
-                .map(|attachment| {
-                    let name = html_escape(&attachment.name);
-                    if attachment.is_image {
-                        format!(
-                            r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a><img class="message-image" src="/agents/attachments/{}" alt="">"#,
-                            attachment.id, name, attachment.id
-                        )
-                    } else {
-                        format!(
-                            r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a>"#,
-                            attachment.id, name
-                        )
-                    }
-                })
-                .unwrap_or_default();
-            format!(
-                r#"<article class="message">
+    let ordered = messages.iter().rev().collect::<Vec<_>>();
+    let mut rendered = String::new();
+    let mut index = 0usize;
+    while index < ordered.len() {
+        if agent_activity_kind(ordered[index]).is_some() {
+            let start = index;
+            while index < ordered.len() && agent_activity_kind(ordered[index]).is_some() {
+                index += 1;
+            }
+            rendered.push_str(&agent_activity_stack_html(&ordered[start..index]));
+        } else {
+            rendered.push_str(&agent_message_html(ordered[index]));
+            index += 1;
+        }
+    }
+    rendered
+}
+
+#[derive(Copy, Clone)]
+enum AgentActivityKind {
+    Start,
+    Run,
+    Exit,
+}
+
+fn agent_activity_kind(message: &AgentMessageRow) -> Option<AgentActivityKind> {
+    if message.role != "assistant" || message.attachment.is_some() {
+        return None;
+    }
+    let body = message.body.trim();
+    if body.starts_with("running: `") {
+        return Some(AgentActivityKind::Run);
+    }
+    if body.starts_with("command exit ") {
+        return Some(AgentActivityKind::Exit);
+    }
+    if body.contains(" started in `") && body.ends_with("`.") {
+        return Some(AgentActivityKind::Start);
+    }
+    None
+}
+
+fn agent_message_html(message: &AgentMessageRow) -> String {
+    let role_class = agent_role_class(&message.role);
+    let avatar = if role_class == "user" { "U" } else { "A" };
+    let actions = if role_class == "user" && message.id > 0 {
+        format!(
+            r#"<button type="button" class="message-edit" data-edit-message="{}" data-edit-body="{}">Edit</button>"#,
+            message.id,
+            html_attr_escape(&message.body)
+        )
+    } else {
+        String::new()
+    };
+    let body = if message.body.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p>{}</p>"#,
+            html_escape(&message.body).replace('\n', "<br>")
+        )
+    };
+    let attachment = agent_attachment_html(message);
+    format!(
+        r#"<article class="message message-{role_class}" data-message-entry>
   <div class="message-avatar">{avatar}</div>
   <div class="message-body">
-    <div class="message-meta"><strong>{}</strong><span class="message-log">{}</span></div>
+    <div class="message-meta"><strong>{}</strong><span class="message-log">{}</span>{actions}</div>
     {}{}
   </div>
 </article>"#,
-                html_escape(&message.role),
-                html_escape(&message.created_at),
-                body,
-                attachment
-            )
+        html_escape(agent_role_label(&message.role)),
+        html_escape(&compact_local_time(&message.created_at)),
+        body,
+        attachment
+    )
+}
+
+fn agent_attachment_html(message: &AgentMessageRow) -> String {
+    message
+        .attachment
+        .as_ref()
+        .map(|attachment| {
+            let name = html_escape(&attachment.name);
+            if attachment.is_image {
+                format!(
+                    r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a><img class="message-image" src="/agents/attachments/{}" alt="">"#,
+                    attachment.id, name, attachment.id
+                )
+            } else {
+                format!(
+                    r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a>"#,
+                    attachment.id, name
+                )
+            }
         })
+        .unwrap_or_default()
+}
+
+fn agent_role_class(role: &str) -> &'static str {
+    if role == "user" { "user" } else { "assistant" }
+}
+
+fn agent_role_label(role: &str) -> &str {
+    if role == "user" { "You" } else { "Codex" }
+}
+
+fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String {
+    let rows = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| agent_activity_row_html(index + 1, message))
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    let event_count = messages.len();
+    let event_label = if event_count == 1 {
+        "1 event".to_string()
+    } else {
+        format!("{event_count} events")
+    };
+    let preview = messages
+        .iter()
+        .find_map(|message| agent_activity_preview(message))
+        .unwrap_or_else(|| "Codex command activity".into());
+    let started_at = messages
+        .first()
+        .map(|message| html_escape(&compact_local_time(&message.created_at)))
+        .unwrap_or_default();
+    format!(
+        r#"<article class="message message-activity" data-message-entry>
+  <div class="message-avatar">$</div>
+  <div class="message-body">
+    <div class="message-meta"><strong>Activity</strong><span class="message-log">{started_at}</span></div>
+    <details class="tool-fold">
+      <summary><span>{}</span><code>{}</code></summary>
+      <ol class="tool-stack" aria-label="Codex command activity">{rows}</ol>
+    </details>
+  </div>
+ </article>"#,
+        html_escape(&event_label),
+        html_escape(&truncate_text(&preview, 140))
+    )
+}
+
+fn agent_activity_preview(message: &AgentMessageRow) -> Option<String> {
+    let body = message.body.trim();
+    match agent_activity_kind(message)? {
+        AgentActivityKind::Start => Some(body.to_string()),
+        AgentActivityKind::Run => first_backtick_text(body)
+            .or_else(|| body.strip_prefix("running:"))
+            .map(|value| value.trim().to_string()),
+        AgentActivityKind::Exit => {
+            let exit_code = body
+                .strip_prefix("command exit ")
+                .and_then(|rest| rest.split_once(':').map(|(code, _)| code.trim()))
+                .unwrap_or("?");
+            let command = first_backtick_text(body).unwrap_or("(unknown command)");
+            Some(format!("exit {exit_code}: {command}"))
+        }
+    }
+}
+
+fn agent_activity_row_html(index: usize, message: &AgentMessageRow) -> String {
+    let Some(kind) = agent_activity_kind(message) else {
+        return String::new();
+    };
+    let body = message.body.trim();
+    let number = format!("{index:02}");
+    match kind {
+        AgentActivityKind::Start => format!(
+            r#"<li class="tool-row tool-row-start"><span class="tool-index">{number}</span><span class="tool-label">start</span><code>{}</code></li>"#,
+            html_escape(body)
+        ),
+        AgentActivityKind::Run => {
+            let command = first_backtick_text(body)
+                .or_else(|| body.strip_prefix("running:"))
+                .unwrap_or(body)
+                .trim();
+            format!(
+                r#"<li class="tool-row tool-row-run"><span class="tool-index">{number}</span><span class="tool-label">run</span><code>{}</code></li>"#,
+                html_escape(command)
+            )
+        }
+        AgentActivityKind::Exit => {
+            let exit_code = body
+                .strip_prefix("command exit ")
+                .and_then(|rest| rest.split_once(':').map(|(code, _)| code.trim()))
+                .unwrap_or("?");
+            let command = first_backtick_text(body).unwrap_or("(unknown command)");
+            let output = fenced_text(body);
+            let output_html = if output.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<details class="tool-output"><summary>output</summary><pre>{}</pre></details>"#,
+                    html_escape(output.trim())
+                )
+            };
+            format!(
+                r#"<li class="tool-row tool-row-exit"><span class="tool-index">{number}</span><span class="tool-label">exit {}</span><code>{}</code>{output_html}</li>"#,
+                html_escape(exit_code),
+                html_escape(command)
+            )
+        }
+    }
+}
+
+fn first_backtick_text(text: &str) -> Option<&str> {
+    let start = text.find('`')? + 1;
+    let end = text[start..].find('`')?;
+    Some(&text[start..start + end])
+}
+
+fn fenced_text(text: &str) -> &str {
+    text.split_once("```text\n")
+        .map(|(_, output)| output.strip_suffix("\n```").unwrap_or(output))
+        .unwrap_or("")
 }
 
 fn codex_browser_drawer_html(
@@ -1125,7 +1778,7 @@ fn codex_browser_drawer_html(
                 };
                 let title = html_escape(&conversation.title);
                 let preview = html_escape(&truncate_text(&conversation.preview, 92));
-                let updated = html_escape(&short_time(&conversation.updated_at));
+                let updated = html_escape(&compact_local_time(&conversation.updated_at));
                 let workdir = html_escape(&conversation.cwd);
                 let thread_id = html_escape(&conversation.id);
                 format!(
@@ -1397,17 +2050,18 @@ fn codex_transcript_html(index: &CodexIndex, thread_id: &str) -> io::Result<Stri
 }
 
 fn codex_transcript_count(html: &str) -> Option<usize> {
-    let count = html.matches("<article class=\"message\">").count();
+    let count = html.matches("data-message-entry").count();
     (count > 0).then_some(count)
 }
 
 fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlotRow>> {
-    let mut stmt = db.prepare("SELECT id, name, workdir FROM agent_slots ORDER BY id ASC")?;
+    let mut stmt = db.prepare("SELECT id, name, workdir, goal FROM agent_slots ORDER BY id ASC")?;
     stmt.query_map([], |row| {
         Ok(AgentSlotRow {
             id: row.get(0)?,
             name: row.get(1)?,
             workdir: row.get(2)?,
+            goal: row.get(3)?,
         })
     })?
     .collect()
@@ -1415,13 +2069,14 @@ fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlotRow>> {
 
 fn get_agent_slot(db: &Connection, id: i64) -> rusqlite::Result<Option<AgentSlotRow>> {
     db.query_row(
-        "SELECT id, name, workdir FROM agent_slots WHERE id = ?1",
+        "SELECT id, name, workdir, goal FROM agent_slots WHERE id = ?1",
         params![id],
         |row| {
             Ok(AgentSlotRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 workdir: row.get(2)?,
+                goal: row.get(3)?,
             })
         },
     )
@@ -1465,7 +2120,7 @@ fn ensure_agent_slot_seeds(
 
 fn list_agent_messages(db: &Connection, slot_id: i64) -> rusqlite::Result<Vec<AgentMessageRow>> {
     let mut stmt = db.prepare(
-        "SELECT m.role, m.body, m.created_at, a.id, a.original_name, a.content_type, a.size_bytes
+        "SELECT m.id, m.role, m.body, m.created_at, a.id, a.original_name, a.content_type, a.size_bytes
          FROM agent_messages m
          LEFT JOIN agent_attachments a ON a.id = m.attachment_id
          WHERE m.slot_id = ?1
@@ -1473,27 +2128,43 @@ fn list_agent_messages(db: &Connection, slot_id: i64) -> rusqlite::Result<Vec<Ag
          LIMIT 200",
     )?;
     stmt.query_map(params![slot_id], |row| {
-        let attachment_id = row.get::<_, Option<i64>>(3)?;
+        let attachment_id = row.get::<_, Option<i64>>(4)?;
         let attachment = if let Some(id) = attachment_id {
-            let content_type = row.get::<_, String>(5)?;
+            let content_type = row.get::<_, String>(6)?;
             Some(AgentAttachmentSummary {
                 id,
-                name: row.get(4)?,
+                name: row.get(5)?,
                 is_image: content_type.starts_with("image/"),
                 content_type,
-                size_bytes: row.get(6)?,
+                size_bytes: row.get(7)?,
             })
         } else {
             None
         };
         Ok(AgentMessageRow {
-            role: row.get(0)?,
-            body: row.get(1)?,
-            created_at: row.get(2)?,
+            id: row.get(0)?,
+            role: row.get(1)?,
+            body: row.get(2)?,
+            created_at: row.get(3)?,
             attachment,
         })
     })?
     .collect()
+}
+
+fn agent_user_message_attachment_id(
+    db: &Connection,
+    slot_id: i64,
+    message_id: i64,
+) -> rusqlite::Result<Option<Option<i64>>> {
+    db.query_row(
+        "SELECT attachment_id
+         FROM agent_messages
+         WHERE id = ?1 AND slot_id = ?2 AND role = 'user'",
+        params![message_id, slot_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
 }
 
 fn append_agent_message(
@@ -1510,9 +2181,51 @@ fn append_agent_message(
     Ok(db.last_insert_rowid())
 }
 
+fn update_agent_user_message(
+    db: &Connection,
+    slot_id: i64,
+    message_id: i64,
+    body: &str,
+    attachment_id: Option<i64>,
+) -> rusqlite::Result<()> {
+    db.execute(
+        "UPDATE agent_messages
+         SET body = ?1, attachment_id = COALESCE(?2, attachment_id), created_at = ?3
+         WHERE id = ?4 AND slot_id = ?5 AND role = 'user'",
+        params![
+            body,
+            attachment_id,
+            Utc::now().to_rfc3339(),
+            message_id,
+            slot_id
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_agent_messages_after(
+    db: &Connection,
+    slot_id: i64,
+    message_id: i64,
+) -> rusqlite::Result<()> {
+    db.execute(
+        "DELETE FROM agent_messages WHERE slot_id = ?1 AND id > ?2",
+        params![slot_id, message_id],
+    )?;
+    Ok(())
+}
+
 fn append_agent_assistant(state: &AppState, slot_id: i64, body: &str) {
     let db = state.db.lock().unwrap();
     let _ = append_agent_message(&db, slot_id, "assistant", body, None);
+}
+
+fn set_agent_goal(db: &Connection, slot_id: i64, goal: &str) -> rusqlite::Result<()> {
+    db.execute(
+        "UPDATE agent_slots SET goal = ?1 WHERE id = ?2",
+        params![goal, slot_id],
+    )?;
+    Ok(())
 }
 
 async fn save_agent_upload(
@@ -1548,12 +2261,58 @@ async fn save_agent_upload(
 
 fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) -> bool {
     let trimmed = body.trim();
-    let Some(text) = trimmed.strip_prefix('!').map(str::trim) else {
+    let Some((prefix, raw_text)) = agent_control_text(trimmed) else {
         return false;
     };
+    let text = normalize_agent_command_text(raw_text);
     let lower = text.to_ascii_lowercase();
     if matches!(lower.as_str(), "help" | "commands") {
         append_agent_assistant(state, slot.id, &agent_help_text(state));
+        return true;
+    }
+    if let Some(arg) = command_arg(&text, "goal") {
+        let goal = arg.trim();
+        if goal.is_empty() {
+            let current = slot.goal.trim();
+            let response = if current.is_empty() {
+                "No goal is set for this slot. Use `/goal <objective>` to set one.".to_string()
+            } else {
+                format!(
+                    "Current goal:\n```text\n{}\n```",
+                    truncate_text(current, 2000)
+                )
+            };
+            append_agent_assistant(state, slot.id, &response);
+            return true;
+        }
+        if matches!(
+            goal.to_ascii_lowercase().as_str(),
+            "clear" | "none" | "unset" | "off"
+        ) {
+            let db = state.db.lock().unwrap();
+            let _ = set_agent_goal(&db, slot.id, "");
+            drop(db);
+            append_agent_assistant(state, slot.id, "Goal cleared for this slot.");
+            return true;
+        }
+        let goal = truncate_text(goal, MAX_AGENT_GOAL_CHARS);
+        let db = state.db.lock().unwrap();
+        let _ = set_agent_goal(&db, slot.id, &goal);
+        drop(db);
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!(
+                "Goal set for this slot. Future Codex messages will include:\n```text\n{goal}\n```"
+            ),
+        );
+        return true;
+    }
+    if lower == "clear-goal" {
+        let db = state.db.lock().unwrap();
+        let _ = set_agent_goal(&db, slot.id, "");
+        drop(db);
+        append_agent_assistant(state, slot.id, "Goal cleared for this slot.");
         return true;
     }
     if matches!(lower.as_str(), "slots" | "list" | "overview") {
@@ -1659,7 +2418,7 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         );
         return true;
     }
-    if let Some(arg) = command_arg(text, "cd") {
+    if let Some(arg) = command_arg(&text, "cd") {
         let target = if arg.trim().is_empty() {
             default_home_dir()
         } else {
@@ -1690,14 +2449,14 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         }
         return true;
     }
-    if let Some(arg) = command_arg(text, "ls") {
+    if let Some(arg) = command_arg(&text, "ls") {
         append_agent_assistant(state, slot.id, &list_agent_path_text(slot, arg));
         return true;
     }
     append_agent_assistant(
         state,
         slot.id,
-        &format!("Unknown Mobailmux agent command: `{text}`. Type `!help` for commands."),
+        &format!("Unknown command: `{prefix}{raw_text}`. Type `/help` for commands."),
     );
     true
 }
@@ -1717,20 +2476,26 @@ fn agent_help_text(state: &AppState) -> String {
         let db = state.db.lock().unwrap();
         list_agent_slots(&db).unwrap_or_default()
     };
-    let mut lines = vec!["Agent commands:".to_string()];
+    let mut lines = vec![
+        "Agent commands:".to_string(),
+        "Use `/` in the web chatbox. The old `!` prefix still works.".to_string(),
+    ];
     lines.extend(
         [
-            "- `!help` or `!commands`",
-            "- `!slots`",
-            "- `!pwd`",
-            "- `!ls [path]`",
-            "- `!cd [path]`",
-            "- `!fresh`",
-            "- `!stayfresh`",
-            "- `!status`",
-            "- `!usage`",
-            "- `!stop`",
-            "- `!model`",
+            "- `/goal <objective>` sets a goal that is included in future Codex prompts",
+            "- `/goal` shows the current goal",
+            "- `/goal clear` or `/clear-goal` clears it",
+            "- `/slots`",
+            "- `/pwd`",
+            "- `/ls [path]`",
+            "- `/cd [path]`",
+            "- `/fresh`",
+            "- `/stayfresh`",
+            "- `/status`",
+            "- `/usage`",
+            "- `/stop`",
+            "- `/model`",
+            "- `/help` or `/commands`",
         ]
         .into_iter()
         .map(str::to_string),
@@ -1757,7 +2522,17 @@ fn agent_slots_status_text(state: &AppState) -> String {
             } else {
                 "idle"
             };
-            format!("{}: {state} | {}", slot.name, slot.workdir)
+            let goal = slot.goal.trim();
+            if goal.is_empty() {
+                format!("{}: {state} | {}", slot.name, slot.workdir)
+            } else {
+                format!(
+                    "{}: {state} | {} | goal: {}",
+                    slot.name,
+                    slot.workdir,
+                    truncate_text(goal, 120)
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1832,12 +2607,19 @@ fn load_codex_index(config: &Config) -> CodexIndex {
     for conversation in &conversations {
         projects
             .entry(conversation.cwd.clone())
-            .and_modify(|project| project.conversation_count += 1)
+            .and_modify(|project| {
+                project.conversation_count += 1;
+                project.latest_activity = newest_activity(
+                    project.latest_activity.as_deref(),
+                    Some(&conversation.updated_at),
+                );
+            })
             .or_insert_with(|| CodexProject {
                 path: conversation.cwd.clone(),
                 name: project_display_name(&conversation.cwd),
                 trusted: false,
                 conversation_count: 1,
+                latest_activity: Some(conversation.updated_at.clone()),
             });
     }
     for project in projects.values_mut() {
@@ -1849,16 +2631,7 @@ fn load_codex_index(config: &Config) -> CodexIndex {
         }
     }
     let mut projects = projects.into_values().collect::<Vec<_>>();
-    projects.sort_by(|left, right| {
-        right
-            .conversation_count
-            .cmp(&left.conversation_count)
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-    });
+    sort_codex_projects_by_activity(&mut projects);
 
     let usage = merge_codex_rate_limit_status(latest_codex_usage(&files), &config);
 
@@ -1867,6 +2640,35 @@ fn load_codex_index(config: &Config) -> CodexIndex {
         conversations,
         projects,
     }
+}
+
+fn newest_activity(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) if left >= right => Some(left.to_string()),
+        (Some(_), Some(right)) => Some(right.to_string()),
+        (Some(left), None) => Some(left.to_string()),
+        (None, Some(right)) => Some(right.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn sort_codex_projects_by_activity(projects: &mut [CodexProject]) {
+    projects.sort_by(|left, right| {
+        right
+            .latest_activity
+            .cmp(&left.latest_activity)
+            .then_with(|| right.conversation_count.cmp(&left.conversation_count))
+            .then_with(|| match (left.trusted, right.trusted) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => Ordering::Equal,
+            })
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
 }
 
 fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, (String, String)> {
@@ -2031,6 +2833,7 @@ fn codex_transcript_messages(path: &Path) -> io::Result<Vec<AgentMessageRow>> {
             continue;
         }
         rows.push(AgentMessageRow {
+            id: 0,
             role,
             body: text,
             created_at: timestamp,
@@ -2391,6 +3194,7 @@ fn configured_codex_projects(codex_home: &Path) -> HashMap<String, CodexProject>
                 name: project_display_name(path),
                 trusted,
                 conversation_count: 0,
+                latest_activity: None,
             },
         );
     }
@@ -2749,9 +3553,15 @@ fn build_agent_prompt(
     request_body: &str,
     attachment: Option<&AgentPromptAttachment>,
 ) -> String {
+    let goal = slot.goal.trim();
+    let goal_text = if goal.is_empty() {
+        String::new()
+    } else {
+        format!("Current slot goal:\n{goal}\n\n")
+    };
     let mut prompt = format!(
-        "You are running from Mobailmux agent slot {}.\nCurrent working folder: {}\nKeep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
-        slot.name, slot.workdir, request_body
+        "You are running from Mobailmux agent slot {}.\nCurrent working folder: {}\n{}Keep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
+        slot.name, slot.workdir, goal_text, request_body
     );
     if let Some(attachment) = attachment {
         prompt.push_str(&format!(
@@ -2787,6 +3597,220 @@ fn command_arg<'a>(text: &'a str, command: &str) -> Option<&'a str> {
         return Some(trimmed[command.len()..].trim());
     }
     None
+}
+
+fn agent_control_text(text: &str) -> Option<(char, &str)> {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let prefix = chars.next()?;
+    if !matches!(prefix, '!' | '/') {
+        return None;
+    }
+    Some((prefix, chars.as_str().trim()))
+}
+
+fn normalize_agent_command_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let (name, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .map(|(name, rest)| (name, Some(rest)))
+        .unwrap_or((trimmed, None));
+    let lower = name.to_ascii_lowercase();
+    if known_agent_command_names()
+        .iter()
+        .any(|command| *command == lower)
+    {
+        return trimmed.to_string();
+    }
+    let matches = known_agent_command_names()
+        .into_iter()
+        .filter(|command| command.starts_with(&lower))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return trimmed.to_string();
+    }
+    match rest {
+        Some(rest) if !rest.trim_start().is_empty() => {
+            format!("{} {}", matches[0], rest.trim_start())
+        }
+        _ => matches[0].to_string(),
+    }
+}
+
+fn known_agent_command_names() -> Vec<&'static str> {
+    let mut names = AGENT_COMMAND_SPECS
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    names.extend(AGENT_COMMAND_ALIASES);
+    names
+}
+
+fn agent_composer_suggestions_json(config: &Config) -> String {
+    let mut suggestions = AGENT_COMMAND_SPECS
+        .iter()
+        .map(|command| ComposerSuggestion {
+            kind: "command",
+            name: command.name.to_string(),
+            insert: format!("/{}", command.name),
+            description: command.description.to_string(),
+            takes_arg: command.takes_arg,
+        })
+        .collect::<Vec<_>>();
+    suggestions.extend(discover_codex_skill_suggestions(&config.codex_home));
+    suggestions.extend(discover_codex_plugin_suggestions(&config.codex_home));
+    let mut seen = HashSet::new();
+    suggestions.retain(|suggestion| {
+        seen.insert(format!(
+            "{}:{}",
+            suggestion.kind,
+            suggestion.name.to_ascii_lowercase()
+        ))
+    });
+    suggestions.sort_by(|left, right| {
+        suggestion_kind_rank(left.kind)
+            .cmp(&suggestion_kind_rank(right.kind))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+    serde_json::to_string(&suggestions).unwrap_or_else(|_| "[]".into())
+}
+
+fn suggestion_kind_rank(kind: &str) -> usize {
+    match kind {
+        "command" => 0,
+        "skill" => 1,
+        "plugin" => 2,
+        _ => 3,
+    }
+}
+
+fn discover_codex_skill_suggestions(codex_home: &Path) -> Vec<ComposerSuggestion> {
+    let mut files = Vec::new();
+    collect_named_files(&codex_home.join("skills"), "SKILL.md", 5, &mut files);
+    collect_named_files(&codex_home.join("plugins"), "SKILL.md", 9, &mut files);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let skill_dir = path.parent()?.file_name()?.to_str()?.to_string();
+            let plugin_root = plugin_root_for_path(&path);
+            let name = if let Some(root) = plugin_root {
+                let plugin = plugin_manifest_field(&root, "name")?;
+                format!("{plugin}:{skill_dir}")
+            } else {
+                skill_dir
+            };
+            let description =
+                skill_description_from_file(&path).unwrap_or_else(|| "Codex skill".into());
+            Some(ComposerSuggestion {
+                kind: "skill",
+                insert: format!("${name}"),
+                name,
+                description: compact_text(&description, 120),
+                takes_arg: false,
+            })
+        })
+        .collect()
+}
+
+fn discover_codex_plugin_suggestions(codex_home: &Path) -> Vec<ComposerSuggestion> {
+    let mut files = Vec::new();
+    collect_named_files(&codex_home.join("plugins"), "plugin.json", 9, &mut files);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let plugin_dir = path.parent()?.parent()?;
+            let name = plugin_manifest_field(plugin_dir, "name")?;
+            let description =
+                plugin_manifest_description(plugin_dir).unwrap_or_else(|| "Codex plugin".into());
+            Some(ComposerSuggestion {
+                kind: "plugin",
+                insert: format!("#{name}"),
+                name,
+                description: compact_text(&description, 120),
+                takes_arg: false,
+            })
+        })
+        .collect()
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_text(&compact, max_chars).replace('\n', " ")
+}
+
+fn collect_named_files(dir: &Path, file_name: &str, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_files(&path, file_name, depth - 1, files);
+        } else if path.file_name().and_then(|name| name.to_str()) == Some(file_name) {
+            files.push(path);
+        }
+    }
+}
+
+fn plugin_root_for_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.join(".codex-plugin/plugin.json").is_file() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn skill_description_from_file(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.lines()
+        .find_map(|line| yaml_string_field(line, "description"))
+}
+
+fn plugin_manifest_description(plugin_root: &Path) -> Option<String> {
+    let manifest = plugin_manifest_json(plugin_root)?;
+    manifest
+        .get("interface")
+        .and_then(|interface| interface.get("shortDescription"))
+        .and_then(|value| value.as_str())
+        .or_else(|| manifest.get("description").and_then(|value| value.as_str()))
+        .map(str::to_string)
+}
+
+fn plugin_manifest_field(plugin_root: &Path, field: &str) -> Option<String> {
+    plugin_manifest_json(plugin_root)?
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn plugin_manifest_json(plugin_root: &Path) -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(plugin_root.join(".codex-plugin/plugin.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn yaml_string_field(line: &str, field: &str) -> Option<String> {
+    let value = line.trim().strip_prefix(&format!("{field}:"))?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        value
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string(),
+    )
 }
 
 fn resolve_agent_path(raw: &str, base: &str) -> PathBuf {
@@ -2959,6 +3983,25 @@ fn short_time(value: &str) -> String {
         return format_duration(past.num_seconds(), "") + " ago";
     }
     dt.format("%b %-d %H:%M").to_string()
+}
+
+fn compact_local_time(value: &str) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(value) else {
+        return if value.trim().is_empty() {
+            "unknown".into()
+        } else {
+            value.to_string()
+        };
+    };
+    let dt = parsed.with_timezone(&Local);
+    let now = Local::now();
+    if dt.date_naive() == now.date_naive() {
+        return dt.format("%H:%M").to_string();
+    }
+    if dt.year() == now.year() {
+        return dt.format("%d-%m %H:%M").to_string();
+    }
+    dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
 fn format_duration(seconds: i64, prefix: &str) -> String {
@@ -3499,6 +4542,10 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn html_attr_escape(value: &str) -> String {
+    html_escape(value).replace('\r', "").replace('\n', "&#10;")
+}
+
 fn io_other(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -3559,6 +4606,172 @@ mod tests {
         assert!(suspicious_secret_assignment(
             "MOBAILMUX_COOKIE_SECRET=abc123"
         ));
+    }
+
+    #[test]
+    fn slash_command_prefixes_autocorrect_when_unambiguous() {
+        assert_eq!(normalize_agent_command_text("go ship it"), "goal ship it");
+        assert_eq!(normalize_agent_command_text("mod"), "model");
+        assert_eq!(normalize_agent_command_text("sta"), "sta");
+    }
+
+    #[test]
+    fn agent_prompt_includes_slot_goal() {
+        let slot = AgentSlotRow {
+            id: 1,
+            name: "codex".into(),
+            workdir: "/work/app".into(),
+            goal: "Keep the app deployable.".into(),
+        };
+
+        let prompt = build_agent_prompt(&slot, "fix the bug", None);
+
+        assert!(prompt.contains("Current slot goal:\nKeep the app deployable."));
+        assert!(prompt.contains("User request:\nfix the bug"));
+    }
+
+    #[test]
+    fn agent_messages_group_command_activity() {
+        let messages = vec![
+            test_message(
+                "assistant",
+                "codex done in 3s.\n\nDone with the requested change.",
+            ),
+            test_message("assistant", "running: `/bin/bash -lc 'cargo test'`"),
+            test_message("assistant", "running: `/bin/bash -lc 'cargo fmt'`"),
+            test_message("assistant", "codex started in `/work/app`."),
+            test_message("user", "please fix this"),
+        ];
+
+        let html = agent_messages_html(&messages);
+
+        assert_eq!(html.matches("message-activity").count(), 1);
+        assert_eq!(html.matches("tool-fold").count(), 1);
+        assert!(html.contains("3 events"));
+        assert_eq!(html.matches("tool-row-run").count(), 2);
+        assert!(html.contains("message-user"));
+        assert!(html.contains("message-assistant"));
+        assert!(
+            html.find("message-user").unwrap() < html.find("message-activity").unwrap()
+                && html.find("message-activity").unwrap() < html.find("codex done").unwrap()
+        );
+    }
+
+    #[test]
+    fn composer_suggestions_include_skills_and_plugins() {
+        let dir = env::temp_dir().join(format!("mobailmux-test-{}", Uuid::new_v4().simple()));
+        let skill_dir = dir.join("skills/repo-starter");
+        let plugin_dir = dir.join("plugins/cache/openai-curated/github/hash");
+        let plugin_skill_dir = plugin_dir.join("skills/yeet");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(&plugin_skill_dir).unwrap();
+        fs::create_dir_all(plugin_dir.join(".codex-plugin")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: repo-starter\ndescription: Start repos safely.\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join(".codex-plugin/plugin.json"),
+            r#"{"name":"github","description":"GitHub workflows"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_skill_dir.join("SKILL.md"),
+            "---\nname: yeet\ndescription: Publish changes.\n---\n",
+        )
+        .unwrap();
+
+        let skills = discover_codex_skill_suggestions(&dir);
+        let plugins = discover_codex_plugin_suggestions(&dir);
+
+        assert!(skills.iter().any(|item| item.insert == "$repo-starter"));
+        assert!(skills.iter().any(|item| item.insert == "$github:yeet"));
+        assert!(plugins.iter().any(|item| item.insert == "#github"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn edited_user_message_prunes_later_chat_and_session() {
+        let db = Connection::open_in_memory().unwrap();
+        db_migrations::migrate(&db).unwrap();
+        let slot_id = ensure_agent_slot(&db, "codex", Path::new("/tmp")).unwrap();
+        let message_id = append_agent_message(&db, slot_id, "user", "old prompt", None).unwrap();
+        append_agent_message(&db, slot_id, "assistant", "old answer", None).unwrap();
+        set_agent_session(&db, slot_id, "thread-old", "/tmp").unwrap();
+
+        update_agent_user_message(&db, slot_id, message_id, "new prompt", None).unwrap();
+        delete_agent_messages_after(&db, slot_id, message_id).unwrap();
+        db.execute(
+            "DELETE FROM agent_sessions WHERE slot_id = ?1",
+            params![slot_id],
+        )
+        .unwrap();
+
+        let body: String = db
+            .query_row(
+                "SELECT body FROM agent_messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM agent_messages WHERE slot_id = ?1",
+                params![slot_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "new prompt");
+        assert_eq!(count, 1);
+        assert!(agent_session(&db, slot_id).unwrap().is_none());
+    }
+
+    fn test_message(role: &str, body: &str) -> AgentMessageRow {
+        AgentMessageRow {
+            id: 1,
+            role: role.into(),
+            body: body.into(),
+            created_at: "2026-06-29T12:00:00Z".into(),
+            attachment: None,
+        }
+    }
+
+    #[test]
+    fn codex_projects_sort_by_recent_activity() {
+        let mut projects = vec![
+            CodexProject {
+                path: "/work/old".into(),
+                name: "Old".into(),
+                trusted: false,
+                conversation_count: 12,
+                latest_activity: Some("2026-06-20T10:00:00Z".into()),
+            },
+            CodexProject {
+                path: "/work/empty".into(),
+                name: "Empty".into(),
+                trusted: true,
+                conversation_count: 0,
+                latest_activity: None,
+            },
+            CodexProject {
+                path: "/work/new".into(),
+                name: "New".into(),
+                trusted: false,
+                conversation_count: 1,
+                latest_activity: Some("2026-06-29T08:00:00Z".into()),
+            },
+        ];
+
+        sort_codex_projects_by_activity(&mut projects);
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["New", "Old", "Empty"]
+        );
     }
 
     #[test]

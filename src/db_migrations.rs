@@ -2,7 +2,7 @@ use rusqlite::{Connection, params};
 
 use crate::codex_reset_ledger;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SCHEMA_VERSION: i64 = 3;
 
 const BASE_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -65,6 +65,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         migrate_single_codex_lane(conn)?;
         record_migration(conn, 2)?;
     }
+    if current < 3 {
+        migrate_agent_slot_goals(conn)?;
+        record_migration(conn, 3)?;
+    }
     debug_assert!(current_version(conn)? >= LATEST_SCHEMA_VERSION);
     Ok(())
 }
@@ -103,6 +107,21 @@ fn migrate_single_codex_lane(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_agent_slot_goals(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(agent_slots)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|column| column == "goal") {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE agent_slots ADD COLUMN goal TEXT NOT NULL DEFAULT ''",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +131,14 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         migrate(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), LATEST_SCHEMA_VERSION);
+        let columns = db
+            .prepare("PRAGMA table_info(agent_slots)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "goal"));
     }
 
     #[test]
