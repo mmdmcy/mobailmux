@@ -64,6 +64,21 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .message-activity .message-body{border-left:3px solid var(--line);padding-left:10px}
 .message-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px}
 .message p{margin:4px 0 0;white-space:normal;word-break:break-word;line-height:1.45}
+.message-content{min-width:0;line-height:1.45}
+.message-content>*{margin:7px 0 0}
+.message-content>:first-child{margin-top:0}
+.message-content p{margin:7px 0 0}
+.message-content ul,.message-content ol{padding-left:21px}
+.message-content li{margin:3px 0}
+.message-content blockquote{padding-left:10px;border-left:3px solid var(--line);color:var(--muted)}
+.message-content table{width:100%;border-collapse:collapse;display:block;overflow-x:auto}
+.message-content th,.message-content td{border:1px solid var(--line);padding:5px 7px;text-align:left}
+.message-content :not(pre)>code{border:1px solid var(--line);border-radius:5px;padding:1px 4px;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;overflow-wrap:anywhere}
+.message-code{margin-top:8px;border:1px solid var(--line);border-radius:7px;overflow:hidden;background:rgba(0,0,0,.03)}
+.message-code-head{min-height:34px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px;border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:900;text-transform:uppercase}
+.message-copy{min-height:28px;border:1px solid var(--line);background:transparent;color:var(--fg);padding:0 8px;font-size:12px}
+.message-code pre{max-width:100%;max-height:280px;overflow:auto;margin:0;padding:10px;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;line-height:1.45;white-space:pre;tab-size:2}
+.message-code code{font:inherit}
 .message-log{color:var(--muted);font-size:13px}
 .message-edit{min-height:28px;border:1px solid var(--line);background:transparent;color:var(--fg);padding:0 8px;font-size:12px}
 .tool-fold{max-width:100%;min-width:0;margin-top:4px;border:1px solid var(--line);border-radius:7px;overflow:hidden}

@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1086,8 +1087,42 @@ async fn agents_page(
       input.focus();
     }}
   }}
+  async function copyText(value) {{
+    if (!value) return false;
+    if (navigator.clipboard?.writeText) {{
+      await navigator.clipboard.writeText(value);
+      return true;
+    }}
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.left = "-9999px";
+    area.style.top = "0";
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, value.length);
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  }}
   document.querySelector("[data-edit-clear]")?.addEventListener("click", clearEditMode);
   list?.addEventListener("click", (event) => {{
+    const copyButton = event.target.closest("[data-copy-code]");
+    if (copyButton) {{
+      event.preventDefault();
+      const code = copyButton.closest(".message-code")?.querySelector("code")?.textContent || "";
+      copyText(code).then((ok) => {{
+        const original = copyButton.textContent || "Copy";
+        copyButton.textContent = ok ? "Copied" : "Copy failed";
+        window.setTimeout(() => copyButton.textContent = original, 1400);
+      }}).catch(() => {{
+        copyButton.textContent = "Copy failed";
+        window.setTimeout(() => copyButton.textContent = "Copy", 1400);
+      }});
+      return;
+    }}
     const button = event.target.closest("[data-edit-message]");
     if (!button) return;
     event.preventDefault();
@@ -2015,14 +2050,7 @@ fn agent_message_html(message: &AgentMessageRow) -> String {
     } else {
         String::new()
     };
-    let body = if message.body.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"<p>{}</p>"#,
-            html_escape(&message.body).replace('\n', "<br>")
-        )
-    };
+    let body = message_body_html(&message.body);
     let attachment = agent_attachment_html(message);
     format!(
         r#"<article class="message message-{role_class}" data-message-entry>
@@ -2037,6 +2065,88 @@ fn agent_message_html(message: &AgentMessageRow) -> String {
         body,
         attachment
     )
+}
+
+fn message_body_html(body: &str) -> String {
+    if body.trim().is_empty() {
+        return String::new();
+    }
+    let normalized = normalize_markdown_fences(body);
+    let parser = Parser::new_ext(&normalized, markdown_options()).map(markdown_event);
+    let mut rendered = String::new();
+    html::push_html(&mut rendered, parser);
+    format!(r#"<div class="message-content">{rendered}</div>"#)
+}
+
+fn markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options
+}
+
+fn markdown_event(event: Event<'_>) -> Event<'_> {
+    match event {
+        Event::Start(Tag::CodeBlock(kind)) => Event::Html(CowStr::from(code_block_open_html(kind))),
+        Event::End(TagEnd::CodeBlock) => Event::Html(CowStr::Borrowed("</code></pre></div>")),
+        Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
+        _ => event,
+    }
+}
+
+fn code_block_open_html(kind: CodeBlockKind<'_>) -> String {
+    let language = match kind {
+        CodeBlockKind::Fenced(info) => info
+            .split_whitespace()
+            .next()
+            .map(|value| {
+                value
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '+'))
+                    .collect::<String>()
+            })
+            .unwrap_or_default(),
+        CodeBlockKind::Indented => String::new(),
+    };
+    let label = if language.is_empty() {
+        "code"
+    } else {
+        language.as_str()
+    };
+    let class_attr = if language.is_empty() {
+        String::new()
+    } else {
+        format!(r#" class="language-{}""#, html_attr_escape(&language))
+    };
+    format!(
+        r#"<div class="message-code"><div class="message-code-head"><span>{}</span><button type="button" class="message-copy" data-copy-code>Copy</button></div><pre><code{}>"#,
+        html_escape(label),
+        class_attr
+    )
+}
+
+fn normalize_markdown_fences(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut changed = false;
+    for line in value.split_inclusive('\n') {
+        let without_spaces = line.trim_start_matches(' ');
+        let space_count = line.len().saturating_sub(without_spaces.len());
+        let quote_count = without_spaces.chars().take_while(|ch| *ch == '\'').count();
+        if space_count <= 3 && quote_count >= 3 {
+            normalized.extend(std::iter::repeat_n(' ', space_count));
+            normalized.push_str("```");
+            normalized.push_str(&without_spaces[quote_count..]);
+            changed = true;
+        } else {
+            normalized.push_str(line);
+        }
+    }
+    if changed {
+        normalized
+    } else {
+        value.to_string()
+    }
 }
 
 fn agent_attachment_html(message: &AgentMessageRow) -> String {
@@ -5384,6 +5494,39 @@ mod tests {
         let note = html.find("note: finished investigation").unwrap();
         let second_activity = html.rfind("message-activity").unwrap();
         assert!(first_activity < note && note < second_activity);
+    }
+
+    #[test]
+    fn agent_messages_render_markdown_code_blocks_with_copy() {
+        let html = agent_messages_html(&[test_message(
+            "assistant",
+            "Run this:\n\n```bash\ncargo test\n```",
+        )]);
+
+        assert!(html.contains(r#"<div class="message-content">"#));
+        assert!(html.contains(r#"<div class="message-code">"#));
+        assert!(html.contains(r#"data-copy-code"#));
+        assert!(html.contains(r#"class="language-bash""#));
+        assert!(html.contains("cargo test"));
+        assert!(!html.contains("```bash"));
+    }
+
+    #[test]
+    fn agent_messages_accept_single_quote_code_fences() {
+        let html = message_body_html("Run this:\n\n'''bash\ncargo test\n'''\n");
+
+        assert!(html.contains(r#"<div class="message-code">"#));
+        assert!(html.contains("cargo test"));
+        assert!(!html.contains("'''bash"));
+    }
+
+    #[test]
+    fn agent_markdown_escapes_raw_html() {
+        let html = message_body_html("<script>alert(1)</script>\n\n`safe`");
+
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("<code>safe</code>"));
     }
 
     #[test]
