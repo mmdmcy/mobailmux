@@ -18,7 +18,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{HashMap, HashSet},
     env, fs,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -31,6 +31,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as TokioCommand,
     sync::oneshot,
+    time::sleep,
 };
 use uuid::Uuid;
 
@@ -535,12 +536,20 @@ async fn logout_post() -> Response {
 struct AgentsQuery {
     slot: Option<i64>,
     thread: Option<String>,
+    refresh: Option<String>,
+    browse: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AgentConversationForm {
     thread_id: String,
     workdir: String,
+}
+
+#[derive(Deserialize)]
+struct AgentNewChatForm {
+    workdir: Option<String>,
+    create: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -578,6 +587,11 @@ struct AgentMessageRow {
     body: String,
     created_at: String,
     attachment: Option<AgentAttachmentSummary>,
+}
+
+struct AgentProgress {
+    dir: PathBuf,
+    file: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -622,7 +636,12 @@ async fn agents_page(
     let Some(active_slot) = active_slot else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "missing agent slot").into_response();
     };
-    let mut codex_snapshot = codex_index_snapshot(&state);
+    let mut codex_snapshot = if query.refresh.is_some() {
+        Some(refresh_codex_index_blocking(&state))
+    } else {
+        codex_index_snapshot(&state)
+    };
+    let reopen_browser = query.browse.is_some();
     let selected_thread = query.thread.clone();
     if selected_thread.as_ref().is_some_and(|thread_id| {
         codex_snapshot
@@ -644,6 +663,7 @@ async fn agents_page(
         active_slot.id,
         selected_thread.as_deref(),
         codex_loaded,
+        &active_slot.workdir,
     );
     let messages_html = selected_thread
         .as_deref()
@@ -664,6 +684,15 @@ async fn agents_page(
     let slot_rail = agent_slot_rail_html(&state, &slots, active_slot.id);
     let usage_dialog = codex_usage_dialog(&state.config, codex.usage.as_ref(), codex_loaded);
     let viewing_transcript = selected_thread.is_some();
+    let refresh_thread_input = selected_thread
+        .as_deref()
+        .map(|thread| {
+            format!(
+                r#"<input type="hidden" name="thread" value="{}">"#,
+                html_attr_escape(thread)
+            )
+        })
+        .unwrap_or_default();
     let composer_suggestions_json = agent_composer_suggestions_json(&state.config);
     let active_running = agent_run_for(&state, active_slot.id).is_some();
     let cancel_disabled = if active_running { "" } else { " disabled" };
@@ -671,7 +700,7 @@ async fn agents_page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost" data-browser-open>Browse</button><button type="button" class="ghost" data-codex-open>Usage</button><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost" data-browser-open>Browse</button><button type="button" class="ghost" data-codex-open>Usage</button><form action="/agents" method="get"><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost">Refresh</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
@@ -787,6 +816,7 @@ async fn agents_page(
     unlockPageScroll();
     syncDialogLock();
   }});
+  if ({reopen_browser}) openLockedDialog(browserPanel);
   document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
   let browserTouchY = 0;
   document.addEventListener("touchstart", (event) => {{
@@ -831,6 +861,39 @@ async fn agents_page(
     if (!ok) event.preventDefault();
   }});
   let dirty = false;
+  let agentPollTimer = 0;
+  let slotPollTimer = 0;
+  let lastMessagesHtml = list ? list.innerHTML : "";
+  function scheduleAgentPoll(delay) {{
+    window.clearTimeout(agentPollTimer);
+    agentPollTimer = window.setTimeout(poll, delay);
+  }}
+  function scheduleSlotPoll(delay) {{
+    window.clearTimeout(slotPollTimer);
+    slotPollTimer = window.setTimeout(pollSlots, delay);
+  }}
+  function captureOpenFolds() {{
+    const keys = new Set();
+    list?.querySelectorAll("details[data-fold-key]").forEach((details) => {{
+      if (details.open) {{
+        const key = details.getAttribute("data-fold-key");
+        if (key) keys.add(key);
+      }}
+    }});
+    return keys;
+  }}
+  function replaceMessages(html) {{
+    if (!list || html === lastMessagesHtml) return;
+    const openFolds = captureOpenFolds();
+    const nearBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 90;
+    list.innerHTML = html;
+    lastMessagesHtml = html;
+    list.querySelectorAll("details[data-fold-key]").forEach((details) => {{
+      const key = details.getAttribute("data-fold-key");
+      if (key && openFolds.has(key)) details.open = true;
+    }});
+    if (nearBottom) list.scrollTop = list.scrollHeight;
+  }}
   function activeCompletionToken() {{
     if (!input) return null;
     const value = input.value;
@@ -967,25 +1030,23 @@ async fn agents_page(
     }}
   }});
   async function poll() {{
-    if (!list || dirty || document.activeElement === input) {{
-      setTimeout(poll, 1800);
+    if (!list || dirty) {{
+      scheduleAgentPoll(1800);
       return;
     }}
-    const nearBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 90;
     try {{
       const response = await fetch("/agents/slots/{}/state", {{cache:"no-store"}});
       if (response.ok) {{
         const data = await response.json();
-        list.innerHTML = data.messages_html;
+        replaceMessages(data.messages_html);
         status.textContent = data.active_status || (data.running ? (data.current || "running") : "idle");
         count.textContent = data.message_count + " messages";
         if (cancelButton) cancelButton.disabled = !data.running;
-        if (nearBottom) list.scrollTop = list.scrollHeight;
-        setTimeout(poll, data.running ? 1200 : 4000);
+        scheduleAgentPoll(data.running ? 1200 : 4000);
         return;
       }}
     }} catch (_) {{}}
-    setTimeout(poll, 4000);
+    scheduleAgentPoll(4000);
   }}
   function renderSlotStates(slots) {{
     let anyRunning = false;
@@ -1020,18 +1081,29 @@ async fn agents_page(
       if (response.ok) {{
         const data = await response.json();
         const anyRunning = renderSlotStates(data.slots || []);
-        setTimeout(pollSlots, anyRunning ? 1200 : 4000);
+        scheduleSlotPoll(anyRunning ? 1200 : 4000);
         return;
       }}
     }} catch (_) {{}}
-    setTimeout(pollSlots, 5000);
+    scheduleSlotPoll(5000);
+  }}
+  function refreshVisibleState() {{
+    if (document.visibilityState === "hidden") return;
+    scheduleSlotPoll(0);
+    if (!viewingTranscript) scheduleAgentPoll(0);
   }}
   if (list) list.scrollTop = list.scrollHeight;
-  setTimeout(pollSlots, 1000);
-  if (!viewingTranscript) setTimeout(poll, 1200);
+  window.addEventListener("pageshow", refreshVisibleState);
+  window.addEventListener("focus", refreshVisibleState);
+  document.addEventListener("visibilitychange", () => {{
+    if (document.visibilityState === "visible") refreshVisibleState();
+  }});
+  scheduleSlotPoll(1000);
+  if (!viewingTranscript) scheduleAgentPoll(1200);
 }})();
 </script>
 "##,
+            active_slot.id,
             html_escape(&runtime.label),
             active_slot.id,
             active_slot.id,
@@ -1090,6 +1162,66 @@ async fn agent_conversation_load(
         url_encode(&form.thread_id)
     ))
     .into_response()
+}
+
+async fn agent_new_chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<i64>,
+    Form(form): Form<AgentNewChatForm>,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    let slot = {
+        let db = state.db.lock().unwrap();
+        get_agent_slot(&db, id).unwrap_or(None)
+    };
+    let Some(slot) = slot else {
+        return Redirect::to("/agents").into_response();
+    };
+    let raw_workdir = form.workdir.as_deref().unwrap_or("").trim();
+    let workdir = if raw_workdir.is_empty() {
+        PathBuf::from(&slot.workdir)
+    } else {
+        resolve_agent_path(raw_workdir, &slot.workdir)
+    };
+    if form.create.is_some()
+        && !workdir.exists()
+        && let Err(err) = fs::create_dir_all(&workdir)
+    {
+        append_agent_assistant(
+            &state,
+            slot.id,
+            &format!("Could not create folder `{}`: {err}", workdir.display()),
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    if !workdir.is_dir() {
+        append_agent_assistant(
+            &state,
+            slot.id,
+            &format!("Folder does not exist: `{}`", workdir.display()),
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    let workdir = workdir.canonicalize().unwrap_or(workdir);
+    let workdir_text = workdir.to_string_lossy().to_string();
+    let stopped = reset_agent_slot_chat(&state, slot.id, &workdir);
+    let stop_text = if stopped {
+        " Stopped the current job."
+    } else {
+        ""
+    };
+    append_agent_assistant(
+        &state,
+        slot.id,
+        &format!(
+            "{} new chat ready in `{workdir_text}`.{stop_text} Your next message starts a new agent chat.",
+            slot.name
+        ),
+    );
+    Redirect::to(&agent_location(Some(slot.id))).into_response()
 }
 
 async fn codex_reset_post(
@@ -1650,12 +1782,13 @@ fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String {
         .first()
         .map(|message| html_escape(&compact_local_time(&message.created_at)))
         .unwrap_or_default();
+    let fold_key = html_attr_escape(&agent_activity_fold_key(messages));
     format!(
         r#"<article class="message message-activity" data-message-entry>
   <div class="message-avatar">$</div>
   <div class="message-body">
     <div class="message-meta"><strong>Activity</strong><span class="message-log">{started_at}</span></div>
-    <details class="tool-fold">
+    <details class="tool-fold" data-fold-key="{fold_key}">
       <summary><span>{}</span><code>{}</code></summary>
       <ol class="tool-stack" aria-label="Codex command activity">{rows}</ol>
     </details>
@@ -1664,6 +1797,27 @@ fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String {
         html_escape(&event_label),
         html_escape(&truncate_text(&preview, 140))
     )
+}
+
+fn agent_activity_fold_key(messages: &[&AgentMessageRow]) -> String {
+    messages
+        .first()
+        .map(|message| message_fold_key("activity", message))
+        .unwrap_or_else(|| "activity-empty".into())
+}
+
+fn message_fold_key(prefix: &str, message: &AgentMessageRow) -> String {
+    if message.id > 0 {
+        return format!("{prefix}-{}", message.id);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(message.created_at.as_bytes());
+    hasher.update([0]);
+    hasher.update(message.role.as_bytes());
+    hasher.update([0]);
+    hasher.update(message.body.as_bytes());
+    let digest = hasher.finalize();
+    format!("{prefix}-{}", hex::encode(&digest[..8]))
 }
 
 fn agent_activity_preview(message: &AgentMessageRow) -> Option<String> {
@@ -1715,8 +1869,9 @@ fn agent_activity_row_html(index: usize, message: &AgentMessageRow) -> String {
             let output_html = if output.trim().is_empty() {
                 String::new()
             } else {
+                let fold_key = html_attr_escape(&message_fold_key("output", message));
                 format!(
-                    r#"<details class="tool-output"><summary>output</summary><pre>{}</pre></details>"#,
+                    r#"<details class="tool-output" data-fold-key="{fold_key}"><summary>output</summary><pre>{}</pre></details>"#,
                     html_escape(output.trim())
                 )
             };
@@ -1747,7 +1902,9 @@ fn codex_browser_drawer_html(
     slot_id: i64,
     active_thread: Option<&str>,
     loaded: bool,
+    active_workdir: &str,
 ) -> String {
+    let active_workdir = html_escape(active_workdir);
     let mut groups = Vec::new();
     for project in projects
         .iter()
@@ -1807,14 +1964,20 @@ fn codex_browser_drawer_html(
         } else {
             "project"
         };
+        let project_path = html_escape(&project.path);
+        let project_name = html_escape(&project.name);
         groups.push(format!(
             r#"<section class="browser-project" data-project-group>
-  <div class="browser-project-head" title="{}"><strong>{}</strong><span>{} chats · {trust}</span></div>
+  <div class="browser-project-head" title="{project_path}">
+    <div><strong>{project_name}</strong><span>{} chats · {trust}</span></div>
+    <form action="/agents/slots/{slot_id}/new" method="post">
+      <input type="hidden" name="workdir" value="{project_path}">
+      <button type="submit" class="ghost">New</button>
+    </form>
+  </div>
   <div class="browser-conversations">{rows}</div>
   {more}
 </section>"#,
-            html_escape(&project.path),
-            html_escape(&project.name),
             project.conversation_count
         ));
     }
@@ -1827,8 +1990,32 @@ fn codex_browser_drawer_html(
     };
     format!(
         r#"<dialog class="browser-drawer" id="conversationDrawer">
-  <header><div><strong>Conversations</strong><br><span>Projects with saved Codex sessions</span></div><button type="button" class="icon" data-browser-close aria-label="Close">x</button></header>
-  <main class="browser-scroll">{body}</main>
+  <header>
+    <div><strong>Conversations</strong><br><span>Projects with saved Codex sessions</span></div>
+    <div class="browser-head-actions">
+      <form action="/agents" method="get">
+        <input type="hidden" name="slot" value="{slot_id}">
+        <input type="hidden" name="refresh" value="1">
+        <input type="hidden" name="browse" value="1">
+        <button type="submit" class="ghost">Refresh</button>
+      </form>
+      <button type="button" class="icon" data-browser-close aria-label="Close">x</button>
+    </div>
+  </header>
+  <main class="browser-scroll">
+    <section class="browser-new">
+      <form class="browser-new-current" action="/agents/slots/{slot_id}/new" method="post">
+        <input type="hidden" name="workdir" value="{active_workdir}">
+        <button type="submit">New current</button>
+      </form>
+      <form class="browser-new-path" action="/agents/slots/{slot_id}/new" method="post">
+        <input name="workdir" placeholder="Folder path" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <label class="browser-check"><input type="checkbox" name="create" value="1"><span>Create folder</span></label>
+        <button type="submit">Start</button>
+      </form>
+    </section>
+    {body}
+  </main>
 </dialog>"#
     )
 }
@@ -2228,6 +2415,25 @@ fn set_agent_goal(db: &Connection, slot_id: i64, goal: &str) -> rusqlite::Result
     Ok(())
 }
 
+fn reset_agent_slot_chat(state: &AppState, slot_id: i64, workdir: &Path) -> bool {
+    let stopped = stop_agent_job(state, slot_id);
+    let workdir = workdir.to_string_lossy().to_string();
+    let db = state.db.lock().unwrap();
+    let _ = db.execute(
+        "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
+        params![workdir, slot_id],
+    );
+    let _ = db.execute(
+        "DELETE FROM agent_sessions WHERE slot_id = ?1",
+        params![slot_id],
+    );
+    let _ = db.execute(
+        "DELETE FROM agent_messages WHERE slot_id = ?1",
+        params![slot_id],
+    );
+    stopped
+}
+
 async fn save_agent_upload(
     state: &AppState,
     slot: &AgentSlotRow,
@@ -2358,7 +2564,6 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
     }
     if matches!(lower.as_str(), "fresh" | "new" | "stayfresh") {
         let keep_workdir = lower == "stayfresh";
-        let stopped = stop_agent_job(state, slot.id);
         let workdir = if keep_workdir {
             slot.workdir.clone()
         } else {
@@ -2368,23 +2573,7 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
                 .to_string_lossy()
                 .to_string()
         };
-        {
-            let db = state.db.lock().unwrap();
-            if !keep_workdir {
-                let _ = db.execute(
-                    "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
-                    params![workdir, slot.id],
-                );
-            }
-            let _ = db.execute(
-                "DELETE FROM agent_sessions WHERE slot_id = ?1",
-                params![slot.id],
-            );
-            let _ = db.execute(
-                "DELETE FROM agent_messages WHERE slot_id = ?1",
-                params![slot.id],
-            );
-        }
+        let stopped = reset_agent_slot_chat(state, slot.id, Path::new(&workdir));
         let folder_text = if keep_workdir {
             format!("Folder kept at `{workdir}`.")
         } else {
@@ -3211,6 +3400,85 @@ fn codex_conversation_by_id<'a>(
         .find(|conversation| conversation.id == thread_id)
 }
 
+fn prepare_agent_progress(slot_id: i64) -> io::Result<AgentProgress> {
+    let dir = env::temp_dir().join(format!(
+        "mobailmux-agent-progress-{}-{}",
+        slot_id,
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&dir)?;
+    let file = dir.join("progress.log");
+    fs::File::create(&file)?;
+    let helper = dir.join("aiprogress");
+    let progress_file = shell_single_quote(&file.to_string_lossy());
+    fs::write(
+        &helper,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {progress_file}\n"
+        ),
+    )?;
+    let mut permissions = fs::metadata(&helper)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&helper, permissions)?;
+    Ok(AgentProgress { dir, file })
+}
+
+fn progress_path_env(progress_dir: &Path) -> Option<std::ffi::OsString> {
+    let mut paths = vec![progress_dir.to_path_buf()];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    env::join_paths(paths).ok()
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn watch_agent_progress_file(
+    state: Arc<AppState>,
+    slot_id: i64,
+    path: PathBuf,
+    mut done_rx: oneshot::Receiver<()>,
+) {
+    let mut offset = 0u64;
+    loop {
+        tokio::select! {
+            _ = &mut done_rx => {
+                let _ = drain_agent_progress_file(&state, slot_id, &path, &mut offset);
+                break;
+            }
+            _ = sleep(StdDuration::from_secs(1)) => {
+                let _ = drain_agent_progress_file(&state, slot_id, &path, &mut offset);
+            }
+        }
+    }
+}
+
+fn drain_agent_progress_file(
+    state: &AppState,
+    slot_id: i64,
+    path: &Path,
+    offset: &mut u64,
+) -> io::Result<()> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    *offset = file.stream_position()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            append_agent_assistant(
+                state,
+                slot_id,
+                &format!("note: {}", truncate_text(line, 1200)),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn start_agent_job(
     state: Arc<AppState>,
     slot_id: i64,
@@ -3251,7 +3519,13 @@ async fn run_agent_job(
         let db = state.db.lock().unwrap();
         agent_attachment_for_prompt(&db, id).unwrap_or(None)
     });
-    let prompt = build_agent_prompt(&slot, &request_body, attachment.as_ref());
+    let progress = prepare_agent_progress(slot_id).ok();
+    let prompt = build_agent_prompt(
+        &slot,
+        &request_body,
+        attachment.as_ref(),
+        progress.is_some(),
+    );
     let session = {
         let db = state.db.lock().unwrap();
         agent_session(&db, slot_id).unwrap_or(None)
@@ -3293,6 +3567,11 @@ async fn run_agent_job(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(progress) = &progress
+        && let Some(path) = progress_path_env(&progress.dir)
+    {
+        command.env("PATH", path);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -3302,6 +3581,9 @@ async fn run_agent_job(
                 &format!("Could not start `{}`: {err}", state.config.agent_codex_bin),
             );
             state.agent_jobs.lock().unwrap().remove(&slot_id);
+            if let Some(progress) = progress {
+                let _ = tokio::fs::remove_dir_all(progress.dir).await;
+            }
             return;
         }
     };
@@ -3324,6 +3606,20 @@ async fn run_agent_job(
         .stderr
         .take()
         .map(|stderr| tokio::spawn(read_agent_stderr(stderr_tail.clone(), stderr)));
+    let (progress_done_tx, progress_task) = if let Some(progress) = &progress {
+        let (done_tx, done_rx) = oneshot::channel();
+        (
+            Some(done_tx),
+            Some(tokio::spawn(watch_agent_progress_file(
+                state.clone(),
+                slot_id,
+                progress.file.clone(),
+                done_rx,
+            ))),
+        )
+    } else {
+        (None, None)
+    };
     let started = Utc::now();
     let stopped;
     let status = tokio::select! {
@@ -3342,6 +3638,15 @@ async fn run_agent_job(
     }
     if let Some(task) = stderr_task {
         let _ = task.await;
+    }
+    if let Some(done_tx) = progress_done_tx {
+        let _ = done_tx.send(());
+    }
+    if let Some(task) = progress_task {
+        let _ = task.await;
+    }
+    if let Some(progress) = progress {
+        let _ = tokio::fs::remove_dir_all(progress.dir).await;
     }
     state.agent_cancels.lock().unwrap().remove(&slot_id);
     state.agent_jobs.lock().unwrap().remove(&slot_id);
@@ -3552,6 +3857,7 @@ fn build_agent_prompt(
     slot: &AgentSlotRow,
     request_body: &str,
     attachment: Option<&AgentPromptAttachment>,
+    progress_notes_enabled: bool,
 ) -> String {
     let goal = slot.goal.trim();
     let goal_text = if goal.is_empty() {
@@ -3559,9 +3865,14 @@ fn build_agent_prompt(
     } else {
         format!("Current slot goal:\n{goal}\n\n")
     };
+    let progress_text = if progress_notes_enabled {
+        "Mobailmux shows command/tool activity automatically.\nUse `aiprogress 'message'` for short human progress notes when exploration starts or finishes, before verification, before risky edits, or after a couple of minutes without a visible update. Do not use it for every command.\n\n"
+    } else {
+        ""
+    };
     let mut prompt = format!(
-        "You are running from Mobailmux agent slot {}.\nCurrent working folder: {}\n{}Keep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
-        slot.name, slot.workdir, goal_text, request_body
+        "You are running from Mobailmux agent slot {}.\nCurrent working folder: {}\n{}{}Keep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
+        slot.name, slot.workdir, goal_text, progress_text, request_body
     );
     if let Some(attachment) = attachment {
         prompt.push_str(&format!(
@@ -4624,10 +4935,12 @@ mod tests {
             goal: "Keep the app deployable.".into(),
         };
 
-        let prompt = build_agent_prompt(&slot, "fix the bug", None);
+        let prompt = build_agent_prompt(&slot, "fix the bug", None, false);
 
         assert!(prompt.contains("Current slot goal:\nKeep the app deployable."));
         assert!(prompt.contains("User request:\nfix the bug"));
+        let prompt_with_progress = build_agent_prompt(&slot, "fix the bug", None, true);
+        assert!(prompt_with_progress.contains("aiprogress 'message'"));
     }
 
     #[test]
@@ -4647,6 +4960,7 @@ mod tests {
 
         assert_eq!(html.matches("message-activity").count(), 1);
         assert_eq!(html.matches("tool-fold").count(), 1);
+        assert!(html.contains(r#"data-fold-key="activity-1""#));
         assert!(html.contains("3 events"));
         assert_eq!(html.matches("tool-row-run").count(), 2);
         assert!(html.contains("message-user"));
@@ -4655,6 +4969,28 @@ mod tests {
             html.find("message-user").unwrap() < html.find("message-activity").unwrap()
                 && html.find("message-activity").unwrap() < html.find("codex done").unwrap()
         );
+    }
+
+    #[test]
+    fn agent_messages_keep_progress_notes_outside_activity_folds() {
+        let messages = vec![
+            test_message("assistant", "codex done in 5s.\n\nDone."),
+            test_message("assistant", "running: `/bin/bash -lc 'cargo test'`"),
+            test_message("assistant", "note: finished investigation"),
+            test_message("assistant", "running: `/bin/bash -lc 'rg bug'`"),
+            test_message("assistant", "codex started in `/work/app`."),
+            test_message("user", "please fix this"),
+        ];
+
+        let html = agent_messages_html(&messages);
+
+        assert_eq!(html.matches("message-activity").count(), 2);
+        assert_eq!(html.matches("tool-fold").count(), 2);
+        assert!(html.contains("note: finished investigation"));
+        let first_activity = html.find("message-activity").unwrap();
+        let note = html.find("note: finished investigation").unwrap();
+        let second_activity = html.rfind("message-activity").unwrap();
+        assert!(first_activity < note && note < second_activity);
     }
 
     #[test]
@@ -4877,5 +5213,55 @@ mod tests {
         assert_eq!(window.used_percent, 35.0);
         assert_eq!(window.window_minutes, 300);
         assert_eq!(window.resets_at, Some(1782210186));
+    }
+
+    #[test]
+    fn reset_agent_slot_chat_updates_workdir_and_clears_local_chat() {
+        let old_dir = env::temp_dir().join(format!("mobailmux-old-{}", Uuid::new_v4().simple()));
+        let new_dir = env::temp_dir().join(format!("mobailmux-new-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db_migrations::migrate(&db).unwrap();
+        let slot_id = ensure_agent_slot(&db, "codex", &old_dir).unwrap();
+        append_agent_message(&db, slot_id, "user", "hello", None).unwrap();
+        set_agent_session(
+            &db,
+            slot_id,
+            "thread-old",
+            old_dir.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        let state = AppState {
+            db: Mutex::new(db),
+            config: Config {
+                bind: "127.0.0.1:0".into(),
+                db_path: PathBuf::new(),
+                agent_default_workdir: old_dir.clone(),
+                agent_upload_dir: PathBuf::new(),
+                agent_codex_bin: "codex".into(),
+                agent_codex_args: Vec::new(),
+                codex_home: PathBuf::new(),
+                codex_reset_command: None,
+                agent_slots: Vec::new(),
+                user: "mobailmux".into(),
+                password_hash: None,
+                cookie_secret: vec![2u8; 32],
+                auth_disabled: true,
+            },
+            agent_jobs: Mutex::new(HashMap::new()),
+            agent_cancels: Mutex::new(HashMap::new()),
+            codex_index: Mutex::new(CodexIndexCache::default()),
+        };
+
+        assert!(!reset_agent_slot_chat(&state, slot_id, &new_dir));
+
+        let db = state.db.lock().unwrap();
+        let slot = get_agent_slot(&db, slot_id).unwrap().unwrap();
+        assert_eq!(slot.workdir, new_dir.to_string_lossy());
+        assert!(agent_session(&db, slot_id).unwrap().is_none());
+        assert!(list_agent_messages(&db, slot_id).unwrap().is_empty());
+        fs::remove_dir_all(old_dir).unwrap();
+        fs::remove_dir_all(new_dir).unwrap();
     }
 }
