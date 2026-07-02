@@ -24,6 +24,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/agents/slots/state", get(crate::agent_slots_state))
         .route("/agents/slots/{id}/new", post(crate::agent_new_chat))
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
+        .route("/agents/terminal/run", post(crate::agent_terminal_run))
         .route("/agents/attachments/{id}", get(crate::agent_attachment))
         .route("/agents/codex/reset", post(crate::codex_reset_post))
         .layer(DefaultBodyLimit::max(

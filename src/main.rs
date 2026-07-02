@@ -61,6 +61,8 @@ const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
 const MAX_AGENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_AGENT_SLOT_CHARS: usize = 32;
 const MAX_AGENT_GOAL_CHARS: usize = 4000;
+const MAX_TERMINAL_COMMAND_CHARS: usize = 4096;
+const MAX_TERMINAL_OUTPUT_CHARS: usize = 64 * 1024;
 const MAX_CODEX_CONVERSATIONS: usize = 120;
 const MAX_CODEX_TRANSCRIPT_MESSAGES: usize = 80;
 const CODEX_SESSION_SCAN_LIMIT: usize = 180;
@@ -547,6 +549,12 @@ struct AgentConversationForm {
 }
 
 #[derive(Deserialize)]
+struct AgentTerminalForm {
+    slot_id: i64,
+    command: String,
+}
+
+#[derive(Deserialize)]
 struct AgentNewChatForm {
     workdir: Option<String>,
     create: Option<String>,
@@ -615,6 +623,14 @@ struct AgentSlotSummary {
 #[derive(Serialize)]
 struct AgentSlotsPoll {
     slots: Vec<AgentSlotSummary>,
+}
+
+#[derive(Serialize)]
+struct AgentTerminalRun {
+    ok: bool,
+    status: String,
+    output: String,
+    cwd: String,
 }
 
 async fn agents_page(
@@ -700,12 +716,12 @@ async fn agents_page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost" data-browser-open>Browse</button><button type="button" class="ghost" data-codex-open>Usage</button><form action="/agents" method="get"><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost">Refresh</button></form><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-browser-open aria-label="Browse conversations" title="Browse conversations">🗂</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get"><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh">↻</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
     <header class="chat-head">
-      <div class="chat-title"><strong>{active_title}</strong><span>{active_slot_workdir}</span></div>
+      <div class="chat-title"><strong>{active_title}</strong><span data-active-cwd>{active_slot_workdir}</span></div>
       <div class="chat-stats"><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></div>
     </header>
     <div class="message-list" data-agent-messages>{messages_html}</div>
@@ -725,6 +741,18 @@ async fn agents_page(
 </main>
 {browser_drawer}
 {usage_dialog}
+<dialog class="terminal-panel" id="terminalPanel">
+  <header><div><strong>Terminal</strong><br><span data-terminal-cwd>{active_slot_workdir}</span></div><button type="button" class="icon" data-terminal-close aria-label="Close">x</button></header>
+  <main>
+    <pre class="terminal-output" data-terminal-output>$ ready
+</pre>
+    <form class="terminal-form" data-terminal-form>
+      <input name="slot_id" type="hidden" value="{}">
+      <input name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Command">
+      <button type="submit">Run</button>
+    </form>
+  </main>
+</dialog>
 <script>
 (() => {{
   const list = document.querySelector("[data-agent-messages]");
@@ -737,6 +765,7 @@ async fn agents_page(
   const sendButton = document.querySelector("[data-send-button]");
   const cancelButton = document.querySelector("[data-cancel-button]");
   const suggestionBox = document.getElementById("commandSuggestions");
+  const activeCwd = document.querySelector("[data-active-cwd]");
   const composerSuggestions = {composer_suggestions_json};
   let selectedSuggestion = 0;
   const viewingTranscript = {viewing_transcript};
@@ -784,6 +813,12 @@ async fn agents_page(
   document.querySelector("[data-codex-open]")?.addEventListener("click", () => openDialog(codexPanel));
   document.querySelector("[data-codex-close]")?.addEventListener("click", () => closeDialog(codexPanel));
   const browserPanel = document.getElementById("conversationDrawer");
+  const terminalPanel = document.getElementById("terminalPanel");
+  const terminalForm = document.querySelector("[data-terminal-form]");
+  const terminalOutput = document.querySelector("[data-terminal-output]");
+  const terminalCwd = document.querySelector("[data-terminal-cwd]");
+  document.querySelector("[data-terminal-open]")?.addEventListener("click", () => openDialog(terminalPanel));
+  document.querySelector("[data-terminal-close]")?.addEventListener("click", () => closeDialog(terminalPanel));
   const closestElement = (target, selector) => target instanceof Element ? target.closest(selector) : null;
   const lockPageScroll = () => {{
     if (document.body.classList.contains("modal-scroll-locked")) return;
@@ -863,6 +898,7 @@ async fn agents_page(
   let dirty = false;
   let agentPollTimer = 0;
   let slotPollTimer = 0;
+  let selectionHoldUntil = 0;
   let lastMessagesHtml = list ? list.innerHTML : "";
   function scheduleAgentPoll(delay) {{
     window.clearTimeout(agentPollTimer);
@@ -882,8 +918,36 @@ async fn agents_page(
     }});
     return keys;
   }}
+  function nodeInsideMessageList(node) {{
+    if (!list || !node) return false;
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    return !!element && list.contains(element);
+  }}
+  function messageSelectionActive() {{
+    const selection = window.getSelection?.();
+    if (!selection || selection.isCollapsed || !selection.toString().trim()) return false;
+    return nodeInsideMessageList(selection.anchorNode) || nodeInsideMessageList(selection.focusNode);
+  }}
+  function holdMessageUpdates(ms = 9000) {{
+    selectionHoldUntil = Math.max(selectionHoldUntil, Date.now() + ms);
+  }}
+  function canReplaceMessages() {{
+    if (messageSelectionActive()) {{
+      holdMessageUpdates();
+      return false;
+    }}
+    return Date.now() >= selectionHoldUntil;
+  }}
+  document.addEventListener("selectionchange", () => {{
+    if (messageSelectionActive()) holdMessageUpdates();
+  }});
+  list?.addEventListener("contextmenu", () => holdMessageUpdates(12000));
+  list?.addEventListener("touchstart", () => {{
+    if (messageSelectionActive()) holdMessageUpdates(5000);
+  }}, {{passive:true}});
   function replaceMessages(html) {{
-    if (!list || html === lastMessagesHtml) return;
+    if (!list || html === lastMessagesHtml) return true;
+    if (!canReplaceMessages()) return false;
     const openFolds = captureOpenFolds();
     const nearBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 90;
     list.innerHTML = html;
@@ -893,7 +957,37 @@ async fn agents_page(
       if (key && openFolds.has(key)) details.open = true;
     }});
     if (nearBottom) list.scrollTop = list.scrollHeight;
+    return true;
   }}
+  terminalForm?.addEventListener("submit", async (event) => {{
+    event.preventDefault();
+    const commandInput = terminalForm.elements.command;
+    const command = commandInput?.value.trim() || "";
+    if (!command) return;
+    if (commandInput) commandInput.value = "";
+    terminalOutput.textContent += `\n$ ${{command}}\n`;
+    terminalOutput.scrollTop = terminalOutput.scrollHeight;
+    const body = new URLSearchParams(new FormData(terminalForm));
+    body.set("command", command);
+    try {{
+      const response = await fetch("/agents/terminal/run", {{
+        method: "POST",
+        body,
+        headers: {{"Accept":"application/json"}}
+      }});
+      const data = response.ok ? await response.json() : {{ok:false,status:`http ${{response.status}}`,output:""}};
+      if (terminalCwd && data.cwd) terminalCwd.textContent = data.cwd;
+      if (activeCwd && data.cwd) activeCwd.textContent = data.cwd;
+      const output = data.output || "";
+      terminalOutput.textContent += output;
+      if (output && !output.endsWith("\n")) terminalOutput.textContent += "\n";
+      terminalOutput.textContent += `[${{data.status || (data.ok ? "ok" : "failed")}}]\n`;
+    }} catch (_) {{
+      terminalOutput.textContent += "[request failed]\n";
+    }}
+    terminalOutput.scrollTop = terminalOutput.scrollHeight;
+    commandInput?.focus();
+  }});
   function activeCompletionToken() {{
     if (!input) return null;
     const value = input.value;
@@ -1038,11 +1132,11 @@ async fn agents_page(
       const response = await fetch("/agents/slots/{}/state", {{cache:"no-store"}});
       if (response.ok) {{
         const data = await response.json();
-        replaceMessages(data.messages_html);
+        const replaced = replaceMessages(data.messages_html);
         status.textContent = data.active_status || (data.running ? (data.current || "running") : "idle");
         count.textContent = data.message_count + " messages";
         if (cancelButton) cancelButton.disabled = !data.running;
-        scheduleAgentPoll(data.running ? 1200 : 4000);
+        scheduleAgentPoll(!replaced ? 1200 : data.running ? 1200 : 4000);
         return;
       }}
     }} catch (_) {{}}
@@ -1105,6 +1199,7 @@ async fn agents_page(
 "##,
             active_slot.id,
             html_escape(&runtime.label),
+            active_slot.id,
             active_slot.id,
             active_slot.id,
             active_slot.id
@@ -1551,6 +1646,155 @@ async fn agent_slots_state(State(state): State<Arc<AppState>>, headers: HeaderMa
         .map(|slot| agent_slot_summary(&state, slot))
         .collect();
     Json(AgentSlotsPoll { slots: summaries }).into_response()
+}
+
+async fn agent_terminal_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AgentTerminalForm>,
+) -> Response {
+    if let Some(response) = raw_guard(&state, &headers) {
+        return response;
+    }
+    let command = form.command.trim();
+    let slot = {
+        let db = state.db.lock().unwrap();
+        get_agent_slot(&db, form.slot_id).unwrap_or(None)
+    };
+    let Some(slot) = slot else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(AgentTerminalRun {
+                ok: false,
+                status: "missing slot".into(),
+                output: String::new(),
+                cwd: String::new(),
+            }),
+        )
+            .into_response();
+    };
+    if command.is_empty() {
+        return Json(AgentTerminalRun {
+            ok: false,
+            status: "empty".into(),
+            output: String::new(),
+            cwd: slot.workdir,
+        })
+        .into_response();
+    }
+    if command.chars().count() > MAX_TERMINAL_COMMAND_CHARS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(AgentTerminalRun {
+                ok: false,
+                status: "too long".into(),
+                output: String::new(),
+                cwd: slot.workdir,
+            }),
+        )
+            .into_response();
+    }
+    let workdir = PathBuf::from(&slot.workdir);
+    if !workdir.is_dir() {
+        return (
+            StatusCode::CONFLICT,
+            Json(AgentTerminalRun {
+                ok: false,
+                status: "bad cwd".into(),
+                output: format!("Folder does not exist: {}", workdir.display()),
+                cwd: slot.workdir,
+            }),
+        )
+            .into_response();
+    }
+
+    let marker = format!("__MOBAILMUX_{}__", Uuid::new_v4().simple());
+    let script = format!(
+        "set +e\n{command}\n__mobailmux_status=$?\nprintf '\\n{marker}STATUS:%s\\n{marker}PWD:%s\\n' \"$__mobailmux_status\" \"$PWD\"\nexit \"$__mobailmux_status\""
+    );
+    let mut child = TokioCommand::new("/bin/bash");
+    child
+        .arg("-lc")
+        .arg(script)
+        .current_dir(&workdir)
+        .env("HOME", default_home_dir())
+        .env(
+            "PATH",
+            env::var("PATH").unwrap_or_else(|_| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            }),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let Ok(child) = child.spawn() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AgentTerminalRun {
+                ok: false,
+                status: "spawn failed".into(),
+                output: "Could not start /bin/bash.".into(),
+                cwd: slot.workdir,
+            }),
+        )
+            .into_response();
+    };
+    let output =
+        match tokio::time::timeout(StdDuration::from_secs(30), child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(AgentTerminalRun {
+                        ok: false,
+                        status: "wait failed".into(),
+                        output: err.to_string(),
+                        cwd: slot.workdir,
+                    }),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return Json(AgentTerminalRun {
+                    ok: false,
+                    status: "timeout".into(),
+                    output: "Command timed out after 30s.".into(),
+                    cwd: slot.workdir,
+                })
+                .into_response();
+            }
+        };
+
+    let (stdout, exit_code, final_cwd) = terminal_visible_stdout(
+        &String::from_utf8_lossy(&output.stdout),
+        &marker,
+        &slot.workdir,
+    );
+    if final_cwd != slot.workdir && Path::new(&final_cwd).is_dir() {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
+            params![&final_cwd, slot.id],
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut combined = stdout;
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let status_code = exit_code.or_else(|| output.status.code()).unwrap_or(-1);
+    let ok = output.status.success() || status_code == 0;
+    Json(AgentTerminalRun {
+        ok,
+        status: format!("exit {status_code}"),
+        output: truncate_text(&combined, MAX_TERMINAL_OUTPUT_CHARS),
+        cwd: final_cwd,
+    })
+    .into_response()
 }
 
 async fn agent_attachment(
@@ -4478,6 +4722,31 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(20);
     value.chars().take(keep).collect::<String>() + "\n...[truncated]"
+}
+
+fn terminal_visible_stdout(
+    stdout: &str,
+    marker: &str,
+    fallback_cwd: &str,
+) -> (String, Option<i32>, String) {
+    let status_prefix = format!("{marker}STATUS:");
+    let pwd_prefix = format!("{marker}PWD:");
+    let mut visible = String::new();
+    let mut exit_code = None;
+    let mut cwd = fallback_cwd.to_string();
+    for chunk in stdout.split_inclusive('\n') {
+        let line = chunk.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+        if let Some(rest) = line.strip_prefix(&status_prefix) {
+            exit_code = rest.trim().parse::<i32>().ok();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(&pwd_prefix) {
+            cwd = rest.trim().to_string();
+            continue;
+        }
+        visible.push_str(chunk);
+    }
+    (visible, exit_code, cwd)
 }
 
 fn page(title: &str, body: &str) -> Response {

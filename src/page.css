@@ -18,6 +18,8 @@ nav a{color:var(--accent2);font-weight:700}
 .nav-actions{display:flex;align-items:center;gap:8px;min-width:0}
 .nav-actions form{margin:0}
 .nav-actions button{min-height:36px;padding:0 11px}
+.nav-actions strong{white-space:nowrap}
+.nav-icon{width:36px;min-width:36px;padding:0!important;display:inline-grid;place-items:center;font-size:18px;line-height:1}
 h1{font-size:28px;line-height:1.1;margin:0}
 main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .chat-shell{width:min(1180px,calc(100% - 32px));height:calc(100dvh - 64px);padding:12px 0;display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;min-width:0}
@@ -118,6 +120,17 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .meter{height:9px;border:1px solid var(--line);border-radius:999px;overflow:hidden}
 .meter span{display:block;height:100%;background:var(--accent)}
 .reset-form{display:grid;gap:8px}
+.terminal-panel{position:fixed;inset:auto 0 0;width:100%;max-width:none;height:min(56dvh,520px);max-height:calc(100dvh - 14px);margin:0;border:0;border-top:1px solid var(--line);border-radius:8px 8px 0 0;background:var(--panel);color:var(--fg);padding:0;overflow:hidden}
+.terminal-panel::backdrop{background:rgba(0,0,0,.32)}
+.terminal-panel header{height:52px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 12px;border-bottom:1px solid var(--line)}
+.terminal-panel header div{min-width:0}
+.terminal-panel header strong{font-size:15px}
+.terminal-panel header span{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px;font-weight:700}
+.terminal-panel main{width:auto;height:calc(100% - 52px);padding:0;display:grid;grid-template-rows:minmax(0,1fr) auto}
+.terminal-output{margin:0;padding:10px 12px;overflow:auto;background:#050706;color:#d8ffe3;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+.terminal-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:8px;border-top:1px solid var(--line)}
+.terminal-form input{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.terminal-form button{min-width:64px}
 .agent-compose-wrap{position:relative;border-top:1px solid var(--line);background:var(--panel)}
 .agent-composer{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;padding:10px 12px 12px;min-width:0}
 .agent-composer textarea{min-height:52px;max-height:30dvh;resize:vertical}
@@ -139,8 +152,10 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 @media(max-width:760px){
   body{font-size:14px}
   nav{height:52px;padding:0 10px}
-  .nav-actions{gap:6px}
+  .nav-actions{gap:5px}
   .nav-actions button{min-height:34px;padding:0 9px}
+  .nav-actions strong{font-size:13px}
+  .nav-icon{width:34px;min-width:34px;font-size:17px}
   h1{font-size:22px}
   main{width:calc(100% - 20px)}
   .chat-shell{width:100%;height:calc(100dvh - 52px);padding:0;gap:0;grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
@@ -167,6 +182,7 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
   .browser-new-path{grid-template-columns:minmax(0,1fr) auto}
   .browser-new-path input[name="workdir"]{grid-column:1/-1}
   .usage-grid{grid-template-columns:1fr}
+  .terminal-panel{height:min(58dvh,520px)}
   .agent-composer{grid-template-columns:minmax(0,1fr) 74px 74px;padding:7px 8px max(8px,env(safe-area-inset-bottom));gap:7px}
   .agent-composer textarea{grid-column:1/-1;min-height:50px;max-height:22dvh;padding:8px 10px;font-size:16px}
   .command-suggestions{left:8px;right:8px;bottom:calc(100% + 5px);max-height:min(300px,46dvh);padding:6px}
