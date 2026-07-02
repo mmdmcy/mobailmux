@@ -1207,21 +1207,52 @@ async fn agent_new_chat(
     }
     let workdir = workdir.canonicalize().unwrap_or(workdir);
     let workdir_text = workdir.to_string_lossy().to_string();
-    let stopped = reset_agent_slot_chat(&state, slot.id, &workdir);
-    let stop_text = if stopped {
-        " Stopped the current job."
+    let (target_slot, stop_text) = if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+        let created = {
+            let db = state.db.lock().unwrap();
+            create_parallel_agent_slot(&db, &slot, &workdir).ok()
+        };
+        let Some(created) = created else {
+            append_agent_assistant(
+                &state,
+                slot.id,
+                "Could not create a parallel Codex lane. Try again or stop this lane first.",
+            );
+            return Redirect::to(&agent_location(Some(slot.id))).into_response();
+        };
+        append_agent_assistant(
+            &state,
+            slot.id,
+            &format!(
+                "{} is still running. Started `{}` separately in `{workdir_text}`.",
+                slot.name, created.name
+            ),
+        );
+        (created, "")
     } else {
-        ""
+        let stopped = reset_agent_slot_chat(&state, slot.id, &workdir);
+        let stop_text = if stopped {
+            " Stopped the current job."
+        } else {
+            ""
+        };
+        (
+            AgentSlotRow {
+                workdir: workdir_text.clone(),
+                ..slot
+            },
+            stop_text,
+        )
     };
     append_agent_assistant(
         &state,
-        slot.id,
+        target_slot.id,
         &format!(
             "{} new chat ready in `{workdir_text}`.{stop_text} Your next message starts a new agent chat.",
-            slot.name
+            target_slot.name
         ),
     );
-    Redirect::to(&agent_location(Some(slot.id))).into_response()
+    Redirect::to(&agent_location(Some(target_slot.id))).into_response()
 }
 
 async fn codex_reset_post(
@@ -1374,8 +1405,35 @@ async fn agent_message_create(
     if body.len() > MAX_AGENT_MESSAGE_CHARS {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
+    let is_control_request = looks_like_agent_control_request(&body);
+    let has_upload = upload.is_some();
+    let target_slot = if edit_message_id.is_none()
+        && !is_control_request
+        && (!body.is_empty() || has_upload)
+        && state.agent_jobs.lock().unwrap().contains_key(&slot.id)
+    {
+        let created = {
+            let db = state.db.lock().unwrap();
+            create_parallel_agent_slot(&db, &slot, Path::new(&slot.workdir)).ok()
+        };
+        if let Some(created) = created {
+            append_agent_assistant(
+                &state,
+                slot.id,
+                &format!(
+                    "{} is already running. Started this request in `{}` instead.",
+                    slot.name, created.name
+                ),
+            );
+            created
+        } else {
+            slot.clone()
+        }
+    } else {
+        slot.clone()
+    };
     let attachment_id = if let Some(upload) = upload {
-        save_agent_upload(&state, &slot, upload).await.ok()
+        save_agent_upload(&state, &target_slot, upload).await.ok()
     } else {
         None
     };
@@ -1417,32 +1475,37 @@ async fn agent_message_create(
     }
     {
         let db = state.db.lock().unwrap();
-        let _ = append_agent_message(&db, slot.id, "user", &body, attachment_id);
+        let _ = append_agent_message(&db, target_slot.id, "user", &body, attachment_id);
     }
-    if handle_agent_control(&state, &slot, &body) {
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    if handle_agent_control(&state, &target_slot, &body) {
+        return Redirect::to(&agent_location(Some(target_slot.id))).into_response();
     }
-    if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+    if state
+        .agent_jobs
+        .lock()
+        .unwrap()
+        .contains_key(&target_slot.id)
+    {
         let db = state.db.lock().unwrap();
         let _ = append_agent_message(
             &db,
-            slot.id,
+            target_slot.id,
             "assistant",
             &format!(
                 "{} is already running. Use Cancel, another slot, or `/stop` first.",
-                slot.name
+                target_slot.name
             ),
             None,
         );
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+        return Redirect::to(&agent_location(Some(target_slot.id))).into_response();
     }
     let request_body = if body.is_empty() {
         "Please inspect the attached file.".to_string()
     } else {
         body
     };
-    start_agent_job(state.clone(), slot.id, request_body, attachment_id);
-    Redirect::to(&agent_location(Some(slot.id))).into_response()
+    start_agent_job(state.clone(), target_slot.id, request_body, attachment_id);
+    Redirect::to(&agent_location(Some(target_slot.id))).into_response()
 }
 
 async fn agent_slot_state(
@@ -2270,6 +2333,16 @@ fn get_agent_slot(db: &Connection, id: i64) -> rusqlite::Result<Option<AgentSlot
     .optional()
 }
 
+fn agent_slot_name_exists(db: &Connection, name: &str) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT 1 FROM agent_slots WHERE name = ?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+}
+
 fn ensure_agent_slot(db: &Connection, name: &str, workdir: &Path) -> rusqlite::Result<i64> {
     let existing = db
         .query_row(
@@ -2286,6 +2359,53 @@ fn ensure_agent_slot(db: &Connection, name: &str, workdir: &Path) -> rusqlite::R
         params![name, workdir.to_string_lossy(), Utc::now().to_rfc3339()],
     )?;
     Ok(db.last_insert_rowid())
+}
+
+fn create_parallel_agent_slot(
+    db: &Connection,
+    source: &AgentSlotRow,
+    workdir: &Path,
+) -> rusqlite::Result<AgentSlotRow> {
+    let base = parallel_agent_slot_base(&source.name);
+    let name = next_parallel_agent_slot_name(db, &base)?;
+    let workdir = workdir.to_string_lossy().to_string();
+    db.execute(
+        "INSERT INTO agent_slots (name, workdir, goal, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![name, workdir, source.goal, Utc::now().to_rfc3339()],
+    )?;
+    Ok(AgentSlotRow {
+        id: db.last_insert_rowid(),
+        name,
+        workdir,
+        goal: source.goal.clone(),
+    })
+}
+
+fn parallel_agent_slot_base(name: &str) -> String {
+    let normalized = normalize_agent_slot_name(name);
+    let base = normalized
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|(base, _)| base)
+        .unwrap_or(&normalized);
+    if base.is_empty() {
+        "codex".into()
+    } else {
+        base.to_string()
+    }
+}
+
+fn next_parallel_agent_slot_name(db: &Connection, base: &str) -> rusqlite::Result<String> {
+    for number in 2..10_000 {
+        let suffix = format!("-{number}");
+        let stem_len = MAX_AGENT_SLOT_CHARS.saturating_sub(suffix.len()).max(1);
+        let stem = base.chars().take(stem_len).collect::<String>();
+        let candidate = format!("{stem}{suffix}");
+        if !agent_slot_name_exists(db, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(rusqlite::Error::InvalidQuery)
 }
 
 fn ensure_agent_slot_seeds(
@@ -2648,6 +2768,10 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         &format!("Unknown command: `{prefix}{raw_text}`. Type `/help` for commands."),
     );
     true
+}
+
+fn looks_like_agent_control_request(body: &str) -> bool {
+    agent_control_text(body).is_some()
 }
 
 fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
@@ -4991,6 +5115,29 @@ mod tests {
         let note = html.find("note: finished investigation").unwrap();
         let second_activity = html.rfind("message-activity").unwrap();
         assert!(first_activity < note && note < second_activity);
+    }
+
+    #[test]
+    fn parallel_agent_slot_names_increment_from_base_lane() {
+        let db = Connection::open_in_memory().unwrap();
+        db_migrations::migrate(&db).unwrap();
+        let slot_id = ensure_agent_slot(&db, "codex", Path::new("/work/one")).unwrap();
+        let slot = get_agent_slot(&db, slot_id).unwrap().unwrap();
+
+        let second = create_parallel_agent_slot(&db, &slot, Path::new("/work/two")).unwrap();
+        let third = create_parallel_agent_slot(&db, &second, Path::new("/work/three")).unwrap();
+
+        assert_eq!(second.name, "codex-2");
+        assert_eq!(third.name, "codex-3");
+        assert_eq!(third.workdir, "/work/three");
+    }
+
+    #[test]
+    fn prefixed_messages_are_control_requests() {
+        assert!(looks_like_agent_control_request("/status"));
+        assert!(looks_like_agent_control_request("!stop"));
+        assert!(looks_like_agent_control_request("/unknown"));
+        assert!(!looks_like_agent_control_request("fix the app"));
     }
 
     #[test]
