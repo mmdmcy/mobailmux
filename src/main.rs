@@ -717,7 +717,7 @@ async fn agents_page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-browser-open aria-label="Browse conversations" title="Browse conversations">🗂</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get"><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh">↻</button></form><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-browser-open aria-label="Browse conversations" title="Browse conversations">🗂</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
@@ -845,6 +845,16 @@ async fn agents_page(
     lockPageScroll();
     syncDialogLock();
   }};
+  document.querySelectorAll("[data-refresh-form]").forEach((form) => {{
+    form.addEventListener("submit", () => {{
+      const button = form.querySelector("[data-refresh-button]");
+      if (!button) return;
+      button.classList.add("is-busy");
+      button.setAttribute("aria-busy", "true");
+      button.setAttribute("aria-label", "Refreshing");
+      button.setAttribute("title", "Refreshing");
+    }});
+  }});
   document.querySelector("[data-browser-open]")?.addEventListener("click", () => {{
     openLockedDialog(browserPanel);
   }});
@@ -854,6 +864,52 @@ async fn agents_page(
   }});
   if ({reopen_browser}) openLockedDialog(browserPanel);
   document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
+  const browserSearchPanel = document.querySelector("[data-browser-search-panel]");
+  const browserSearchToggle = document.querySelector("[data-browser-search-toggle]");
+  const browserNewPanel = document.querySelector("[data-browser-new-panel]");
+  const browserNewToggle = document.querySelector("[data-browser-new-toggle]");
+  const browserSearch = document.querySelector("[data-browser-search]");
+  const browserEmptySearch = document.querySelector("[data-browser-empty-search]");
+  const setBrowserToolOpen = (panel, button, open) => {{
+    if (!panel || !button) return;
+    panel.hidden = !open;
+    button.classList.toggle("is-active", open);
+    button.setAttribute("aria-expanded", open ? "true" : "false");
+  }};
+  const filterBrowserProjects = () => {{
+    const query = (browserSearch?.value || "").trim().toLowerCase();
+    let visibleProjects = 0;
+    const projects = document.querySelectorAll("[data-project-group]");
+    projects.forEach((project) => {{
+      const haystack = (project.getAttribute("data-project-search") || project.textContent || "").toLowerCase();
+      const visible = !query || haystack.includes(query);
+      project.hidden = !visible;
+      if (visible) visibleProjects += 1;
+    }});
+    if (browserEmptySearch) browserEmptySearch.hidden = !query || visibleProjects > 0 || projects.length === 0;
+  }};
+  browserSearch?.addEventListener("input", filterBrowserProjects);
+  browserSearchToggle?.addEventListener("click", () => {{
+    const opening = browserSearchPanel?.hidden !== false;
+    setBrowserToolOpen(browserSearchPanel, browserSearchToggle, opening);
+    setBrowserToolOpen(browserNewPanel, browserNewToggle, false);
+    if (opening) {{
+      window.setTimeout(() => browserSearch?.focus(), 0);
+    }} else if (browserSearch?.value) {{
+      browserSearch.value = "";
+      filterBrowserProjects();
+    }}
+  }});
+  browserNewToggle?.addEventListener("click", () => {{
+    const opening = browserNewPanel?.hidden !== false;
+    setBrowserToolOpen(browserNewPanel, browserNewToggle, opening);
+    setBrowserToolOpen(browserSearchPanel, browserSearchToggle, false);
+    if (browserSearch?.value) {{
+      browserSearch.value = "";
+      filterBrowserProjects();
+    }}
+  }});
+  filterBrowserProjects();
   let browserTouchY = 0;
   document.addEventListener("touchstart", (event) => {{
     if (!browserPanel?.open || event.touches.length !== 1) return;
@@ -2383,8 +2439,9 @@ fn codex_browser_drawer_html(
         };
         let project_path = html_escape(&project.path);
         let project_name = html_escape(&project.name);
+        let project_search = html_attr_escape(&format!("{} {}", project.name, project.path));
         groups.push(format!(
-            r#"<section class="browser-project" data-project-group>
+            r#"<section class="browser-project" data-project-group data-project-search="{project_search}">
   <div class="browser-project-head" title="{project_path}">
     <div><strong>{project_name}</strong><span>{} chats · {trust}</span></div>
     <form action="/agents/slots/{slot_id}/new" method="post">
@@ -2410,28 +2467,41 @@ fn codex_browser_drawer_html(
   <header>
     <div><strong>Conversations</strong><br><span>Projects with saved Codex sessions</span></div>
     <div class="browser-head-actions">
-      <form action="/agents" method="get">
+      <form action="/agents" method="get" data-refresh-form>
         <input type="hidden" name="slot" value="{slot_id}">
         <input type="hidden" name="refresh" value="1">
         <input type="hidden" name="browse" value="1">
-        <button type="submit" class="ghost">Refresh</button>
+        <button type="submit" class="ghost nav-icon browser-refresh" aria-label="Refresh projects" title="Refresh projects" data-refresh-button>↻</button>
       </form>
       <button type="button" class="icon" data-browser-close aria-label="Close">x</button>
     </div>
   </header>
   <main class="browser-scroll">
-    <section class="browser-new">
-      <form class="browser-new-current" action="/agents/slots/{slot_id}/new" method="post">
-        <input type="hidden" name="workdir" value="{active_workdir}">
-        <button type="submit">New current</button>
-      </form>
-      <form class="browser-new-path" action="/agents/slots/{slot_id}/new" method="post">
-        <input name="workdir" placeholder="Folder path" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <label class="browser-check"><input type="checkbox" name="create" value="1"><span>Create folder</span></label>
-        <button type="submit">Start</button>
-      </form>
+    <section class="browser-tools">
+      <div class="browser-tool-row">
+        <button type="button" class="browser-tool-button" aria-label="Search repositories" title="Search repositories" aria-expanded="false" aria-controls="browserSearchPanel" data-browser-search-toggle>🔍</button>
+        <button type="button" class="browser-tool-button" aria-label="Add new" title="Add new" aria-expanded="false" aria-controls="browserNewPanel" data-browser-new-toggle>➕</button>
+      </div>
+      <div class="browser-tool-panel browser-search" id="browserSearchPanel" data-browser-search-panel hidden>
+        <label class="browser-search-body">
+          <span>Search repositories</span>
+          <input type="search" placeholder="Repository or folder" autocomplete="off" autocapitalize="off" spellcheck="false" data-browser-search>
+        </label>
+      </div>
+      <div class="browser-tool-panel browser-new" id="browserNewPanel" data-browser-new-panel hidden>
+        <form class="browser-new-current" action="/agents/slots/{slot_id}/new" method="post">
+          <input type="hidden" name="workdir" value="{active_workdir}">
+          <button type="submit">New current</button>
+        </form>
+        <form class="browser-new-path" action="/agents/slots/{slot_id}/new" method="post">
+          <input name="workdir" placeholder="Folder path" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <label class="browser-check"><input type="checkbox" name="create" value="1"><span>Create folder</span></label>
+          <button type="submit">Start</button>
+        </form>
+      </div>
     </section>
     {body}
+    <p class="empty browser-empty-search" data-browser-empty-search hidden>No matching repositories or folders.</p>
   </main>
 </dialog>"#
     )
