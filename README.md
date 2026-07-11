@@ -11,8 +11,12 @@ and stop Codex work.
 - Rust web service for Agents at `/` and `/agents`.
 - SQLite storage for agent messages and saved Codex thread identifiers.
 - Codex usage and manually confirmed reset controls.
+- Embedded web terminal, isolated as its own capability.
 - Existing `commands/bin/mbx` tmux helper remains available for terminal slots.
 - Private-by-default: run behind localhost, LAN, VPN, or tailnet access.
+
+Architecture and feature boundaries are documented in
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Run The Rust Web UI
 
@@ -98,6 +102,7 @@ ignored `private/playwright-webkit/`.
 cargo fmt --check
 cargo test
 cargo run -- audit-public
+cargo katrust check
 ```
 
 Keep real `.env` files, databases, logs, local service units, and

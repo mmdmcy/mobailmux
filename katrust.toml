@@ -1,0 +1,5 @@
+schema = 1
+kind = "binary"
+main_target_lines = 100
+module_warn_lines = 600
+module_max_lines = 800

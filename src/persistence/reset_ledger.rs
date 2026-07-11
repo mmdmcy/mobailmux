@@ -156,7 +156,9 @@ fn expire_old_credits(db: &Connection, now: DateTime<Utc>) -> rusqlite::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SCHEMA, reconcile};
+    use chrono::{DateTime, Duration, Utc};
+    use rusqlite::Connection;
 
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
