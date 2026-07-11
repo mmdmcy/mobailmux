@@ -41,6 +41,7 @@ MOBAILMUX_AGENT_UPLOAD_DIR=data/agent-uploads
 MOBAILMUX_AGENT_SLOTS=codex
 MOBAILMUX_AGENT_CODEX_BIN=codex
 MOBAILMUX_AGENT_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
+MOBAILMUX_AGENT_PROGRESS_NOTES=0
 MOBAILMUX_PASSWORD_HASH=<argon2 hash>
 MOBAILMUX_COOKIE_SECRET=<random hex>
 ```
@@ -58,6 +59,41 @@ It manages tmux-backed Codex sessions. Run:
 ```sh
 commands/bin/mbx help
 ```
+
+## Manual Live Deploy
+
+There is no background auto-deploy watcher. Deploy only when a human or agent
+explicitly runs:
+
+```sh
+scripts/deploy-live.sh
+```
+
+The command refuses to run if `mobailmux-autodeploy.service` is active. It runs
+the host's one-shot deploy helper, which checks, builds, installs the live
+binary, restarts `mobailmux.service`, and verifies that it came back active.
+
+## iPhone WebKit Smoke Test
+
+Set up the private Playwright/WebKit toolchain once:
+
+```sh
+scripts/ensure-playwright-webkit.sh
+```
+
+Then test a Mobailmux page with the iPhone 13 WebKit profile:
+
+```sh
+PLAYWRIGHT_BROWSERS_PATH=private/playwright-webkit/browsers \
+  private/playwright-webkit/venv/bin/python \
+  scripts/smoke-iphone-webkit.py \
+  --url http://127.0.0.1:8765/agents \
+  --expect-selector '[data-agent-messages]' \
+  --expect-selector '.agent-composer'
+```
+
+The Playwright virtualenv, browser binaries, screenshots, and logs live under
+ignored `private/playwright-webkit/`.
 
 ## Checks
 

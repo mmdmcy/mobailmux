@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    io::{self, BufRead, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, Read, Seek, SeekFrom},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -71,7 +71,6 @@ const CODEX_PROJECT_DRAWER_LIMIT: usize = 48;
 const CODEX_PROJECT_VISIBLE_CONVERSATIONS: usize = 3;
 const CODEX_PROJECT_CONVERSATION_LIMIT: usize = 24;
 const CODEX_INDEX_REFRESH_AFTER: StdDuration = StdDuration::from_secs(30);
-const CODEX_APP_SERVER_TIMEOUT: StdDuration = StdDuration::from_secs(12);
 const CODEX_APP_SERVER_WRITE_SETTLE: StdDuration = StdDuration::from_secs(5);
 const SESSION_COOKIE: &str = "mobailmux_session";
 const SESSION_DAYS: i64 = 30;
@@ -104,7 +103,7 @@ const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
     AgentCommandSpec {
         name: "model",
         usage: "/model",
-        description: "Show the Codex command settings",
+        description: "Open the model picker",
         takes_arg: false,
     },
     AgentCommandSpec {
@@ -135,6 +134,18 @@ const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
         name: "stop",
         usage: "/stop",
         description: "Stop the running Codex job",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "queue",
+        usage: "/queue",
+        description: "Show queued follow-ups for this slot",
+        takes_arg: false,
+    },
+    AgentCommandSpec {
+        name: "clear-queue",
+        usage: "/clear-queue",
+        description: "Clear queued follow-ups for this slot",
         takes_arg: false,
     },
     AgentCommandSpec {
@@ -193,10 +204,14 @@ async fn serve() -> io::Result<()> {
         config,
         agent_jobs: Mutex::new(HashMap::new()),
         agent_cancels: Mutex::new(HashMap::new()),
+        agent_queues: Mutex::new(HashMap::new()),
         codex_index: Mutex::new(CodexIndexCache::default()),
+        codex_models: Mutex::new(CodexModelCatalogCache::default()),
     });
 
+    mark_interrupted_agent_runs(&state);
     refresh_codex_index(state.clone());
+    refresh_codex_model_catalog(state.clone());
 
     let app = modules::build_router(state.clone());
 
@@ -218,6 +233,7 @@ struct Config {
     agent_upload_dir: PathBuf,
     agent_codex_bin: String,
     agent_codex_args: Vec<String>,
+    agent_progress_notes: bool,
     codex_home: PathBuf,
     codex_reset_command: Option<Vec<String>>,
     agent_slots: Vec<AgentSlotSeed>,
@@ -240,6 +256,25 @@ struct AgentRun {
     started_at: String,
 }
 
+#[derive(Default)]
+struct AgentStdoutSummary {
+    last_assistant_text: Option<String>,
+    final_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AgentRunSettings {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedAgentRequest {
+    body: String,
+    attachment_id: Option<i64>,
+    settings: AgentRunSettings,
+}
+
 #[derive(Clone, Debug)]
 struct SlotRuntime {
     label: String,
@@ -257,12 +292,39 @@ struct CodexConversation {
 }
 
 #[derive(Clone, Debug)]
+struct CodexVisibleMessage {
+    role: String,
+    text: String,
+    timestamp: String,
+    order: usize,
+    fallback: bool,
+    final_answer: bool,
+    assistant_progress: bool,
+}
+
+#[derive(Clone, Debug)]
 struct CodexProject {
     path: String,
     name: String,
     trusted: bool,
     conversation_count: usize,
     latest_activity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CodexReasoningEffort {
+    effort: String,
+    description: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CodexModel {
+    model: String,
+    display_name: String,
+    description: String,
+    default_reasoning_effort: String,
+    supported_reasoning_efforts: Vec<CodexReasoningEffort>,
+    is_default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -312,8 +374,20 @@ struct CodexResetCreditsSummary {
 }
 
 #[derive(Default)]
+struct CodexAppServerDashboard {
+    rate_limits: Option<serde_json::Value>,
+}
+
+#[derive(Default)]
 struct CodexIndexCache {
     snapshot: Option<CodexIndex>,
+    refreshed_at: Option<Instant>,
+    refreshing: bool,
+}
+
+#[derive(Default)]
+struct CodexModelCatalogCache {
+    models: Vec<CodexModel>,
     refreshed_at: Option<Instant>,
     refreshing: bool,
 }
@@ -343,6 +417,7 @@ impl Config {
             .ok()
             .map(|value| split_env_args(&value))
             .unwrap_or_default();
+        let agent_progress_notes = env_flag("MOBAILMUX_AGENT_PROGRESS_NOTES", false);
         let codex_home = env::var("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_home_dir().join(".codex"));
@@ -378,6 +453,7 @@ impl Config {
             agent_upload_dir,
             agent_codex_bin,
             agent_codex_args,
+            agent_progress_notes,
             codex_home,
             codex_reset_command,
             agent_slots,
@@ -394,7 +470,9 @@ struct AppState {
     config: Config,
     agent_jobs: Mutex<HashMap<i64, AgentRun>>,
     agent_cancels: Mutex<HashMap<i64, oneshot::Sender<()>>>,
+    agent_queues: Mutex<HashMap<i64, VecDeque<QueuedAgentRequest>>>,
     codex_index: Mutex<CodexIndexCache>,
+    codex_models: Mutex<CodexModelCatalogCache>,
 }
 
 fn codex_index_snapshot(state: &Arc<AppState>) -> Option<CodexIndex> {
@@ -425,6 +503,38 @@ fn refresh_codex_index(state: Arc<AppState>) {
         let mut cache = state.codex_index.lock().unwrap();
         cache.snapshot = Some(index);
         cache.refreshed_at = Some(Instant::now());
+        cache.refreshing = false;
+    });
+}
+
+fn codex_model_catalog_snapshot(state: &Arc<AppState>) -> Vec<CodexModel> {
+    let (models, should_refresh) = {
+        let cache = state.codex_models.lock().unwrap();
+        let stale = cache
+            .refreshed_at
+            .is_none_or(|refreshed_at| refreshed_at.elapsed() >= CODEX_INDEX_REFRESH_AFTER);
+        let should_refresh = stale && !cache.refreshing;
+        (cache.models.clone(), should_refresh)
+    };
+    if should_refresh {
+        refresh_codex_model_catalog(state.clone());
+    }
+    models
+}
+
+fn refresh_codex_model_catalog(state: Arc<AppState>) {
+    {
+        let mut cache = state.codex_models.lock().unwrap();
+        if cache.refreshing {
+            return;
+        }
+        cache.refreshing = true;
+    }
+    tokio::task::spawn_blocking(move || {
+        let models = fetch_codex_model_catalog(&state.config);
+        let mut cache = state.codex_models.lock().unwrap();
+        cache.models = models;
+        cache.refreshed_at = (!cache.models.is_empty()).then(Instant::now);
         cache.refreshing = false;
     });
 }
@@ -627,6 +737,11 @@ struct AgentSlotsPoll {
 }
 
 #[derive(Serialize)]
+struct AgentModelCatalogPoll {
+    models: Vec<CodexModel>,
+}
+
+#[derive(Serialize)]
 struct AgentTerminalRun {
     ok: bool,
     status: String,
@@ -711,6 +826,8 @@ async fn agents_page(
         })
         .unwrap_or_default();
     let composer_suggestions_json = agent_composer_suggestions_json(&state.config);
+    let model_catalog_json = json_for_inline_script(&codex_model_catalog_snapshot(&state));
+    let execution_mode = agent_execution_mode_html(&state.config);
     let active_running = agent_run_for(&state, active_slot.id).is_some();
     let cancel_disabled = if active_running { "" } else { " disabled" };
     page(
@@ -733,6 +850,11 @@ async fn agents_page(
         <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message Codex"></textarea>
         <div class="command-suggestions" id="commandSuggestions" role="listbox" hidden></div>
         <div class="edit-strip" id="editStrip" hidden><span>Editing message</span><button type="button" class="ghost" data-edit-clear>Discard</button></div>
+        <div class="agent-settings" data-agent-settings>
+          <label class="agent-setting"><span>Model</span><select name="model" data-agent-model aria-label="Codex model" disabled><option>Loading models…</option></select></label>
+          <label class="agent-setting"><span>Thinking</span><select name="reasoning_effort" data-agent-reasoning aria-label="Thinking difficulty" disabled><option>Loading…</option></select></label>
+          {execution_mode}
+        </div>
         <label class="file-pill"><input name="attachment" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,application/pdf,text/*"><span>Attach</span></label>
         <button type="submit" name="control" value="stop" class="ghost cancel-button" data-cancel-button{cancel_disabled}>Cancel</button>
         <button type="submit" data-send-button>Send</button>
@@ -768,10 +890,100 @@ async fn agents_page(
   const suggestionBox = document.getElementById("commandSuggestions");
   const activeCwd = document.querySelector("[data-active-cwd]");
   const composerSuggestions = {composer_suggestions_json};
+  const modelPicker = document.querySelector("[data-agent-model]");
+  const reasoningPicker = document.querySelector("[data-agent-reasoning]");
+  const initialModelCatalog = {model_catalog_json};
+  let modelCatalog = initialModelCatalog;
+  const modelStorageKey = "mobailmux.agent.model";
+  const reasoningStorageKey = "mobailmux.agent.reasoning";
   let selectedSuggestion = 0;
   const viewingTranscript = {viewing_transcript};
   const activeSlotId = "{}";
   const slotRows = new Map();
+  function storedValue(key) {{
+    try {{ return window.localStorage.getItem(key) || ""; }} catch (_) {{ return ""; }}
+  }}
+  function storeValue(key, value) {{
+    try {{ window.localStorage.setItem(key, value); }} catch (_) {{}}
+  }}
+  function catalogModel(models, name) {{
+    return (models || []).find((model) => model.model === name) || null;
+  }}
+  function defaultCatalogModel(models) {{
+    return (models || []).find((model) => model.is_default) || (models || [])[0] || null;
+  }}
+  function setOption(select, value, label, title) {{
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    if (title) option.title = title;
+    select.append(option);
+  }}
+  function syncReasoningPicker(model, preferredEffort) {{
+    if (!reasoningPicker) return;
+    reasoningPicker.replaceChildren();
+    const efforts = model?.supported_reasoning_efforts || [];
+    if (!model || !efforts.length) {{
+      setOption(reasoningPicker, "", "Unavailable");
+      reasoningPicker.disabled = true;
+      return;
+    }}
+    const selected = efforts.some((item) => item.effort === preferredEffort)
+      ? preferredEffort
+      : model.default_reasoning_effort || efforts[0].effort;
+    efforts.forEach((item) => setOption(reasoningPicker, item.effort, item.effort, item.description));
+    reasoningPicker.value = selected;
+    reasoningPicker.disabled = false;
+    storeValue(reasoningStorageKey, selected);
+  }}
+  function syncModelPickers(models) {{
+    if (!modelPicker) return;
+    modelCatalog = models || [];
+    if (!models.length) {{
+      modelPicker.replaceChildren();
+      setOption(modelPicker, "", "Models unavailable");
+      modelPicker.disabled = true;
+      syncReasoningPicker(null, "");
+      return;
+    }}
+    const previousModel = modelPicker.value || storedValue(modelStorageKey);
+    const previousEffort = reasoningPicker?.value || storedValue(reasoningStorageKey);
+    const selectedModel = catalogModel(models, previousModel) || defaultCatalogModel(models);
+    modelPicker.replaceChildren();
+    models.forEach((model) => setOption(modelPicker, model.model, model.display_name || model.model, model.description));
+    modelPicker.value = selectedModel.model;
+    modelPicker.disabled = false;
+    storeValue(modelStorageKey, selectedModel.model);
+    syncReasoningPicker(selectedModel, previousEffort);
+  }}
+  let modelCatalogPollTimer = 0;
+  function scheduleModelCatalogPoll(delay) {{
+    window.clearTimeout(modelCatalogPollTimer);
+    modelCatalogPollTimer = window.setTimeout(loadModelCatalog, delay);
+  }}
+  async function loadModelCatalog() {{
+    try {{
+      const response = await fetch("/agents/models", {{cache:"no-store"}});
+      if (response.ok) {{
+        const data = await response.json();
+        if (Array.isArray(data.models) && data.models.length) {{
+          syncModelPickers(data.models);
+          return;
+        }}
+      }}
+    }} catch (_) {{}}
+    scheduleModelCatalogPoll(2500);
+  }}
+  if (modelPicker) {{
+    modelPicker.addEventListener("change", () => {{
+      const model = catalogModel(modelCatalog, modelPicker.value);
+      storeValue(modelStorageKey, modelPicker.value);
+      syncReasoningPicker(model, storedValue(reasoningStorageKey));
+    }});
+  }}
+  reasoningPicker?.addEventListener("change", () => storeValue(reasoningStorageKey, reasoningPicker.value));
+  if (initialModelCatalog.length) syncModelPickers(initialModelCatalog);
+  else scheduleModelCatalogPoll(0);
   document.querySelectorAll("[data-slot-row]").forEach((row) => {{
     const id = row.getAttribute("data-slot-id");
     if (!id) return;
@@ -1187,6 +1399,11 @@ async fn agents_page(
   form?.addEventListener("submit", (event) => {{
     if (event.submitter?.getAttribute("name") === "control") {{
       dirty = false;
+      return;
+    }}
+    if (input?.value.trim().toLowerCase() === "/model") {{
+      event.preventDefault();
+      modelPicker?.focus();
     }}
   }});
   input.addEventListener("input", () => {{
@@ -1517,6 +1734,8 @@ async fn agent_message_create(
     let mut edit_message_id = None;
     let mut body = String::new();
     let mut control = String::new();
+    let mut requested_model = String::new();
+    let mut requested_reasoning_effort = String::new();
     let mut upload = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -1540,6 +1759,16 @@ async fn agent_message_create(
             "body" => {
                 if let Ok(text) = field.text().await {
                     body = text;
+                }
+            }
+            "model" => {
+                if let Ok(text) = field.text().await {
+                    requested_model = text;
+                }
+            }
+            "reasoning_effort" => {
+                if let Ok(text) = field.text().await {
+                    requested_reasoning_effort = text;
                 }
             }
             "attachment" | "file" => {
@@ -1574,15 +1803,25 @@ async fn agent_message_create(
     let Some(slot) = slot else {
         return Redirect::to("/agents").into_response();
     };
+    let settings =
+        requested_agent_run_settings(&state, &requested_model, &requested_reasoning_effort);
     if control == "stop" {
         let stopped = stop_agent_job(&state, slot.id);
+        let cleared = clear_agent_queue(&state, slot.id);
+        let queue_text = if cleared == 0 {
+            String::new()
+        } else if cleared == 1 {
+            " Cleared 1 queued follow-up.".into()
+        } else {
+            format!(" Cleared {cleared} queued follow-ups.")
+        };
         append_agent_assistant(
             &state,
             slot.id,
-            if stopped {
-                "Stop requested."
+            &if stopped {
+                format!("Stop requested.{queue_text}")
             } else {
-                "This slot is not running."
+                format!("This slot is not running.{queue_text}")
             },
         );
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
@@ -1591,35 +1830,8 @@ async fn agent_message_create(
     if body.len() > MAX_AGENT_MESSAGE_CHARS {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
-    let is_control_request = looks_like_agent_control_request(&body);
-    let has_upload = upload.is_some();
-    let target_slot = if edit_message_id.is_none()
-        && !is_control_request
-        && (!body.is_empty() || has_upload)
-        && state.agent_jobs.lock().unwrap().contains_key(&slot.id)
-    {
-        let created = {
-            let db = state.db.lock().unwrap();
-            create_parallel_agent_slot(&db, &slot, Path::new(&slot.workdir)).ok()
-        };
-        if let Some(created) = created {
-            append_agent_assistant(
-                &state,
-                slot.id,
-                &format!(
-                    "{} is already running. Started this request in `{}` instead.",
-                    slot.name, created.name
-                ),
-            );
-            created
-        } else {
-            slot.clone()
-        }
-    } else {
-        slot.clone()
-    };
     let attachment_id = if let Some(upload) = upload {
-        save_agent_upload(&state, &target_slot, upload).await.ok()
+        save_agent_upload(&state, &slot, upload).await.ok()
     } else {
         None
     };
@@ -1648,6 +1860,7 @@ async fn agent_message_create(
                 params![slot.id],
             );
         }
+        let _ = clear_agent_queue(&state, slot.id);
         if handle_agent_control(&state, &slot, &body) {
             return Redirect::to(&agent_location(Some(slot.id))).into_response();
         }
@@ -1656,42 +1869,57 @@ async fn agent_message_create(
         } else {
             body
         };
-        start_agent_job(state.clone(), slot.id, request_body, final_attachment_id);
+        start_agent_job(
+            state.clone(),
+            slot.id,
+            request_body,
+            final_attachment_id,
+            settings,
+        );
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     {
         let db = state.db.lock().unwrap();
-        let _ = append_agent_message(&db, target_slot.id, "user", &body, attachment_id);
+        let _ = append_agent_message(&db, slot.id, "user", &body, attachment_id);
     }
-    if handle_agent_control(&state, &target_slot, &body) {
-        return Redirect::to(&agent_location(Some(target_slot.id))).into_response();
-    }
-    if state
-        .agent_jobs
-        .lock()
-        .unwrap()
-        .contains_key(&target_slot.id)
-    {
-        let db = state.db.lock().unwrap();
-        let _ = append_agent_message(
-            &db,
-            target_slot.id,
-            "assistant",
-            &format!(
-                "{} is already running. Use Cancel, another slot, or `/stop` first.",
-                target_slot.name
-            ),
-            None,
-        );
-        return Redirect::to(&agent_location(Some(target_slot.id))).into_response();
+    if handle_agent_control(&state, &slot, &body) {
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     let request_body = if body.is_empty() {
         "Please inspect the attached file.".to_string()
     } else {
         body
     };
-    start_agent_job(state.clone(), target_slot.id, request_body, attachment_id);
-    Redirect::to(&agent_location(Some(target_slot.id))).into_response()
+    if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+        let queued_count = queue_agent_request(
+            &state,
+            slot.id,
+            QueuedAgentRequest {
+                body: request_body,
+                attachment_id,
+                settings,
+            },
+        );
+        let queued_text = if queued_count == 1 {
+            "1 queued follow-up".to_string()
+        } else {
+            format!("{queued_count} queued follow-ups")
+        };
+        append_agent_assistant(
+            &state,
+            slot.id,
+            &format!("Queued behind the current Codex turn. {queued_text}."),
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    start_agent_job(
+        state.clone(),
+        slot.id,
+        request_body,
+        attachment_id,
+        settings,
+    );
+    Redirect::to(&agent_location(Some(slot.id))).into_response()
 }
 
 async fn agent_slot_state(
@@ -1737,6 +1965,14 @@ async fn agent_slots_state(State(state): State<Arc<AppState>>, headers: HeaderMa
         .map(|slot| agent_slot_summary(&state, slot))
         .collect();
     Json(AgentSlotsPoll { slots: summaries }).into_response()
+}
+
+async fn agent_model_catalog(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(response) = raw_guard(&state, &headers) {
+        return response;
+    }
+    let models = codex_model_catalog_snapshot(&state);
+    Json(AgentModelCatalogPoll { models }).into_response()
 }
 
 async fn agent_terminal_run(
@@ -1984,6 +2220,7 @@ fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> AgentSlotSummary
         } else {
             run.current.clone()
         };
+        let label = format!("{}{}", label, queue_suffix(agent_queue_len(state, slot.id)));
         return AgentSlotSummary {
             id: slot.id,
             name: slot.name.clone(),
@@ -1992,12 +2229,13 @@ fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> AgentSlotSummary
             status: label,
         };
     }
+    let idle = format!("idle{}", queue_suffix(agent_queue_len(state, slot.id)));
     AgentSlotSummary {
         id: slot.id,
         name: slot.name.clone(),
         running: false,
         current: String::new(),
-        status: "idle".into(),
+        status: idle,
     }
 }
 
@@ -2008,10 +2246,12 @@ fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotRuntime {
         } else {
             run.current
         };
-        return SlotRuntime { label };
+        return SlotRuntime {
+            label: format!("{}{}", label, queue_suffix(agent_queue_len(state, slot.id))),
+        };
     }
     SlotRuntime {
-        label: "idle".into(),
+        label: format!("idle{}", queue_suffix(agent_queue_len(state, slot.id))),
     }
 }
 
@@ -2883,6 +3123,27 @@ fn list_agent_messages(db: &Connection, slot_id: i64) -> rusqlite::Result<Vec<Ag
     .collect()
 }
 
+fn last_agent_message(db: &Connection, slot_id: i64) -> rusqlite::Result<Option<AgentMessageRow>> {
+    db.query_row(
+        "SELECT id, role, body, created_at
+         FROM agent_messages
+         WHERE slot_id = ?1
+         ORDER BY id DESC
+         LIMIT 1",
+        params![slot_id],
+        |row| {
+            Ok(AgentMessageRow {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                body: row.get(2)?,
+                created_at: row.get(3)?,
+                attachment: None,
+            })
+        },
+    )
+    .optional()
+}
+
 fn agent_user_message_attachment_id(
     db: &Connection,
     slot_id: i64,
@@ -2951,6 +3212,28 @@ fn append_agent_assistant(state: &AppState, slot_id: i64, body: &str) {
     let _ = append_agent_message(&db, slot_id, "assistant", body, None);
 }
 
+fn mark_interrupted_agent_runs(state: &AppState) {
+    let db = state.db.lock().unwrap();
+    let slots = list_agent_slots(&db).unwrap_or_default();
+    for slot in slots {
+        let Ok(Some(message)) = last_agent_message(&db, slot.id) else {
+            continue;
+        };
+        if agent_activity_kind(&message).is_some() {
+            let _ = append_agent_message(
+                &db,
+                slot.id,
+                "assistant",
+                &format!(
+                    "Mobailmux restarted while `{}` was running, so this local web transcript ended before Codex returned a final answer. Send a new message to continue from the saved Codex session.",
+                    slot.name
+                ),
+                None,
+            );
+        }
+    }
+}
+
 fn set_agent_goal(db: &Connection, slot_id: i64, goal: &str) -> rusqlite::Result<()> {
     db.execute(
         "UPDATE agent_slots SET goal = ?1 WHERE id = ?2",
@@ -2961,6 +3244,7 @@ fn set_agent_goal(db: &Connection, slot_id: i64, goal: &str) -> rusqlite::Result
 
 fn reset_agent_slot_chat(state: &AppState, slot_id: i64, workdir: &Path) -> bool {
     let stopped = stop_agent_job(state, slot_id);
+    let _ = clear_agent_queue(state, slot_id);
     let workdir = workdir.to_string_lossy().to_string();
     let db = state.db.lock().unwrap();
     let _ = db.execute(
@@ -3102,7 +3386,10 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         append_agent_assistant(
             state,
             slot.id,
-            &format!("Agent command: `{}`", agent_command_label(&state.config)),
+            &format!(
+                "Choose a model and thinking difficulty in the composer. Agent command: `{}`",
+                agent_command_label(&state.config)
+            ),
         );
         return true;
     }
@@ -3140,14 +3427,35 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
     }
     if lower == "stop" {
         let stopped = stop_agent_job(state, slot.id);
+        let cleared = clear_agent_queue(state, slot.id);
+        let queue_text = if cleared == 0 {
+            String::new()
+        } else if cleared == 1 {
+            " Cleared 1 queued follow-up.".into()
+        } else {
+            format!(" Cleared {cleared} queued follow-ups.")
+        };
         append_agent_assistant(
             state,
             slot.id,
-            if stopped {
-                "Stop requested."
+            &if stopped {
+                format!("Stop requested.{queue_text}")
             } else {
-                "This slot is not running."
+                format!("This slot is not running.{queue_text}")
             },
+        );
+        return true;
+    }
+    if matches!(lower.as_str(), "queue" | "queued") {
+        append_agent_assistant(state, slot.id, &agent_queue_text(state, slot));
+        return true;
+    }
+    if matches!(lower.as_str(), "clear-queue" | "clearqueue" | "queue clear") {
+        let cleared = clear_agent_queue(state, slot.id);
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!("Cleared {cleared} queued follow-up(s) for {}.", slot.name),
         );
         return true;
     }
@@ -3194,10 +3502,6 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
     true
 }
 
-fn looks_like_agent_control_request(body: &str) -> bool {
-    agent_control_text(body).is_some()
-}
-
 fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
     let cancel = state.agent_cancels.lock().unwrap().remove(&slot_id);
     if let Some(cancel) = cancel {
@@ -3206,6 +3510,149 @@ fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
     } else {
         false
     }
+}
+
+fn queue_agent_request(state: &AppState, slot_id: i64, request: QueuedAgentRequest) -> usize {
+    let mut queues = state.agent_queues.lock().unwrap();
+    let queue = queues.entry(slot_id).or_default();
+    queue.push_back(request);
+    queue.len()
+}
+
+fn pop_queued_agent_request(state: &AppState, slot_id: i64) -> Option<QueuedAgentRequest> {
+    let mut queues = state.agent_queues.lock().unwrap();
+    queues.entry(slot_id).or_default().pop_front()
+}
+
+fn clear_agent_queue(state: &AppState, slot_id: i64) -> usize {
+    let mut queues = state.agent_queues.lock().unwrap();
+    let queue = queues.entry(slot_id).or_default();
+    let count = queue.len();
+    queue.clear();
+    count
+}
+
+fn agent_queue_len(state: &AppState, slot_id: i64) -> usize {
+    state
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&slot_id)
+        .map(VecDeque::len)
+        .unwrap_or(0)
+}
+
+fn agent_queue_text(state: &AppState, slot: &AgentSlotRow) -> String {
+    let items = state
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&slot.id)
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        return format!("{} queue is empty.", slot.name);
+    }
+    let rows = items
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            format!(
+                "{}. {}",
+                index + 1,
+                truncate_text(&request.body, 220).replace('\n', " ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{} queued follow-ups:\n```text\n{rows}\n```", slot.name)
+}
+
+fn queue_suffix(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else if count == 1 {
+        " · 1 queued".into()
+    } else {
+        format!(" · {count} queued")
+    }
+}
+
+fn requested_agent_run_settings(
+    state: &Arc<AppState>,
+    requested_model: &str,
+    requested_reasoning_effort: &str,
+) -> AgentRunSettings {
+    let models = codex_model_catalog_snapshot(state);
+    validate_agent_run_settings(&models, requested_model, requested_reasoning_effort)
+}
+
+fn validate_agent_run_settings(
+    models: &[CodexModel],
+    requested_model: &str,
+    requested_reasoning_effort: &str,
+) -> AgentRunSettings {
+    let requested_model = requested_model.trim();
+    let Some(model) = models.iter().find(|model| model.model == requested_model) else {
+        return AgentRunSettings::default();
+    };
+    let requested_reasoning_effort = requested_reasoning_effort.trim();
+    let reasoning_effort = model
+        .supported_reasoning_efforts
+        .iter()
+        .any(|option| option.effort == requested_reasoning_effort)
+        .then(|| requested_reasoning_effort.to_string());
+    AgentRunSettings {
+        model: Some(model.model.clone()),
+        reasoning_effort,
+    }
+}
+
+fn agent_run_settings_label(settings: &AgentRunSettings) -> String {
+    let mut parts = Vec::new();
+    if let Some(model) = &settings.model {
+        parts.push(format!("model `{model}`"));
+    }
+    if let Some(effort) = &settings.reasoning_effort {
+        parts.push(format!("thinking `{effort}`"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+fn apply_agent_run_settings(command: &mut TokioCommand, settings: &AgentRunSettings) {
+    if let Some(model) = &settings.model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(effort) = &settings.reasoning_effort {
+        let value = serde_json::to_string(effort).unwrap_or_else(|_| "\"medium\"".into());
+        command
+            .arg("--config")
+            .arg(format!("model_reasoning_effort={value}"));
+    }
+}
+
+fn start_next_queued_agent_job(state: Arc<AppState>, slot_id: i64) {
+    let Some(next) = pop_queued_agent_request(&state, slot_id) else {
+        return;
+    };
+    let remaining = agent_queue_len(&state, slot_id);
+    let remaining_text = if remaining == 0 {
+        String::new()
+    } else if remaining == 1 {
+        " 1 follow-up remains queued.".into()
+    } else {
+        format!(" {remaining} follow-ups remain queued.")
+    };
+    append_agent_assistant(
+        &state,
+        slot_id,
+        &format!("Starting queued follow-up.{remaining_text}"),
+    );
+    start_agent_job(state, slot_id, next.body, next.attachment_id, next.settings);
 }
 
 fn agent_help_text(state: &AppState) -> String {
@@ -3231,6 +3678,8 @@ fn agent_help_text(state: &AppState) -> String {
             "- `/status`",
             "- `/usage`",
             "- `/stop`",
+            "- `/queue`",
+            "- `/clear-queue`",
             "- `/model`",
             "- `/help` or `/commands`",
         ]
@@ -3254,17 +3703,22 @@ fn agent_slots_status_text(state: &AppState) -> String {
     let lines = slots
         .iter()
         .map(|slot| {
-            let state = if jobs.contains_key(&slot.id) {
+            let status = if jobs.contains_key(&slot.id) {
                 "running"
             } else {
                 "idle"
             };
+            let status = format!(
+                "{}{}",
+                status,
+                queue_suffix(agent_queue_len(state, slot.id))
+            );
             let goal = slot.goal.trim();
             if goal.is_empty() {
-                format!("{}: {state} | {}", slot.name, slot.workdir)
+                format!("{}: {status} | {}", slot.name, slot.workdir)
             } else {
                 format!(
-                    "{}: {state} | {} | goal: {}",
+                    "{}: {status} | {} | goal: {}",
                     slot.name,
                     slot.workdir,
                     truncate_text(goal, 120)
@@ -3370,7 +3824,9 @@ fn load_codex_index(config: &Config) -> CodexIndex {
     let mut projects = projects.into_values().collect::<Vec<_>>();
     sort_codex_projects_by_activity(&mut projects);
 
-    let usage = merge_codex_rate_limit_status(latest_codex_usage(&files), &config);
+    let dashboard = fetch_codex_app_server_dashboard(config);
+    let usage =
+        merge_codex_rate_limit_status(latest_codex_usage(&files), dashboard.rate_limits.as_ref());
 
     CodexIndex {
         usage,
@@ -3481,7 +3937,8 @@ fn codex_conversation_from_file(
     let mut last_message = None::<String>;
     let mut message_count = 0usize;
 
-    for line in reader.lines().map_while(Result::ok) {
+    let mut visible_messages = Vec::new();
+    for (order, line) in reader.lines().map_while(Result::ok).enumerate() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -3504,17 +3961,19 @@ fn codex_conversation_from_file(
                 .map(str::to_string);
             continue;
         }
-        let Some((role, text)) = codex_visible_message(&value) else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
+        if let Some(message) = codex_visible_message_event(&value, order)
+            && !message.text.trim().is_empty()
+        {
+            visible_messages.push(message);
         }
+    }
+
+    for message in dedupe_codex_visible_messages(visible_messages) {
         message_count += 1;
-        if role == "user" && first_user.is_none() {
-            first_user = Some(text.clone());
+        if message.role == "user" && first_user.is_none() {
+            first_user = Some(message.text.clone());
         }
-        last_message = Some(text);
+        last_message = Some(message.text);
     }
 
     let id = id?;
@@ -3553,30 +4012,43 @@ fn codex_conversation_from_file(
 fn codex_transcript_messages(path: &Path) -> io::Result<Vec<AgentMessageRow>> {
     let file = fs::File::open(path)?;
     let reader = io::BufReader::new(file);
-    let mut rows = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    let mut messages = Vec::new();
+    for (order, line) in reader.lines().map_while(Result::ok).enumerate() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let Some((role, text)) = codex_visible_message(&value) else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
+        if let Some(message) = codex_visible_message_event(&value, order)
+            && !message.text.trim().is_empty()
+        {
+            messages.push(message);
         }
-        rows.push(AgentMessageRow {
-            id: 0,
-            role,
-            body: text,
-            created_at: timestamp,
-            attachment: None,
+    }
+    let mut visible_messages = dedupe_codex_visible_messages(messages);
+    if codex_transcript_interrupted(&visible_messages) {
+        let timestamp = visible_messages
+            .last()
+            .map(|message| message.timestamp.clone())
+            .unwrap_or_default();
+        visible_messages.push(CodexVisibleMessage {
+            role: "assistant".into(),
+            text: "This saved Codex transcript ended before Codex returned a final answer. The Mobailmux service or Codex process was likely interrupted; send a new message in the agent slot to continue.".into(),
+            timestamp,
+            order: usize::MAX,
+            fallback: false,
+            final_answer: false,
+            assistant_progress: false,
         });
     }
+    let mut rows = visible_messages
+        .into_iter()
+        .map(|message| AgentMessageRow {
+            id: 0,
+            role: message.role,
+            body: message.text,
+            created_at: message.timestamp,
+            attachment: None,
+        })
+        .collect::<Vec<_>>();
     if rows.len() > MAX_CODEX_TRANSCRIPT_MESSAGES {
         let start = rows.len() - MAX_CODEX_TRANSCRIPT_MESSAGES;
         rows = rows.split_off(start);
@@ -3585,7 +4057,44 @@ fn codex_transcript_messages(path: &Path) -> io::Result<Vec<AgentMessageRow>> {
     Ok(rows)
 }
 
-fn codex_visible_message(value: &serde_json::Value) -> Option<(String, String)> {
+fn codex_transcript_interrupted(messages: &[CodexVisibleMessage]) -> bool {
+    messages.iter().any(|message| message.assistant_progress)
+        && !messages.iter().any(|message| message.final_answer)
+}
+
+fn codex_visible_message_event(
+    value: &serde_json::Value,
+    order: usize,
+) -> Option<CodexVisibleMessage> {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some((role, text, final_answer, assistant_progress)) = codex_visible_message(value) {
+        return Some(CodexVisibleMessage {
+            role,
+            text,
+            timestamp,
+            order,
+            fallback: false,
+            final_answer,
+            assistant_progress,
+        });
+    }
+    let (role, text, final_answer, assistant_progress) = codex_event_visible_message(value)?;
+    Some(CodexVisibleMessage {
+        role,
+        text,
+        timestamp,
+        order,
+        fallback: true,
+        final_answer,
+        assistant_progress,
+    })
+}
+
+fn codex_visible_message(value: &serde_json::Value) -> Option<(String, String, bool, bool)> {
     if value.get("type").and_then(|value| value.as_str()) != Some("response_item") {
         return None;
     }
@@ -3601,7 +4110,81 @@ fn codex_visible_message(value: &serde_json::Value) -> Option<(String, String)> 
     if role == "user" && is_codex_synthetic_user_text(&text) {
         return None;
     }
-    Some((role.to_string(), text))
+    let phase = payload.get("phase").and_then(|value| value.as_str());
+    let final_answer = phase.is_some_and(is_final_agent_phase);
+    let assistant_progress =
+        role == "assistant" && phase.is_some_and(|value| !is_final_agent_phase(value));
+    Some((role.to_string(), text, final_answer, assistant_progress))
+}
+
+fn codex_event_visible_message(value: &serde_json::Value) -> Option<(String, String, bool, bool)> {
+    let event_type = value.get("type").and_then(|value| value.as_str())?;
+    let payload = if event_type == "event_msg" {
+        value.get("payload")?
+    } else {
+        value
+    };
+    let payload_type = payload.get("type").and_then(|value| value.as_str())?;
+    let role = match payload_type {
+        "user_message" => "user",
+        "agent_message" => "assistant",
+        _ => return None,
+    };
+    let text = payload
+        .get("message")
+        .or_else(|| payload.get("text"))
+        .and_then(|value| value.as_str())?
+        .to_string();
+    if role == "user" && is_codex_synthetic_user_text(&text) {
+        return None;
+    }
+    let phase = payload.get("phase").and_then(|value| value.as_str());
+    let final_answer = phase.is_some_and(is_final_agent_phase);
+    let assistant_progress =
+        role == "assistant" && phase.is_some_and(|value| !is_final_agent_phase(value));
+    Some((role.to_string(), text, final_answer, assistant_progress))
+}
+
+fn dedupe_codex_visible_messages(messages: Vec<CodexVisibleMessage>) -> Vec<CodexVisibleMessage> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            if message.fallback
+                && messages.iter().enumerate().any(|(other_index, other)| {
+                    other_index != index
+                        && !other.fallback
+                        && same_codex_visible_message_near(message, other)
+                })
+            {
+                None
+            } else {
+                Some(message.clone())
+            }
+        })
+        .collect()
+}
+
+fn same_codex_visible_message_near(
+    left: &CodexVisibleMessage,
+    right: &CodexVisibleMessage,
+) -> bool {
+    if left.role != right.role || left.text.trim() != right.text.trim() {
+        return false;
+    }
+    match (
+        codex_timestamp_seconds(&left.timestamp),
+        codex_timestamp_seconds(&right.timestamp),
+    ) {
+        (Some(left), Some(right)) => (left - right).abs() <= 2,
+        _ => left.order.abs_diff(right.order) <= 2,
+    }
+}
+
+fn codex_timestamp_seconds(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
 }
 
 fn is_codex_synthetic_user_text(text: &str) -> bool {
@@ -3672,9 +4255,9 @@ fn latest_codex_usage(files: &[PathBuf]) -> Option<CodexUsageSnapshot> {
 
 fn merge_codex_rate_limit_status(
     usage: Option<CodexUsageSnapshot>,
-    config: &Config,
+    result: Option<&serde_json::Value>,
 ) -> Option<CodexUsageSnapshot> {
-    let Some(result) = fetch_codex_rate_limits(config) else {
+    let Some(result) = result else {
         return usage;
     };
     let rate_limits = result
@@ -3714,7 +4297,7 @@ fn merge_codex_rate_limit_status(
     Some(usage)
 }
 
-fn fetch_codex_rate_limits(config: &Config) -> Option<serde_json::Value> {
+fn fetch_codex_app_server_dashboard(config: &Config) -> CodexAppServerDashboard {
     let initialize = serde_json::json!({
         "id": 0,
         "method": "initialize",
@@ -3729,12 +4312,111 @@ fn fetch_codex_rate_limits(config: &Config) -> Option<serde_json::Value> {
         "params": null
     });
     let input = format!("{initialize}\n{{\"method\":\"initialized\"}}\n{read_limits}\n");
-    let output = codex_app_server_request(config, &input)?;
+    let Some(output) = codex_app_server_request(config, &input) else {
+        return CodexAppServerDashboard::default();
+    };
+    let responses = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let rate_limits = responses
+        .iter()
+        .find(|value| value.get("id").and_then(|value| value.as_i64()) == Some(1))
+        .and_then(|value| value.get("result").cloned());
+    CodexAppServerDashboard { rate_limits }
+}
+
+fn fetch_codex_model_catalog(config: &Config) -> Vec<CodexModel> {
+    let initialize = serde_json::json!({
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "mobailmux", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }
+    });
+    let list_models = serde_json::json!({
+        "id": 1,
+        "method": "model/list",
+        "params": {"includeHidden": false}
+    });
+    let input = format!("{initialize}\n{{\"method\":\"initialized\"}}\n{list_models}\n");
+    let Some(output) = codex_app_server_request(config, &input) else {
+        return Vec::new();
+    };
     output
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|value| value.get("id").and_then(|value| value.as_i64()) == Some(1))
         .and_then(|value| value.get("result").cloned())
+        .map(|payload| codex_models_from_payload(&payload))
+        .unwrap_or_default()
+}
+
+fn codex_models_from_payload(payload: &serde_json::Value) -> Vec<CodexModel> {
+    payload
+        .get("data")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let model = item
+                .get("model")
+                .or_else(|| item.get("id"))
+                .and_then(|value| value.as_str())?
+                .trim();
+            if model.is_empty() {
+                return None;
+            }
+            let supported_reasoning_efforts = item
+                .get("supportedReasoningEfforts")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let effort = option.get("reasoningEffort")?.as_str()?.trim();
+                    if effort.is_empty() {
+                        return None;
+                    }
+                    Some(CodexReasoningEffort {
+                        effort: effort.to_string(),
+                        description: option
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some(CodexModel {
+                model: model.to_string(),
+                display_name: item
+                    .get("displayName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(model)
+                    .trim()
+                    .to_string(),
+                description: item
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                default_reasoning_effort: item
+                    .get("defaultReasoningEffort")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                supported_reasoning_efforts,
+                is_default: item
+                    .get("isDefault")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 fn consume_codex_rate_limit_reset_credit(config: &Config) -> Option<String> {
@@ -3767,33 +4449,23 @@ fn consume_codex_rate_limit_reset_credit(config: &Config) -> Option<String> {
 }
 
 fn codex_app_server_request(config: &Config, input: &str) -> Option<String> {
-    let mut command = StdCommand::new(&config.agent_codex_bin);
-    command
-        .args(&config.agent_codex_args)
-        .arg("app-server")
-        .arg("--stdio")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command.spawn().ok()?;
-    {
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(input.as_bytes()).ok()?;
-        stdin.flush().ok()?;
-        std::thread::sleep(CODEX_APP_SERVER_WRITE_SETTLE);
-    }
-    let started = Instant::now();
-    loop {
-        if child.try_wait().ok()?.is_some() {
-            break;
-        }
-        if started.elapsed() >= CODEX_APP_SERVER_TIMEOUT {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(StdDuration::from_millis(100));
-    }
-    let output = child.wait_with_output().ok()?;
+    let mut command_parts = vec![config.agent_codex_bin.as_str()];
+    command_parts.extend(agent_codex_args_for_command(config));
+    command_parts.extend(["app-server", "--stdio"]);
+    let command = command_parts
+        .into_iter()
+        .map(shell_single_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let settle_seconds = CODEX_APP_SERVER_WRITE_SETTLE.as_secs_f64();
+    let script = format!(
+        "{{ printf '%s' {}; sleep {settle_seconds}; }} | {command}",
+        shell_single_quote(input)
+    );
+    let output = StdCommand::new("bash")
+        .args(["-lc", &script])
+        .output()
+        .ok()?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
     }
@@ -4032,6 +4704,7 @@ fn start_agent_job(
     slot_id: i64,
     request_body: String,
     attachment_id: Option<i64>,
+    settings: AgentRunSettings,
 ) {
     state.agent_jobs.lock().unwrap().insert(
         slot_id,
@@ -4041,7 +4714,13 @@ fn start_agent_job(
             started_at: Utc::now().to_rfc3339(),
         },
     );
-    tokio::spawn(run_agent_job(state, slot_id, request_body, attachment_id));
+    tokio::spawn(run_agent_job(
+        state,
+        slot_id,
+        request_body,
+        attachment_id,
+        settings,
+    ));
 }
 
 async fn run_agent_job(
@@ -4049,6 +4728,7 @@ async fn run_agent_job(
     slot_id: i64,
     request_body: String,
     attachment_id: Option<i64>,
+    settings: AgentRunSettings,
 ) {
     let slot = {
         let db = state.db.lock().unwrap();
@@ -4061,13 +4741,22 @@ async fn run_agent_job(
     append_agent_assistant(
         &state,
         slot_id,
-        &format!("{} started in `{}`.", slot.name, slot.workdir),
+        &format!(
+            "{} started in `{}`{}.",
+            slot.name,
+            slot.workdir,
+            agent_run_settings_label(&settings)
+        ),
     );
     let attachment = attachment_id.and_then(|id| {
         let db = state.db.lock().unwrap();
         agent_attachment_for_prompt(&db, id).unwrap_or(None)
     });
-    let progress = prepare_agent_progress(slot_id).ok();
+    let progress = if state.config.agent_progress_notes {
+        prepare_agent_progress(slot_id).ok()
+    } else {
+        None
+    };
     let prompt = build_agent_prompt(
         &slot,
         &request_body,
@@ -4093,7 +4782,8 @@ async fn run_agent_job(
     } else {
         command.arg("--json");
     }
-    command.args(&state.config.agent_codex_args);
+    command.args(agent_codex_args_for_command(&state.config));
+    apply_agent_run_settings(&mut command, &settings);
     if use_resume {
         if let Some((thread_id, _)) = session {
             command
@@ -4181,8 +4871,9 @@ async fn run_agent_job(
             child.wait().await
         }
     };
+    let mut stdout_summary = AgentStdoutSummary::default();
     if let Some(task) = stdout_task {
-        let _ = task.await;
+        stdout_summary = task.await.unwrap_or_default();
     }
     if let Some(task) = stderr_task {
         let _ = task.await;
@@ -4215,19 +4906,22 @@ async fn run_agent_job(
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            append_agent_assistant(
-                &state,
-                slot_id,
-                &format!(
-                    "{} done in {elapsed}s.\n\n{}",
-                    slot.name,
-                    if final_text.is_empty() {
-                        "(Agent completed without a final message.)"
-                    } else {
-                        &final_text
-                    }
-                ),
-            );
+            let streamed_final = stdout_summary
+                .final_text
+                .as_deref()
+                .or(stdout_summary.last_assistant_text.as_deref())
+                .is_some_and(|streamed| streamed.trim() == final_text.trim());
+            if final_text.is_empty() {
+                if stdout_summary.last_assistant_text.is_none() {
+                    append_agent_assistant(
+                        &state,
+                        slot_id,
+                        "(Codex completed without a final message.)",
+                    );
+                }
+            } else if !streamed_final {
+                append_agent_assistant(&state, slot_id, &final_text);
+            }
         }
         Ok(status) => {
             let tail = stderr_tail.lock().unwrap().join("\n");
@@ -4251,6 +4945,7 @@ async fn run_agent_job(
         }
     }
     let _ = tokio::fs::remove_file(&out_path).await;
+    start_next_queued_agent_job(state.clone(), slot_id);
 }
 
 async fn read_agent_stdout(
@@ -4258,8 +4953,9 @@ async fn read_agent_stdout(
     slot_id: i64,
     workdir: String,
     stdout: tokio::process::ChildStdout,
-) {
+) -> AgentStdoutSummary {
     let mut lines = BufReader::new(stdout).lines();
+    let mut summary = AgentStdoutSummary::default();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -4273,6 +4969,32 @@ async fn read_agent_stdout(
         {
             let db = state.db.lock().unwrap();
             let _ = set_agent_session(&db, slot_id, thread_id, &workdir);
+            continue;
+        }
+        if let Some((message, final_answer)) = codex_stdout_agent_message(&event) {
+            let message = truncate_text(&message, MAX_AGENT_MESSAGE_CHARS);
+            if !message.trim().is_empty()
+                && summary.last_assistant_text.as_deref() != Some(message.as_str())
+            {
+                state
+                    .agent_jobs
+                    .lock()
+                    .unwrap()
+                    .entry(slot_id)
+                    .and_modify(|run| {
+                        run.status = if final_answer {
+                            "finishing".into()
+                        } else {
+                            "responding".into()
+                        };
+                        run.current.clear();
+                    });
+                append_agent_assistant(&state, slot_id, &message);
+                summary.last_assistant_text = Some(message.clone());
+                if final_answer {
+                    summary.final_text = Some(message);
+                }
+            }
             continue;
         }
         if !matches!(event_type, "item.started" | "item.completed") {
@@ -4329,6 +5051,53 @@ async fn read_agent_stdout(
             }
         }
     }
+    summary
+}
+
+fn codex_stdout_agent_message(value: &serde_json::Value) -> Option<(String, bool)> {
+    let event_type = value.get("type").and_then(|value| value.as_str())?;
+    if event_type == "response_item" {
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(|value| value.as_str()) != Some("message") {
+            return None;
+        }
+        if payload.get("role").and_then(|value| value.as_str()) != Some("assistant") {
+            return None;
+        }
+        let text = codex_content_text(payload.get("content")?);
+        let final_answer = payload
+            .get("phase")
+            .and_then(|value| value.as_str())
+            .is_some_and(is_final_agent_phase);
+        return Some((text, final_answer));
+    }
+
+    let payload = if event_type == "event_msg" {
+        value.get("payload")?
+    } else {
+        value
+    };
+    let payload_type = payload
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or(event_type);
+    if payload_type != "agent_message" {
+        return None;
+    }
+    let text = payload
+        .get("message")
+        .or_else(|| payload.get("text"))
+        .and_then(|value| value.as_str())?
+        .to_string();
+    let final_answer = payload
+        .get("phase")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_final_agent_phase);
+    Some((text, final_answer))
+}
+
+fn is_final_agent_phase(value: &str) -> bool {
+    matches!(value, "final" | "final_answer")
 }
 
 async fn read_agent_stderr(tail: Arc<Mutex<Vec<String>>>, stderr: tokio::process::ChildStderr) {
@@ -4408,20 +5177,18 @@ fn build_agent_prompt(
     progress_notes_enabled: bool,
 ) -> String {
     let goal = slot.goal.trim();
-    let goal_text = if goal.is_empty() {
-        String::new()
-    } else {
-        format!("Current slot goal:\n{goal}\n\n")
-    };
-    let progress_text = if progress_notes_enabled {
-        "Mobailmux shows command/tool activity automatically.\nUse `aiprogress 'message'` for short human progress notes when exploration starts or finishes, before verification, before risky edits, or after a couple of minutes without a visible update. Do not use it for every command.\n\n"
-    } else {
-        ""
-    };
-    let mut prompt = format!(
-        "You are running from Mobailmux agent slot {}.\nCurrent working folder: {}\n{}{}Keep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
-        slot.name, slot.workdir, goal_text, progress_text, request_body
-    );
+    let mut sections = Vec::new();
+    if !goal.is_empty() {
+        sections.push(format!("Current slot goal:\n{goal}"));
+    }
+    if progress_notes_enabled {
+        sections.push(
+            "Mobailmux has an optional `aiprogress 'message'` command for short human progress notes. Use it only when useful."
+                .to_string(),
+        );
+    }
+    sections.push(request_body.to_string());
+    let mut prompt = sections.join("\n\n");
     if let Some(attachment) = attachment {
         prompt.push_str(&format!(
             "\n\nAttached file:\n- name: {}\n- path: {}\n- type: {}\n- bytes: {}\nUse the file path directly if you need to inspect the upload.",
@@ -4466,6 +5233,11 @@ fn agent_control_text(text: &str) -> Option<(char, &str)> {
         return None;
     }
     Some((prefix, chars.as_str().trim()))
+}
+
+#[cfg(test)]
+fn looks_like_agent_control_request(body: &str) -> bool {
+    agent_control_text(body).is_some()
 }
 
 fn normalize_agent_command_text(text: &str) -> String {
@@ -4538,7 +5310,17 @@ fn agent_composer_suggestions_json(config: &Config) -> String {
                     .cmp(&right.name.to_ascii_lowercase())
             })
     });
-    serde_json::to_string(&suggestions).unwrap_or_else(|_| "[]".into())
+    json_for_inline_script(&suggestions)
+}
+
+fn json_for_inline_script<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn suggestion_kind_rank(kind: &str) -> usize {
@@ -4725,8 +5507,42 @@ fn command_in_path(command: &str) -> bool {
 
 fn agent_command_label(config: &Config) -> String {
     let mut parts = vec![config.agent_codex_bin.clone()];
-    parts.extend(config.agent_codex_args.iter().cloned());
+    parts.extend(
+        agent_codex_args_for_command(config)
+            .into_iter()
+            .map(str::to_string),
+    );
     parts.join(" ")
+}
+
+fn agent_codex_args_for_command(config: &Config) -> Vec<&str> {
+    let wrapper_adds_yolo = Path::new(&config.agent_codex_bin)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "codexunsafe");
+    config
+        .agent_codex_args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !(wrapper_adds_yolo && *arg == "--dangerously-bypass-approvals-and-sandbox"))
+        .collect()
+}
+
+fn agent_execution_mode_html(config: &Config) -> String {
+    let wrapper_adds_yolo = Path::new(&config.agent_codex_bin)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "codexunsafe");
+    if wrapper_adds_yolo
+        || config
+            .agent_codex_args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+    {
+        r#"<span class="agent-execution-mode yolo" data-yolo-mode title="YOLO mode: Codex bypasses approvals and sandboxing for this service" aria-label="YOLO mode: approvals and sandbox bypassed"><span aria-hidden="true">🔓</span><span>YOLO</span></span>"#.into()
+    } else {
+        r#"<span class="agent-execution-mode" title="Codex is using its configured approvals and sandbox policy" aria-label="Configured approvals and sandbox policy"><span aria-hidden="true">🔒</span><span>Guarded</span></span>"#.into()
+    }
 }
 
 fn split_env_args(value: &str) -> Vec<String> {
@@ -4935,7 +5751,7 @@ fn page(title: &str, body: &str) -> Response {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>{}</title>
 <style>
 {PAGE_CSS}
@@ -5453,6 +6269,7 @@ mod tests {
             agent_upload_dir: PathBuf::new(),
             agent_codex_bin: "codex".into(),
             agent_codex_args: Vec::new(),
+            agent_progress_notes: false,
             codex_home: PathBuf::new(),
             codex_reset_command: None,
             agent_slots: Vec::new(),
@@ -5500,7 +6317,142 @@ mod tests {
     }
 
     #[test]
-    fn agent_prompt_includes_slot_goal() {
+    fn codex_model_catalog_keeps_supported_thinking_levels() {
+        let payload = serde_json::json!({
+            "data": [{
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "Test model",
+                "isDefault": true,
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Fast"},
+                    {"reasoningEffort": "medium", "description": "Balanced"},
+                    {"reasoningEffort": "high", "description": "Deep"}
+                ]
+            }]
+        });
+
+        let models = codex_models_from_payload(&payload);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "gpt-test");
+        assert_eq!(models[0].default_reasoning_effort, "medium");
+        assert_eq!(
+            models[0]
+                .supported_reasoning_efforts
+                .iter()
+                .map(|effort| effort.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn agent_run_settings_only_accept_catalog_options() {
+        let models = vec![CodexModel {
+            model: "gpt-test".into(),
+            display_name: "GPT Test".into(),
+            description: String::new(),
+            default_reasoning_effort: "medium".into(),
+            supported_reasoning_efforts: vec![
+                CodexReasoningEffort {
+                    effort: "low".into(),
+                    description: String::new(),
+                },
+                CodexReasoningEffort {
+                    effort: "high".into(),
+                    description: String::new(),
+                },
+            ],
+            is_default: true,
+        }];
+
+        let settings = validate_agent_run_settings(&models, "gpt-test", "high");
+        assert_eq!(settings.model.as_deref(), Some("gpt-test"));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            validate_agent_run_settings(&models, "gpt-test", "ultra").reasoning_effort,
+            None
+        );
+        assert_eq!(
+            validate_agent_run_settings(&models, "other", "high"),
+            AgentRunSettings::default()
+        );
+
+        let mut command = TokioCommand::new("codex");
+        apply_agent_run_settings(&mut command, &settings);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gpt-test",
+                "--config",
+                "model_reasoning_effort=\"high\""
+            ]
+        );
+    }
+
+    #[test]
+    fn codexunsafe_wrapper_drops_duplicate_yolo_flag() {
+        let config = Config {
+            bind: "127.0.0.1:0".into(),
+            db_path: PathBuf::new(),
+            agent_default_workdir: PathBuf::new(),
+            agent_upload_dir: PathBuf::new(),
+            agent_codex_bin: "/usr/local/bin/codexunsafe".into(),
+            agent_codex_args: vec![
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--color".into(),
+                "never".into(),
+            ],
+            agent_progress_notes: false,
+            codex_home: PathBuf::new(),
+            codex_reset_command: None,
+            agent_slots: Vec::new(),
+            user: "mobailmux".into(),
+            password_hash: None,
+            cookie_secret: vec![2u8; 32],
+            auth_disabled: true,
+        };
+
+        assert_eq!(
+            agent_codex_args_for_command(&config),
+            vec!["--color", "never"]
+        );
+        assert!(agent_execution_mode_html(&config).contains("data-yolo-mode"));
+    }
+
+    #[test]
+    fn inline_script_json_escapes_html_terminators() {
+        let json = json_for_inline_script(&serde_json::json!({"name": "</script>&"}));
+        assert!(!json.contains("</script>"));
+        assert!(json.contains("\\u003c/script\\u003e\\u0026"));
+    }
+
+    #[test]
+    fn agent_prompt_uses_plain_request_without_slot_context_by_default() {
+        let slot = AgentSlotRow {
+            id: 1,
+            name: "codex".into(),
+            workdir: "/work/app".into(),
+            goal: String::new(),
+        };
+
+        let prompt = build_agent_prompt(&slot, "fix the bug", None, false);
+
+        assert_eq!(prompt, "fix the bug");
+        assert!(!prompt.contains("Mobailmux"));
+        assert!(!prompt.contains("User request:"));
+    }
+
+    #[test]
+    fn agent_prompt_includes_slot_goal_and_optional_progress_notes() {
         let slot = AgentSlotRow {
             id: 1,
             name: "codex".into(),
@@ -5511,7 +6463,8 @@ mod tests {
         let prompt = build_agent_prompt(&slot, "fix the bug", None, false);
 
         assert!(prompt.contains("Current slot goal:\nKeep the app deployable."));
-        assert!(prompt.contains("User request:\nfix the bug"));
+        assert!(prompt.ends_with("fix the bug"));
+        assert!(!prompt.contains("User request:"));
         let prompt_with_progress = build_agent_prompt(&slot, "fix the bug", None, true);
         assert!(prompt_with_progress.contains("aiprogress 'message'"));
     }
@@ -5519,10 +6472,7 @@ mod tests {
     #[test]
     fn agent_messages_group_command_activity() {
         let messages = vec![
-            test_message(
-                "assistant",
-                "codex done in 3s.\n\nDone with the requested change.",
-            ),
+            test_message("assistant", "Done with the requested change."),
             test_message("assistant", "running: `/bin/bash -lc 'cargo test'`"),
             test_message("assistant", "running: `/bin/bash -lc 'cargo fmt'`"),
             test_message("assistant", "codex started in `/work/app`."),
@@ -5540,14 +6490,14 @@ mod tests {
         assert!(html.contains("message-assistant"));
         assert!(
             html.find("message-user").unwrap() < html.find("message-activity").unwrap()
-                && html.find("message-activity").unwrap() < html.find("codex done").unwrap()
+                && html.find("message-activity").unwrap() < html.find("Done with").unwrap()
         );
     }
 
     #[test]
     fn agent_messages_keep_progress_notes_outside_activity_folds() {
         let messages = vec![
-            test_message("assistant", "codex done in 5s.\n\nDone."),
+            test_message("assistant", "Done."),
             test_message("assistant", "running: `/bin/bash -lc 'cargo test'`"),
             test_message("assistant", "note: finished investigation"),
             test_message("assistant", "running: `/bin/bash -lc 'rg bug'`"),
@@ -5806,6 +6756,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_conversation_parser_reads_event_messages_without_duplicates() {
+        let dir = env::temp_dir().join(format!("mobailmux-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-06-23T09-24-22-thread-3.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-06-23T07:24:22Z","type":"session_meta","payload":{"id":"thread-3","cwd":"/work/app","timestamp":"2026-06-23T07:24:22Z"}}
+{"timestamp":"2026-06-23T07:24:23.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the web chat"}}
+{"timestamp":"2026-06-23T07:24:23.001Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the web chat"}]}}
+{"timestamp":"2026-06-23T07:24:24Z","type":"event_msg","payload":{"type":"agent_message","message":"I am checking the UI now.","phase":"commentary"}}
+{"timestamp":"2026-06-23T07:24:25Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}
+"#,
+        )
+        .unwrap();
+        let conversation = codex_conversation_from_file(&path, &HashMap::new()).unwrap();
+        assert_eq!(conversation.title, "fix the web chat");
+        assert_eq!(conversation.preview, "fix the web chat");
+        assert_eq!(conversation.message_count, 3);
+
+        let messages = codex_transcript_messages(&path).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].body, "Done.");
+        assert_eq!(messages[1].body, "I am checking the UI now.");
+        assert_eq!(messages[2].body, "fix the web chat");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_conversation_parser_marks_interrupted_transcripts() {
+        let dir = env::temp_dir().join(format!("mobailmux-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-06-23T09-24-22-thread-4.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-06-23T07:24:22Z","type":"session_meta","payload":{"id":"thread-4","cwd":"/work/app","timestamp":"2026-06-23T07:24:22Z"}}
+{"timestamp":"2026-06-23T07:24:23.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the web chat"}}
+{"timestamp":"2026-06-23T07:24:24Z","type":"event_msg","payload":{"type":"agent_message","message":"I am checking the UI now.","phase":"commentary"}}
+"#,
+        )
+        .unwrap();
+
+        let messages = codex_transcript_messages(&path).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[0]
+                .body
+                .contains("ended before Codex returned a final answer")
+        );
+        assert_eq!(messages[1].body, "I am checking the UI now.");
+        assert_eq!(messages[2].body, "fix the web chat");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_stdout_agent_message_reads_commentary_and_final_text() {
+        let commentary = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "checking layout",
+                "phase": "commentary"
+            }
+        });
+        assert_eq!(
+            codex_stdout_agent_message(&commentary),
+            Some(("checking layout".into(), false))
+        );
+
+        let final_answer = serde_json::json!({
+            "type": "agent_message",
+            "message": "fixed",
+            "phase": "final_answer"
+        });
+        assert_eq!(
+            codex_stdout_agent_message(&final_answer),
+            Some(("fixed".into(), true))
+        );
+    }
+
+    #[test]
     fn codex_usage_parser_reads_rate_limits() {
         let payload = serde_json::json!({
             "type": "token_count",
@@ -5845,6 +6875,54 @@ mod tests {
     }
 
     #[test]
+    fn startup_marks_interrupted_agent_activity_once() {
+        let dir = env::temp_dir().join(format!("mobailmux-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db_migrations::migrate(&db).unwrap();
+        let slot_id = ensure_agent_slot(&db, "codex-2", &dir).unwrap();
+        append_agent_message(&db, slot_id, "user", "fix this", None).unwrap();
+        append_agent_message(&db, slot_id, "assistant", "running: `cargo test`", None).unwrap();
+        let state = AppState {
+            db: Mutex::new(db),
+            config: Config {
+                bind: "127.0.0.1:0".into(),
+                db_path: PathBuf::new(),
+                agent_default_workdir: dir.clone(),
+                agent_upload_dir: PathBuf::new(),
+                agent_codex_bin: "codex".into(),
+                agent_codex_args: Vec::new(),
+                agent_progress_notes: false,
+                codex_home: PathBuf::new(),
+                codex_reset_command: None,
+                agent_slots: Vec::new(),
+                user: "mobailmux".into(),
+                password_hash: None,
+                cookie_secret: vec![2u8; 32],
+                auth_disabled: true,
+            },
+            agent_jobs: Mutex::new(HashMap::new()),
+            agent_cancels: Mutex::new(HashMap::new()),
+            agent_queues: Mutex::new(HashMap::new()),
+            codex_index: Mutex::new(CodexIndexCache::default()),
+            codex_models: Mutex::new(CodexModelCatalogCache::default()),
+        };
+
+        mark_interrupted_agent_runs(&state);
+        mark_interrupted_agent_runs(&state);
+
+        let db = state.db.lock().unwrap();
+        let messages = list_agent_messages(&db, slot_id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[0]
+                .body
+                .contains("Mobailmux restarted while `codex-2` was running")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reset_agent_slot_chat_updates_workdir_and_clears_local_chat() {
         let old_dir = env::temp_dir().join(format!("mobailmux-old-{}", Uuid::new_v4().simple()));
         let new_dir = env::temp_dir().join(format!("mobailmux-new-{}", Uuid::new_v4().simple()));
@@ -5870,6 +6948,7 @@ mod tests {
                 agent_upload_dir: PathBuf::new(),
                 agent_codex_bin: "codex".into(),
                 agent_codex_args: Vec::new(),
+                agent_progress_notes: false,
                 codex_home: PathBuf::new(),
                 codex_reset_command: None,
                 agent_slots: Vec::new(),
@@ -5880,8 +6959,22 @@ mod tests {
             },
             agent_jobs: Mutex::new(HashMap::new()),
             agent_cancels: Mutex::new(HashMap::new()),
+            agent_queues: Mutex::new(HashMap::new()),
             codex_index: Mutex::new(CodexIndexCache::default()),
+            codex_models: Mutex::new(CodexModelCatalogCache::default()),
         };
+        assert_eq!(
+            queue_agent_request(
+                &state,
+                slot_id,
+                QueuedAgentRequest {
+                    body: "next".into(),
+                    attachment_id: None,
+                    settings: AgentRunSettings::default(),
+                },
+            ),
+            1
+        );
 
         assert!(!reset_agent_slot_chat(&state, slot_id, &new_dir));
 
@@ -5890,6 +6983,8 @@ mod tests {
         assert_eq!(slot.workdir, new_dir.to_string_lossy());
         assert!(agent_session(&db, slot_id).unwrap().is_none());
         assert!(list_agent_messages(&db, slot_id).unwrap().is_empty());
+        drop(db);
+        assert_eq!(agent_queue_len(&state, slot_id), 0);
         fs::remove_dir_all(old_dir).unwrap();
         fs::remove_dir_all(new_dir).unwrap();
     }

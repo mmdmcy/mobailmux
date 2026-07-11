@@ -25,6 +25,10 @@ assets.
 - `mattermost/`: Mattermost-specific notes.
 - `systemd/`: example service unit files only.
 - `scripts/`: bootstrap, install, and development helper scripts.
+- `scripts/ensure-playwright-webkit.sh`: provisions the ignored private
+  Playwright/WebKit toolchain used for iPhone 13 smoke tests.
+- `scripts/smoke-iphone-webkit.py`: runs a WebKit smoke check with Playwright's
+  iPhone 13 device profile.
 - `compose.yaml`: local Mattermost stack example.
 - `.env.example`: public template only. Real `.env` files stay private.
 
@@ -52,6 +56,8 @@ it.
 - `MOBAILMUX_AGENT_SLOTS`: seeds the browser agent slots.
 - `MOBAILMUX_AUTH_DISABLED=1`: useful only for local development.
 - `.env`: local-only and ignored. Do not commit it.
+- `private/playwright-webkit/`: ignored private Playwright virtualenv, WebKit
+  browser cache, wheel cache, hashes, and screenshots for mobile smoke tests.
 
 ## Codex Data Read By Mobailmux
 
@@ -118,7 +124,7 @@ a Plugroot-managed host, run:
 
 If either command fails, stop and fix the boundary first.
 
-For Rust web UI changes, the normal flow is:
+For Rust web UI changes, the local check flow is:
 
 ```bash
 cargo fmt --check
@@ -127,12 +133,46 @@ cargo run --quiet -- audit-public
 cargo build --release
 ```
 
-When replacing a live binary, keep the previous binary as a timestamped backup,
-preserve ownership and mode, restart the service, and verify it is active.
+On the Plugroot-managed live host, use the repo's manual deploy command only
+after the change is done:
+
+```bash
+scripts/deploy-live.sh
+```
+
+Do not run a background source watcher for Mobailmux. A watcher can restart the
+web service while Mobailmux is hosting active Codex agent sessions.
+
+When replacing a live binary manually, keep the previous binary as a timestamped
+backup, preserve ownership and mode, restart the service, and verify it is
+active.
 
 ```bash
 systemctl is-active mobailmux
 systemctl status mobailmux --no-pager
+```
+
+## Mobile WebKit Smoke Tests
+
+Install the private Playwright/WebKit toolchain from the repo root:
+
+```bash
+scripts/ensure-playwright-webkit.sh
+```
+
+This creates an ignored local toolchain under `private/playwright-webkit/`.
+It pins the Playwright Python package version, records downloaded wheel hashes,
+and installs only the WebKit browser into the private browser cache.
+
+Run an iPhone 13 smoke check against a local Mobailmux page:
+
+```bash
+PLAYWRIGHT_BROWSERS_PATH=private/playwright-webkit/browsers \
+  private/playwright-webkit/venv/bin/python \
+  scripts/smoke-iphone-webkit.py \
+  --url http://127.0.0.1:8765/agents \
+  --expect-selector '[data-agent-messages]' \
+  --expect-selector '.agent-composer'
 ```
 
 ## What Not To Store Here
