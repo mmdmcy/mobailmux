@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::{AppState, MAX_AGENT_MESSAGE_CHARS, MAX_AGENT_UPLOAD_BYTES};
+use crate::{AppState, MAX_AGENT_MESSAGE_CHARS};
 
 pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -17,19 +17,10 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
             "/agents",
             get(crate::agents_page).post(crate::agent_message_create),
         )
-        .route(
-            "/agents/slots/{id}/conversation",
-            post(crate::agent_conversation_load),
-        )
         .route("/agents/slots/state", get(crate::agent_slots_state))
-        .route("/agents/slots/{id}/new", post(crate::agent_new_chat))
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
         .route("/agents/models", get(crate::agent_model_catalog))
-        .route("/agents/terminal/run", post(crate::agent_terminal_run))
-        .route("/agents/attachments/{id}", get(crate::agent_attachment))
         .route("/agents/codex/reset", post(crate::codex_reset_post))
-        .layer(DefaultBodyLimit::max(
-            MAX_AGENT_UPLOAD_BYTES + MAX_AGENT_MESSAGE_CHARS + 1024 * 1024,
-        ))
+        .layer(DefaultBodyLimit::max(MAX_AGENT_MESSAGE_CHARS + 1024 * 1024))
         .with_state(state)
 }

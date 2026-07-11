@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    cmp::{Ordering, Reverse},
+    cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, BufRead, Read, Seek, SeekFrom},
@@ -59,17 +59,11 @@ struct ComposerSuggestion {
 
 const DEFAULT_AGENT_SLOTS: &str = "codex";
 const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
-const MAX_AGENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_AGENT_SLOT_CHARS: usize = 32;
 const MAX_AGENT_GOAL_CHARS: usize = 4000;
-const MAX_TERMINAL_COMMAND_CHARS: usize = 4096;
-const MAX_TERMINAL_OUTPUT_CHARS: usize = 64 * 1024;
 const MAX_CODEX_CONVERSATIONS: usize = 120;
 const MAX_CODEX_TRANSCRIPT_MESSAGES: usize = 80;
 const CODEX_SESSION_SCAN_LIMIT: usize = 180;
-const CODEX_PROJECT_DRAWER_LIMIT: usize = 48;
-const CODEX_PROJECT_VISIBLE_CONVERSATIONS: usize = 3;
-const CODEX_PROJECT_CONVERSATION_LIMIT: usize = 24;
 const CODEX_INDEX_REFRESH_AFTER: StdDuration = StdDuration::from_secs(30);
 const CODEX_APP_SERVER_WRITE_SETTLE: StdDuration = StdDuration::from_secs(5);
 const SESSION_COOKIE: &str = "mobailmux_session";
@@ -113,24 +107,6 @@ const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
         takes_arg: false,
     },
     AgentCommandSpec {
-        name: "pwd",
-        usage: "/pwd",
-        description: "Show this slot's folder",
-        takes_arg: false,
-    },
-    AgentCommandSpec {
-        name: "cd",
-        usage: "/cd <folder>",
-        description: "Change this slot's folder",
-        takes_arg: true,
-    },
-    AgentCommandSpec {
-        name: "ls",
-        usage: "/ls [path]",
-        description: "List files from the slot folder",
-        takes_arg: true,
-    },
-    AgentCommandSpec {
         name: "stop",
         usage: "/stop",
         description: "Stop the running Codex job",
@@ -151,13 +127,7 @@ const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
     AgentCommandSpec {
         name: "fresh",
         usage: "/fresh",
-        description: "Reset chat, folder, and saved Codex thread",
-        takes_arg: false,
-    },
-    AgentCommandSpec {
-        name: "stayfresh",
-        usage: "/stayfresh",
-        description: "Reset chat and saved thread, keep folder",
+        description: "Reset chat and saved Codex thread",
         takes_arg: false,
     },
     AgentCommandSpec {
@@ -194,7 +164,6 @@ async fn main() -> io::Result<()> {
 
 async fn serve() -> io::Result<()> {
     let config = Config::from_env()?;
-    fs::create_dir_all(&config.agent_upload_dir)?;
     let conn = open_db(&config.db_path)?;
     ensure_agent_slot_seeds(&conn, &config.agent_slots, &config.agent_default_workdir)
         .map_err(io_other)?;
@@ -230,7 +199,6 @@ struct Config {
     bind: String,
     db_path: PathBuf,
     agent_default_workdir: PathBuf,
-    agent_upload_dir: PathBuf,
     agent_codex_bin: String,
     agent_codex_args: Vec<String>,
     agent_progress_notes: bool,
@@ -302,15 +270,6 @@ struct CodexVisibleMessage {
     assistant_progress: bool,
 }
 
-#[derive(Clone, Debug)]
-struct CodexProject {
-    path: String,
-    name: String,
-    trusted: bool,
-    conversation_count: usize,
-    latest_activity: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct CodexReasoningEffort {
     effort: String,
@@ -330,7 +289,6 @@ struct CodexModel {
 #[derive(Clone, Debug)]
 struct CodexIndex {
     conversations: Vec<CodexConversation>,
-    projects: Vec<CodexProject>,
     usage: Option<CodexUsageSnapshot>,
 }
 
@@ -338,7 +296,6 @@ impl CodexIndex {
     fn empty() -> Self {
         Self {
             conversations: Vec::new(),
-            projects: Vec::new(),
             usage: None,
         }
     }
@@ -370,7 +327,14 @@ struct CodexRateWindow {
 #[derive(Clone, Debug)]
 struct CodexResetCreditsSummary {
     available_count: i64,
+    credits: Vec<CodexResetCredit>,
     estimate: Option<codex_reset_ledger::ResetCreditEstimate>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexResetCredit {
+    title: String,
+    expires_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -408,9 +372,6 @@ impl Config {
         let agent_default_workdir = env::var("MOBAILMUX_AGENT_DEFAULT_WORKDIR")
             .map(|value| expand_local_path(&value))
             .unwrap_or_else(|_| default_home_dir());
-        let agent_upload_dir = env::var("MOBAILMUX_AGENT_UPLOAD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("data/agent-uploads"));
         let agent_codex_bin =
             env::var("MOBAILMUX_AGENT_CODEX_BIN").unwrap_or_else(|_| default_codex_bin());
         let agent_codex_args = env::var("MOBAILMUX_AGENT_CODEX_ARGS")
@@ -450,7 +411,6 @@ impl Config {
             bind,
             db_path,
             agent_default_workdir,
-            agent_upload_dir,
             agent_codex_bin,
             agent_codex_args,
             agent_progress_notes,
@@ -650,36 +610,13 @@ struct AgentsQuery {
     slot: Option<i64>,
     thread: Option<String>,
     refresh: Option<String>,
-    browse: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentConversationForm {
-    thread_id: String,
-    workdir: String,
-}
-
-#[derive(Deserialize)]
-struct AgentTerminalForm {
-    slot_id: i64,
-    command: String,
-}
-
-#[derive(Deserialize)]
-struct AgentNewChatForm {
-    workdir: Option<String>,
-    create: Option<String>,
+    usage: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CodexResetForm {
     confirm: String,
-}
-
-struct PendingUpload {
-    filename: String,
-    content_type: String,
-    bytes: Vec<u8>,
+    slot_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -741,14 +678,6 @@ struct AgentModelCatalogPoll {
     models: Vec<CodexModel>,
 }
 
-#[derive(Serialize)]
-struct AgentTerminalRun {
-    ok: bool,
-    status: String,
-    output: String,
-    cwd: String,
-}
-
 async fn agents_page(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentsQuery>,
@@ -773,7 +702,6 @@ async fn agents_page(
     } else {
         codex_index_snapshot(&state)
     };
-    let reopen_browser = query.browse.is_some();
     let selected_thread = query.thread.clone();
     if selected_thread.as_ref().is_some_and(|thread_id| {
         codex_snapshot
@@ -789,14 +717,6 @@ async fn agents_page(
         list_agent_messages(&db, active_slot.id).unwrap_or_default()
     };
     let runtime = agent_slot_runtime(&state, active_slot);
-    let browser_drawer = codex_browser_drawer_html(
-        &codex.projects,
-        &codex.conversations,
-        active_slot.id,
-        selected_thread.as_deref(),
-        codex_loaded,
-        &active_slot.workdir,
-    );
     let messages_html = selected_thread
         .as_deref()
         .and_then(|thread_id| codex_transcript_html(&codex, thread_id).ok())
@@ -807,14 +727,19 @@ async fn agents_page(
         .map(|conversation| conversation.title.clone())
         .unwrap_or_else(|| "Codex".into());
     let active_title = html_escape(&active_title);
-    let active_slot_workdir = html_escape(&active_slot.workdir);
     let message_count = if selected_thread.is_some() {
         codex_transcript_count(&messages_html).unwrap_or(messages.len())
     } else {
         messages.len()
     };
     let slot_rail = agent_slot_rail_html(&state, &slots, active_slot.id);
-    let usage_dialog = codex_usage_dialog(&state.config, codex.usage.as_ref(), codex_loaded);
+    let usage_dialog = codex_usage_dialog(
+        &state.config,
+        codex.usage.as_ref(),
+        codex_loaded,
+        active_slot.id,
+    );
+    let reopen_usage = query.usage.is_some();
     let viewing_transcript = selected_thread.is_some();
     let refresh_thread_input = selected_thread
         .as_deref()
@@ -834,12 +759,12 @@ async fn agents_page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-browser-open aria-label="Browse conversations" title="Browse conversations">🗂</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
     <header class="chat-head">
-      <div class="chat-title"><strong>{active_title}</strong><span data-active-cwd>{active_slot_workdir}</span></div>
+      <div class="chat-title"><strong>{active_title}</strong></div>
       <div class="chat-stats"><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></div>
     </header>
     <div class="message-list" data-agent-messages>{messages_html}</div>
@@ -855,27 +780,13 @@ async fn agents_page(
           <label class="agent-setting"><span>Thinking</span><select name="reasoning_effort" data-agent-reasoning aria-label="Thinking difficulty" disabled><option>Loading…</option></select></label>
           {execution_mode}
         </div>
-        <label class="file-pill"><input name="attachment" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,application/pdf,text/*"><span>Attach</span></label>
         <button type="submit" name="control" value="stop" class="ghost cancel-button" data-cancel-button{cancel_disabled}>Cancel</button>
         <button type="submit" data-send-button>Send</button>
       </form>
     </section>
   </section>
 </main>
-{browser_drawer}
 {usage_dialog}
-<dialog class="terminal-panel" id="terminalPanel">
-  <header><div><strong>Terminal</strong><br><span data-terminal-cwd>{active_slot_workdir}</span></div><button type="button" class="icon" data-terminal-close aria-label="Close">x</button></header>
-  <main>
-    <pre class="terminal-output" data-terminal-output>$ ready
-</pre>
-    <form class="terminal-form" data-terminal-form>
-      <input name="slot_id" type="hidden" value="{}">
-      <input name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Command">
-      <button type="submit">Run</button>
-    </form>
-  </main>
-</dialog>
 <script>
 (() => {{
   const list = document.querySelector("[data-agent-messages]");
@@ -1025,13 +936,7 @@ async fn agents_page(
   const codexPanel = document.getElementById("codexPanel");
   document.querySelector("[data-codex-open]")?.addEventListener("click", () => openDialog(codexPanel));
   document.querySelector("[data-codex-close]")?.addEventListener("click", () => closeDialog(codexPanel));
-  const browserPanel = document.getElementById("conversationDrawer");
-  const terminalPanel = document.getElementById("terminalPanel");
-  const terminalForm = document.querySelector("[data-terminal-form]");
-  const terminalOutput = document.querySelector("[data-terminal-output]");
-  const terminalCwd = document.querySelector("[data-terminal-cwd]");
-  document.querySelector("[data-terminal-open]")?.addEventListener("click", () => openDialog(terminalPanel));
-  document.querySelector("[data-terminal-close]")?.addEventListener("click", () => closeDialog(terminalPanel));
+  if ({reopen_usage}) openDialog(codexPanel);
   const closestElement = (target, selector) => target instanceof Element ? target.closest(selector) : null;
   const lockPageScroll = () => {{
     if (document.body.classList.contains("modal-scroll-locked")) return;
@@ -1067,100 +972,7 @@ async fn agents_page(
       button.setAttribute("title", "Refreshing");
     }});
   }});
-  document.querySelector("[data-browser-open]")?.addEventListener("click", () => {{
-    openLockedDialog(browserPanel);
-  }});
-  browserPanel?.addEventListener("close", () => {{
-    unlockPageScroll();
-    syncDialogLock();
-  }});
-  if ({reopen_browser}) openLockedDialog(browserPanel);
-  document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
-  const browserSearchPanel = document.querySelector("[data-browser-search-panel]");
-  const browserSearchToggle = document.querySelector("[data-browser-search-toggle]");
-  const browserNewPanel = document.querySelector("[data-browser-new-panel]");
-  const browserNewToggle = document.querySelector("[data-browser-new-toggle]");
-  const browserSearch = document.querySelector("[data-browser-search]");
-  const browserEmptySearch = document.querySelector("[data-browser-empty-search]");
-  const setBrowserToolOpen = (panel, button, open) => {{
-    if (!panel || !button) return;
-    panel.hidden = !open;
-    button.classList.toggle("is-active", open);
-    button.setAttribute("aria-expanded", open ? "true" : "false");
-  }};
-  const filterBrowserProjects = () => {{
-    const query = (browserSearch?.value || "").trim().toLowerCase();
-    let visibleProjects = 0;
-    const projects = document.querySelectorAll("[data-project-group]");
-    projects.forEach((project) => {{
-      const haystack = (project.getAttribute("data-project-search") || project.textContent || "").toLowerCase();
-      const visible = !query || haystack.includes(query);
-      project.hidden = !visible;
-      if (visible) visibleProjects += 1;
-    }});
-    if (browserEmptySearch) browserEmptySearch.hidden = !query || visibleProjects > 0 || projects.length === 0;
-  }};
-  browserSearch?.addEventListener("input", filterBrowserProjects);
-  browserSearchToggle?.addEventListener("click", () => {{
-    const opening = browserSearchPanel?.hidden !== false;
-    setBrowserToolOpen(browserSearchPanel, browserSearchToggle, opening);
-    setBrowserToolOpen(browserNewPanel, browserNewToggle, false);
-    if (opening) {{
-      window.setTimeout(() => browserSearch?.focus(), 0);
-    }} else if (browserSearch?.value) {{
-      browserSearch.value = "";
-      filterBrowserProjects();
-    }}
-  }});
-  browserNewToggle?.addEventListener("click", () => {{
-    const opening = browserNewPanel?.hidden !== false;
-    setBrowserToolOpen(browserNewPanel, browserNewToggle, opening);
-    setBrowserToolOpen(browserSearchPanel, browserSearchToggle, false);
-    if (browserSearch?.value) {{
-      browserSearch.value = "";
-      filterBrowserProjects();
-    }}
-  }});
-  filterBrowserProjects();
-  let browserTouchY = 0;
-  document.addEventListener("touchstart", (event) => {{
-    if (!browserPanel?.open || event.touches.length !== 1) return;
-    browserTouchY = event.touches[0].clientY;
-  }}, {{passive:true}});
-  document.addEventListener("touchmove", (event) => {{
-    if (!browserPanel?.open || event.touches.length !== 1) return;
-    const scrollTarget = closestElement(event.target, ".browser-scroll");
-    if (!scrollTarget) {{
-      event.preventDefault();
-      return;
-    }}
-    const y = event.touches[0].clientY;
-    const delta = y - browserTouchY;
-    browserTouchY = y;
-    const atTop = scrollTarget.scrollTop <= 0;
-    const atBottom = Math.ceil(scrollTarget.scrollTop + scrollTarget.clientHeight) >= scrollTarget.scrollHeight;
-    if ((atTop && delta > 0) || (atBottom && delta < 0)) event.preventDefault();
-  }}, {{passive:false}});
-  document.addEventListener("wheel", (event) => {{
-    if (!browserPanel?.open) return;
-    const scrollTarget = closestElement(event.target, ".browser-scroll");
-    if (!scrollTarget) {{
-      event.preventDefault();
-      return;
-    }}
-    const atTop = scrollTarget.scrollTop <= 0;
-    const atBottom = Math.ceil(scrollTarget.scrollTop + scrollTarget.clientHeight) >= scrollTarget.scrollHeight;
-    if ((atTop && event.deltaY < 0) || (atBottom && event.deltaY > 0)) event.preventDefault();
-  }}, {{passive:false}});
-  document.querySelectorAll("[data-load-more]").forEach((button) => {{
-    button.addEventListener("click", () => {{
-      const group = button.closest("[data-project-group]");
-      if (!group) return;
-      group.querySelectorAll("[data-extra-conversation]").forEach((row) => row.hidden = false);
-      button.hidden = true;
-    }});
-  }});
-  document.querySelector("[data-reset-form]")?.addEventListener("submit", (event) => {{
+   document.querySelector("[data-reset-form]")?.addEventListener("submit", (event) => {{
     const ok = window.confirm("Use a Codex reset now? This cannot be undone.");
     if (!ok) event.preventDefault();
   }});
@@ -1228,36 +1040,7 @@ async fn agents_page(
     if (nearBottom) list.scrollTop = list.scrollHeight;
     return true;
   }}
-  terminalForm?.addEventListener("submit", async (event) => {{
-    event.preventDefault();
-    const commandInput = terminalForm.elements.command;
-    const command = commandInput?.value.trim() || "";
-    if (!command) return;
-    if (commandInput) commandInput.value = "";
-    terminalOutput.textContent += `\n$ ${{command}}\n`;
-    terminalOutput.scrollTop = terminalOutput.scrollHeight;
-    const body = new URLSearchParams(new FormData(terminalForm));
-    body.set("command", command);
-    try {{
-      const response = await fetch("/agents/terminal/run", {{
-        method: "POST",
-        body,
-        headers: {{"Accept":"application/json"}}
-      }});
-      const data = response.ok ? await response.json() : {{ok:false,status:`http ${{response.status}}`,output:""}};
-      if (terminalCwd && data.cwd) terminalCwd.textContent = data.cwd;
-      if (activeCwd && data.cwd) activeCwd.textContent = data.cwd;
-      const output = data.output || "";
-      terminalOutput.textContent += output;
-      if (output && !output.endsWith("\n")) terminalOutput.textContent += "\n";
-      terminalOutput.textContent += `[${{data.status || (data.ok ? "ok" : "failed")}}]\n`;
-    }} catch (_) {{
-      terminalOutput.textContent += "[request failed]\n";
-    }}
-    terminalOutput.scrollTop = terminalOutput.scrollHeight;
-    commandInput?.focus();
-  }});
-  function activeCompletionToken() {{
+   function activeCompletionToken() {{
     if (!input) return null;
     const value = input.value;
     const cursor = input.selectionStart ?? value.length;
@@ -1509,153 +1292,9 @@ async fn agents_page(
             html_escape(&runtime.label),
             active_slot.id,
             active_slot.id,
-            active_slot.id,
             active_slot.id
         ),
     )
-}
-
-async fn agent_conversation_load(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<i64>,
-    Form(form): Form<AgentConversationForm>,
-) -> Response {
-    if let Some(response) = page_guard(&state, &headers) {
-        return response;
-    }
-    let mut codex = codex_index_snapshot(&state);
-    if codex
-        .as_ref()
-        .is_none_or(|index| codex_conversation_by_id(index, &form.thread_id).is_none())
-    {
-        codex = Some(refresh_codex_index_blocking(&state));
-    }
-    let codex_loaded = codex.is_some();
-    let conversation = codex
-        .as_ref()
-        .and_then(|index| codex_conversation_by_id(index, &form.thread_id));
-    if codex_loaded && conversation.is_none() {
-        return Redirect::to(&agent_location(Some(id))).into_response();
-    }
-    let requested_workdir = expand_local_path(&form.workdir);
-    let workdir = if requested_workdir.is_dir() {
-        requested_workdir
-            .canonicalize()
-            .unwrap_or_else(|_| requested_workdir.clone())
-    } else if let Some(conversation) = conversation {
-        expand_local_path(&conversation.cwd)
-    } else {
-        return Redirect::to(&agent_location(Some(id))).into_response();
-    };
-    if !workdir.is_dir() {
-        return Redirect::to(&agent_location(Some(id))).into_response();
-    }
-    {
-        let db = state.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
-            params![workdir.to_string_lossy(), id],
-        );
-        let _ = set_agent_session(&db, id, &form.thread_id, &workdir.to_string_lossy());
-    }
-    Redirect::to(&format!(
-        "{}&thread={}",
-        agent_location(Some(id)),
-        url_encode(&form.thread_id)
-    ))
-    .into_response()
-}
-
-async fn agent_new_chat(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<i64>,
-    Form(form): Form<AgentNewChatForm>,
-) -> Response {
-    if let Some(response) = page_guard(&state, &headers) {
-        return response;
-    }
-    let slot = {
-        let db = state.db.lock().unwrap();
-        get_agent_slot(&db, id).unwrap_or(None)
-    };
-    let Some(slot) = slot else {
-        return Redirect::to("/agents").into_response();
-    };
-    let raw_workdir = form.workdir.as_deref().unwrap_or("").trim();
-    let workdir = if raw_workdir.is_empty() {
-        PathBuf::from(&slot.workdir)
-    } else {
-        resolve_agent_path(raw_workdir, &slot.workdir)
-    };
-    if form.create.is_some()
-        && !workdir.exists()
-        && let Err(err) = fs::create_dir_all(&workdir)
-    {
-        append_agent_assistant(
-            &state,
-            slot.id,
-            &format!("Could not create folder `{}`: {err}", workdir.display()),
-        );
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
-    }
-    if !workdir.is_dir() {
-        append_agent_assistant(
-            &state,
-            slot.id,
-            &format!("Folder does not exist: `{}`", workdir.display()),
-        );
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
-    }
-    let workdir = workdir.canonicalize().unwrap_or(workdir);
-    let workdir_text = workdir.to_string_lossy().to_string();
-    let (target_slot, stop_text) = if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
-        let created = {
-            let db = state.db.lock().unwrap();
-            create_parallel_agent_slot(&db, &slot, &workdir).ok()
-        };
-        let Some(created) = created else {
-            append_agent_assistant(
-                &state,
-                slot.id,
-                "Could not create a parallel Codex lane. Try again or stop this lane first.",
-            );
-            return Redirect::to(&agent_location(Some(slot.id))).into_response();
-        };
-        append_agent_assistant(
-            &state,
-            slot.id,
-            &format!(
-                "{} is still running. Started `{}` separately in `{workdir_text}`.",
-                slot.name, created.name
-            ),
-        );
-        (created, "")
-    } else {
-        let stopped = reset_agent_slot_chat(&state, slot.id, &workdir);
-        let stop_text = if stopped {
-            " Stopped the current job."
-        } else {
-            ""
-        };
-        (
-            AgentSlotRow {
-                workdir: workdir_text.clone(),
-                ..slot
-            },
-            stop_text,
-        )
-    };
-    append_agent_assistant(
-        &state,
-        target_slot.id,
-        &format!(
-            "{} new chat ready in `{workdir_text}`.{stop_text} Your next message starts a new agent chat.",
-            target_slot.name
-        ),
-    );
-    Redirect::to(&agent_location(Some(target_slot.id))).into_response()
 }
 
 async fn codex_reset_post(
@@ -1669,6 +1308,10 @@ async fn codex_reset_post(
     if form.confirm.trim() != "USE_RESET" {
         return (StatusCode::BAD_REQUEST, "confirmation required").into_response();
     }
+    let return_location = format!(
+        "/agents?slot={}&refresh=1&usage=1",
+        form.slot_id.unwrap_or_default()
+    );
     if let Some(command) = &state.config.codex_reset_command {
         let Some((program, args)) = command.split_first() else {
             return (StatusCode::CONFLICT, "no reset command configured").into_response();
@@ -1677,7 +1320,7 @@ async fn codex_reset_post(
         return match output {
             Ok(output) if output.status.success() => {
                 refresh_codex_index(state.clone());
-                Redirect::to("/agents").into_response()
+                Redirect::to(&return_location).into_response()
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1697,7 +1340,7 @@ async fn codex_reset_post(
     match consume_codex_rate_limit_reset_credit(&state.config) {
         Some(outcome) if outcome == "reset" || outcome == "alreadyRedeemed" => {
             refresh_codex_index(state.clone());
-            Redirect::to("/agents").into_response()
+            Redirect::to(&return_location).into_response()
         }
         Some(outcome) if outcome == "nothingToReset" => (
             StatusCode::CONFLICT,
@@ -1736,7 +1379,6 @@ async fn agent_message_create(
     let mut control = String::new();
     let mut requested_model = String::new();
     let mut requested_reasoning_effort = String::new();
-    let mut upload = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -1769,26 +1411,6 @@ async fn agent_message_create(
             "reasoning_effort" => {
                 if let Ok(text) = field.text().await {
                     requested_reasoning_effort = text;
-                }
-            }
-            "attachment" | "file" => {
-                let filename = field
-                    .file_name()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "attachment".into());
-                let content_type = field
-                    .content_type()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "application/octet-stream".into());
-                if let Ok(bytes) = field.bytes().await
-                    && !bytes.is_empty()
-                    && bytes.len() <= MAX_AGENT_UPLOAD_BYTES
-                {
-                    upload = Some(PendingUpload {
-                        filename,
-                        content_type,
-                        bytes: bytes.to_vec(),
-                    });
                 }
             }
             _ => {}
@@ -1830,12 +1452,7 @@ async fn agent_message_create(
     if body.len() > MAX_AGENT_MESSAGE_CHARS {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
-    let attachment_id = if let Some(upload) = upload {
-        save_agent_upload(&state, &slot, upload).await.ok()
-    } else {
-        None
-    };
-    if body.is_empty() && attachment_id.is_none() {
+    if body.is_empty() {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     if let Some(message_id) = edit_message_id {
@@ -1850,10 +1467,10 @@ async fn agent_message_create(
         let Some(existing_attachment_id) = existing_attachment_id else {
             return Redirect::to(&agent_location(Some(slot.id))).into_response();
         };
-        let final_attachment_id = attachment_id.or(existing_attachment_id);
+        let _ = existing_attachment_id;
         {
             let db = state.db.lock().unwrap();
-            let _ = update_agent_user_message(&db, slot.id, message_id, &body, attachment_id);
+            let _ = update_agent_user_message(&db, slot.id, message_id, &body, None);
             let _ = delete_agent_messages_after(&db, slot.id, message_id);
             let _ = db.execute(
                 "DELETE FROM agent_sessions WHERE slot_id = ?1",
@@ -1864,39 +1481,24 @@ async fn agent_message_create(
         if handle_agent_control(&state, &slot, &body) {
             return Redirect::to(&agent_location(Some(slot.id))).into_response();
         }
-        let request_body = if body.is_empty() {
-            "Please inspect the attached file.".to_string()
-        } else {
-            body
-        };
-        start_agent_job(
-            state.clone(),
-            slot.id,
-            request_body,
-            final_attachment_id,
-            settings,
-        );
+        start_agent_job(state.clone(), slot.id, body, None, settings);
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     {
         let db = state.db.lock().unwrap();
-        let _ = append_agent_message(&db, slot.id, "user", &body, attachment_id);
+        let _ = append_agent_message(&db, slot.id, "user", &body, None);
     }
     if handle_agent_control(&state, &slot, &body) {
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
-    let request_body = if body.is_empty() {
-        "Please inspect the attached file.".to_string()
-    } else {
-        body
-    };
+    let request_body = body;
     if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
         let queued_count = queue_agent_request(
             &state,
             slot.id,
             QueuedAgentRequest {
                 body: request_body,
-                attachment_id,
+                attachment_id: None,
                 settings,
             },
         );
@@ -1912,13 +1514,7 @@ async fn agent_message_create(
         );
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
-    start_agent_job(
-        state.clone(),
-        slot.id,
-        request_body,
-        attachment_id,
-        settings,
-    );
+    start_agent_job(state.clone(), slot.id, request_body, None, settings);
     Redirect::to(&agent_location(Some(slot.id))).into_response()
 }
 
@@ -1975,240 +1571,6 @@ async fn agent_model_catalog(State(state): State<Arc<AppState>>, headers: Header
     Json(AgentModelCatalogPoll { models }).into_response()
 }
 
-async fn agent_terminal_run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(form): Form<AgentTerminalForm>,
-) -> Response {
-    if let Some(response) = raw_guard(&state, &headers) {
-        return response;
-    }
-    let command = form.command.trim();
-    let slot = {
-        let db = state.db.lock().unwrap();
-        get_agent_slot(&db, form.slot_id).unwrap_or(None)
-    };
-    let Some(slot) = slot else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(AgentTerminalRun {
-                ok: false,
-                status: "missing slot".into(),
-                output: String::new(),
-                cwd: String::new(),
-            }),
-        )
-            .into_response();
-    };
-    if command.is_empty() {
-        return Json(AgentTerminalRun {
-            ok: false,
-            status: "empty".into(),
-            output: String::new(),
-            cwd: slot.workdir,
-        })
-        .into_response();
-    }
-    if command.chars().count() > MAX_TERMINAL_COMMAND_CHARS {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(AgentTerminalRun {
-                ok: false,
-                status: "too long".into(),
-                output: String::new(),
-                cwd: slot.workdir,
-            }),
-        )
-            .into_response();
-    }
-    let workdir = PathBuf::from(&slot.workdir);
-    if !workdir.is_dir() {
-        return (
-            StatusCode::CONFLICT,
-            Json(AgentTerminalRun {
-                ok: false,
-                status: "bad cwd".into(),
-                output: format!("Folder does not exist: {}", workdir.display()),
-                cwd: slot.workdir,
-            }),
-        )
-            .into_response();
-    }
-
-    let marker = format!("__MOBAILMUX_{}__", Uuid::new_v4().simple());
-    let script = format!(
-        "set +e\n{command}\n__mobailmux_status=$?\nprintf '\\n{marker}STATUS:%s\\n{marker}PWD:%s\\n' \"$__mobailmux_status\" \"$PWD\"\nexit \"$__mobailmux_status\""
-    );
-    let mut child = TokioCommand::new("/bin/bash");
-    child
-        .arg("-lc")
-        .arg(script)
-        .current_dir(&workdir)
-        .env("HOME", default_home_dir())
-        .env(
-            "PATH",
-            env::var("PATH").unwrap_or_else(|_| {
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
-            }),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let Ok(child) = child.spawn() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AgentTerminalRun {
-                ok: false,
-                status: "spawn failed".into(),
-                output: "Could not start /bin/bash.".into(),
-                cwd: slot.workdir,
-            }),
-        )
-            .into_response();
-    };
-    let output =
-        match tokio::time::timeout(StdDuration::from_secs(30), child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AgentTerminalRun {
-                        ok: false,
-                        status: "wait failed".into(),
-                        output: err.to_string(),
-                        cwd: slot.workdir,
-                    }),
-                )
-                    .into_response();
-            }
-            Err(_) => {
-                return Json(AgentTerminalRun {
-                    ok: false,
-                    status: "timeout".into(),
-                    output: "Command timed out after 30s.".into(),
-                    cwd: slot.workdir,
-                })
-                .into_response();
-            }
-        };
-
-    let (stdout, exit_code, final_cwd) = terminal_visible_stdout(
-        &String::from_utf8_lossy(&output.stdout),
-        &marker,
-        &slot.workdir,
-    );
-    if final_cwd != slot.workdir && Path::new(&final_cwd).is_dir() {
-        let db = state.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
-            params![&final_cwd, slot.id],
-        );
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut combined = stdout;
-    if !stderr.trim().is_empty() {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&stderr);
-    }
-    let status_code = exit_code.or_else(|| output.status.code()).unwrap_or(-1);
-    let ok = output.status.success() || status_code == 0;
-    Json(AgentTerminalRun {
-        ok,
-        status: format!("exit {status_code}"),
-        output: truncate_text(&combined, MAX_TERMINAL_OUTPUT_CHARS),
-        cwd: final_cwd,
-    })
-    .into_response()
-}
-
-async fn agent_attachment(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<i64>,
-) -> Response {
-    if let Some(response) = raw_guard(&state, &headers) {
-        return response;
-    }
-    let row = {
-        let db = state.db.lock().unwrap();
-        db.query_row(
-            "SELECT original_name, content_type, file_path, size_bytes FROM agent_attachments WHERE id = ?1",
-            params![id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    PathBuf::from(row.get::<_, String>(2)?),
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .unwrap_or(None)
-    };
-    let Some((filename, content_type, path, size_bytes)) = row else {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    };
-    if size_bytes < 0 || size_bytes as usize > MAX_AGENT_UPLOAD_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large").into_response();
-    }
-    let Ok(path) = path.canonicalize() else {
-        return (StatusCode::NOT_FOUND, "missing file").into_response();
-    };
-    let Ok(root) = state.config.agent_upload_dir.canonicalize() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "bad upload dir").into_response();
-    };
-    if !path.starts_with(root) || !path.is_file() {
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-        return (StatusCode::NOT_FOUND, "missing file").into_response();
-    };
-    let ascii_name = filename
-        .chars()
-        .filter(|ch| ch.is_ascii() && *ch != '"')
-        .collect::<String>();
-    let disposition = if content_type.starts_with("image/") {
-        format!(
-            "inline; filename=\"{}\"",
-            if ascii_name.is_empty() {
-                "attachment"
-            } else {
-                &ascii_name
-            }
-        )
-    } else {
-        format!(
-            "attachment; filename=\"{}\"",
-            if ascii_name.is_empty() {
-                "attachment"
-            } else {
-                &ascii_name
-            }
-        )
-    };
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            ),
-            (
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_str(&disposition).unwrap(),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
 fn agent_run_for(state: &AppState, slot_id: i64) -> Option<AgentRun> {
     state.agent_jobs.lock().unwrap().get(&slot_id).cloned()
 }
@@ -2256,35 +1618,14 @@ fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotRuntime {
 }
 
 fn agent_slot_rail_html(state: &AppState, slots: &[AgentSlotRow], active_id: i64) -> String {
-    let rows = slots
-        .iter()
-        .map(|slot| {
-            let summary = agent_slot_summary(state, slot);
-            let active_class = if slot.id == active_id { " active" } else { "" };
-            let running_class = if summary.running { " running" } else { "" };
-            format!(
-                r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}">
-  <a class="channel-link" href="/agents?slot={}" aria-label="Open {}">
-    <strong>{}</strong>
-    <span data-slot-status>{}</span>
-    <span class="slot-badge" data-slot-badge hidden></span>
-  </a>
-</div>"#,
-                summary.id,
-                if summary.running { "true" } else { "false" },
-                summary.id,
-                html_escape(&summary.name),
-                html_escape(&summary.name),
-                html_escape(&summary.status)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let rows = slots.iter().map(|slot| {
+        let summary = agent_slot_summary(state, slot);
+        let active_class = if slot.id == active_id { " active" } else { "" };
+        let running_class = if summary.running { " running" } else { "" };
+        format!(r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}"><a class="channel-link" href="/agents?slot={}" aria-label="Open {}"><strong>{}</strong><span data-slot-status>{}</span><span class="slot-badge" data-slot-badge hidden></span></a></div>"#, summary.id, summary.running, summary.id, html_escape(&summary.name), html_escape(&summary.name), html_escape(&summary.status))
+    }).collect::<Vec<_>>().join("");
     format!(
-        r#"<aside class="channel-rail" aria-label="Agent sessions">
-  <div class="rail-title">Sessions</div>
-  <div class="channel-list">{rows}</div>
-</aside>"#
+        r#"<aside class="channel-rail" aria-label="Agent sessions"><div class="rail-title">Sessions</div><div class="channel-list">{rows}</div></aside>"#
     )
 }
 
@@ -2347,19 +1688,17 @@ fn agent_message_html(message: &AgentMessageRow) -> String {
         String::new()
     };
     let body = message_body_html(&message.body);
-    let attachment = agent_attachment_html(message);
     format!(
         r#"<article class="message message-{role_class}" data-message-entry>
   <div class="message-avatar">{avatar}</div>
   <div class="message-body">
     <div class="message-meta"><strong>{}</strong><span class="message-log">{}</span>{actions}</div>
-    {}{}
+    {}
   </div>
 </article>"#,
         html_escape(agent_role_label(&message.role)),
         html_escape(&compact_local_time(&message.created_at)),
-        body,
-        attachment
+        body
     )
 }
 
@@ -2443,27 +1782,6 @@ fn normalize_markdown_fences(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn agent_attachment_html(message: &AgentMessageRow) -> String {
-    message
-        .attachment
-        .as_ref()
-        .map(|attachment| {
-            let name = html_escape(&attachment.name);
-            if attachment.is_image {
-                format!(
-                    r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a><img class="message-image" src="/agents/attachments/{}" alt="">"#,
-                    attachment.id, name, attachment.id
-                )
-            } else {
-                format!(
-                    r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a>"#,
-                    attachment.id, name
-                )
-            }
-        })
-        .unwrap_or_default()
 }
 
 fn agent_role_class(role: &str) -> &'static str {
@@ -2609,155 +1927,24 @@ fn fenced_text(text: &str) -> &str {
         .unwrap_or("")
 }
 
-fn codex_browser_drawer_html(
-    projects: &[CodexProject],
-    conversations: &[CodexConversation],
-    slot_id: i64,
-    active_thread: Option<&str>,
+fn codex_usage_dialog(
+    config: &Config,
+    usage: Option<&CodexUsageSnapshot>,
     loaded: bool,
-    active_workdir: &str,
+    slot_id: i64,
 ) -> String {
-    let active_workdir = html_escape(active_workdir);
-    let mut groups = Vec::new();
-    for project in projects
-        .iter()
-        .filter(|project| project.conversation_count > 0)
-        .take(CODEX_PROJECT_DRAWER_LIMIT)
-    {
-        let project_conversations = conversations
-            .iter()
-            .filter(|conversation| conversation.cwd == project.path)
-            .take(CODEX_PROJECT_CONVERSATION_LIMIT)
-            .collect::<Vec<_>>();
-        if project_conversations.is_empty() {
-            continue;
-        }
-        let rows = project_conversations
-            .iter()
-            .enumerate()
-            .map(|(index, conversation)| {
-                let active_class = if Some(conversation.id.as_str()) == active_thread {
-                    " active"
-                } else {
-                    ""
-                };
-                let extra_attr = if index >= CODEX_PROJECT_VISIBLE_CONVERSATIONS {
-                    " data-extra-conversation hidden"
-                } else {
-                    ""
-                };
-                let title = html_escape(&conversation.title);
-                let preview = html_escape(&truncate_text(&conversation.preview, 92));
-                let updated = html_escape(&compact_local_time(&conversation.updated_at));
-                let workdir = html_escape(&conversation.cwd);
-                let thread_id = html_escape(&conversation.id);
-                format!(
-                    r#"<form class="browser-conversation-row{active_class}"{extra_attr} action="/agents/slots/{slot_id}/conversation" method="post">
-  <input type="hidden" name="thread_id" value="{thread_id}">
-  <input type="hidden" name="workdir" value="{workdir}">
-  <button type="submit"><strong>{title}</strong><span>{updated} · {} msgs · {preview}</span></button>
-</form>"#,
-                    conversation.message_count
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        let hidden = project_conversations
-            .len()
-            .saturating_sub(CODEX_PROJECT_VISIBLE_CONVERSATIONS);
-        let more = if hidden > 0 {
-            format!(
-                r#"<button type="button" class="ghost browser-more" data-load-more>Load more ({hidden})</button>"#
-            )
-        } else {
-            String::new()
-        };
-        let trust = if project.trusted {
-            "trusted"
-        } else {
-            "project"
-        };
-        let project_path = html_escape(&project.path);
-        let project_name = html_escape(&project.name);
-        let project_search = html_attr_escape(&format!("{} {}", project.name, project.path));
-        groups.push(format!(
-            r#"<section class="browser-project" data-project-group data-project-search="{project_search}">
-  <div class="browser-project-head" title="{project_path}">
-    <div><strong>{project_name}</strong><span>{} chats · {trust}</span></div>
-    <form action="/agents/slots/{slot_id}/new" method="post">
-      <input type="hidden" name="workdir" value="{project_path}">
-      <button type="submit" class="ghost">New</button>
-    </form>
-  </div>
-  <div class="browser-conversations">{rows}</div>
-  {more}
-</section>"#,
-            project.conversation_count
-        ));
-    }
-    let body = if !loaded {
-        r#"<p class="empty">Loading saved Codex conversations...</p>"#.into()
-    } else if groups.is_empty() {
-        r#"<p class="empty">No saved Codex conversations found yet.</p>"#.into()
-    } else {
-        groups.join("")
-    };
-    format!(
-        r#"<dialog class="browser-drawer" id="conversationDrawer">
-  <header>
-    <div><strong>Conversations</strong><br><span>Projects with saved Codex sessions</span></div>
-    <div class="browser-head-actions">
-      <form action="/agents" method="get" data-refresh-form>
-        <input type="hidden" name="slot" value="{slot_id}">
-        <input type="hidden" name="refresh" value="1">
-        <input type="hidden" name="browse" value="1">
-        <button type="submit" class="ghost nav-icon browser-refresh" aria-label="Refresh projects" title="Refresh projects" data-refresh-button>↻</button>
-      </form>
-      <button type="button" class="icon" data-browser-close aria-label="Close">x</button>
-    </div>
-  </header>
-  <main class="browser-scroll">
-    <section class="browser-tools">
-      <div class="browser-tool-row">
-        <button type="button" class="browser-tool-button" aria-label="Search repositories" title="Search repositories" aria-expanded="false" aria-controls="browserSearchPanel" data-browser-search-toggle>🔍</button>
-        <button type="button" class="browser-tool-button" aria-label="Add new" title="Add new" aria-expanded="false" aria-controls="browserNewPanel" data-browser-new-toggle>➕</button>
-      </div>
-      <div class="browser-tool-panel browser-search" id="browserSearchPanel" data-browser-search-panel hidden>
-        <label class="browser-search-body">
-          <span>Search repositories</span>
-          <input type="search" placeholder="Repository or folder" autocomplete="off" autocapitalize="off" spellcheck="false" data-browser-search>
-        </label>
-      </div>
-      <div class="browser-tool-panel browser-new" id="browserNewPanel" data-browser-new-panel hidden>
-        <form class="browser-new-current" action="/agents/slots/{slot_id}/new" method="post">
-          <input type="hidden" name="workdir" value="{active_workdir}">
-          <button type="submit">New current</button>
-        </form>
-        <form class="browser-new-path" action="/agents/slots/{slot_id}/new" method="post">
-          <input name="workdir" placeholder="Folder path" autocomplete="off" autocapitalize="off" spellcheck="false">
-          <label class="browser-check"><input type="checkbox" name="create" value="1"><span>Create folder</span></label>
-          <button type="submit">Start</button>
-        </form>
-      </div>
-    </section>
-    {body}
-    <p class="empty browser-empty-search" data-browser-empty-search hidden>No matching repositories or folders.</p>
-  </main>
-</dialog>"#
-    )
-}
-
-fn codex_usage_dialog(config: &Config, usage: Option<&CodexUsageSnapshot>, loaded: bool) -> String {
     let command = html_escape(&agent_command_label(config));
     let reset_available = usage
         .and_then(|usage| usage.reset_credits.as_ref())
         .is_some_and(|credits| credits.available_count > 0);
     let reset = if config.codex_reset_command.is_some() || reset_available {
-        r#"<form class="reset-form" action="/agents/codex/reset" method="post" data-reset-form>
+        format!(
+            r#"<form class="reset-form" action="/agents/codex/reset" method="post" data-reset-form>
   <input type="hidden" name="confirm" value="USE_RESET">
+  <input type="hidden" name="slot_id" value="{slot_id}">
   <button type="submit" class="danger-icon ghost">Use reset</button>
 </form>"#
-            .to_string()
+        )
     } else {
         r#"<button type="button" class="ghost" disabled title="No Codex reset credits are currently reported.">Use reset</button>"#.to_string()
     };
@@ -2804,7 +1991,7 @@ fn codex_usage_dialog(config: &Config, usage: Option<&CodexUsageSnapshot>, loade
     };
     format!(
         r#"<dialog class="codex-panel" id="codexPanel">
-  <header><strong>Codex Usage</strong><button type="button" class="icon" data-codex-close aria-label="Close">x</button></header>
+  <header><strong>Codex Usage</strong><div class="usage-head-actions"><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{slot_id}"><input type="hidden" name="refresh" value="1"><input type="hidden" name="usage" value="1"><button type="submit" class="ghost nav-icon usage-refresh" aria-label="Refresh Codex usage" title="Refresh Codex usage" data-refresh-button>↻</button></form><button type="button" class="icon" data-codex-close aria-label="Close">x</button></div></header>
   <main>{body}</main>
 </dialog>"#
     )
@@ -2820,8 +2007,7 @@ fn usage_window_card(fallback_label: &str, window: Option<&CodexRateWindow>) -> 
     let remaining = window.remaining_percent.clamp(0.0, 100.0);
     let reset = window
         .resets_at
-        .and_then(epoch_to_rfc3339)
-        .map(|value| short_time(&value))
+        .map(format_epoch_date)
         .unwrap_or_else(|| "unknown".into());
     format!(
         r#"<section class="usage-card"><strong>{}</strong><span>{:.0}% remaining · {:.0}% used</span><div class="meter" title="{:.0}% remaining"><span style="width:{:.0}%"></span></div><span class="muted">{} window · resets {}</span></section>"#,
@@ -2841,8 +2027,7 @@ fn usage_reset_line(fallback_label: &str, window: Option<&CodexRateWindow>) -> S
     };
     let reset = window
         .resets_at
-        .and_then(epoch_to_rfc3339)
-        .map(|value| short_time(&value))
+        .map(format_epoch_date)
         .unwrap_or_else(|| "unknown".into());
     format!(
         r#"<span>{}: {} window resets {}</span>"#,
@@ -2862,6 +2047,16 @@ fn codex_reset_credit_text(credits: Option<&CodexResetCreditsSummary>) -> String
         return format!("{count} {label} available · local expiry tracking not initialized yet");
     };
     let mut parts = vec![format!("{count} {label} available")];
+    for (index, credit) in credits.credits.iter().enumerate() {
+        let expiry = credit
+            .expires_at
+            .map(format_epoch_date)
+            .unwrap_or_else(|| "expiry unknown".into());
+        parts.push(format!("{} {} · expires {expiry}", index + 1, credit.title));
+    }
+    if !credits.credits.is_empty() {
+        return parts.join(" · ");
+    }
     if estimate.tracked_available_count > 0 {
         let tracked_label = if estimate.tracked_available_count == 1 {
             "tracked credit"
@@ -2997,16 +2192,6 @@ fn get_agent_slot(db: &Connection, id: i64) -> rusqlite::Result<Option<AgentSlot
     .optional()
 }
 
-fn agent_slot_name_exists(db: &Connection, name: &str) -> rusqlite::Result<bool> {
-    db.query_row(
-        "SELECT 1 FROM agent_slots WHERE name = ?1",
-        params![name],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|value| value.is_some())
-}
-
 fn ensure_agent_slot(db: &Connection, name: &str, workdir: &Path) -> rusqlite::Result<i64> {
     let existing = db
         .query_row(
@@ -3023,53 +2208,6 @@ fn ensure_agent_slot(db: &Connection, name: &str, workdir: &Path) -> rusqlite::R
         params![name, workdir.to_string_lossy(), Utc::now().to_rfc3339()],
     )?;
     Ok(db.last_insert_rowid())
-}
-
-fn create_parallel_agent_slot(
-    db: &Connection,
-    source: &AgentSlotRow,
-    workdir: &Path,
-) -> rusqlite::Result<AgentSlotRow> {
-    let base = parallel_agent_slot_base(&source.name);
-    let name = next_parallel_agent_slot_name(db, &base)?;
-    let workdir = workdir.to_string_lossy().to_string();
-    db.execute(
-        "INSERT INTO agent_slots (name, workdir, goal, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![name, workdir, source.goal, Utc::now().to_rfc3339()],
-    )?;
-    Ok(AgentSlotRow {
-        id: db.last_insert_rowid(),
-        name,
-        workdir,
-        goal: source.goal.clone(),
-    })
-}
-
-fn parallel_agent_slot_base(name: &str) -> String {
-    let normalized = normalize_agent_slot_name(name);
-    let base = normalized
-        .rsplit_once('-')
-        .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
-        .map(|(base, _)| base)
-        .unwrap_or(&normalized);
-    if base.is_empty() {
-        "codex".into()
-    } else {
-        base.to_string()
-    }
-}
-
-fn next_parallel_agent_slot_name(db: &Connection, base: &str) -> rusqlite::Result<String> {
-    for number in 2..10_000 {
-        let suffix = format!("-{number}");
-        let stem_len = MAX_AGENT_SLOT_CHARS.saturating_sub(suffix.len()).max(1);
-        let stem = base.chars().take(stem_len).collect::<String>();
-        let candidate = format!("{stem}{suffix}");
-        if !agent_slot_name_exists(db, &candidate)? {
-            return Ok(candidate);
-        }
-    }
-    Err(rusqlite::Error::InvalidQuery)
 }
 
 fn ensure_agent_slot_seeds(
@@ -3262,37 +2400,6 @@ fn reset_agent_slot_chat(state: &AppState, slot_id: i64, workdir: &Path) -> bool
     stopped
 }
 
-async fn save_agent_upload(
-    state: &AppState,
-    slot: &AgentSlotRow,
-    upload: PendingUpload,
-) -> io::Result<i64> {
-    let safe_name = sanitize_filename(&upload.filename);
-    let stored_name = format!("{}-{safe_name}", Uuid::new_v4().simple());
-    let slot_dir = state
-        .config
-        .agent_upload_dir
-        .join(format!("slot-{}", slot.id));
-    tokio::fs::create_dir_all(&slot_dir).await?;
-    let path = slot_dir.join(&stored_name);
-    tokio::fs::write(&path, &upload.bytes).await?;
-    let db = state.db.lock().unwrap();
-    db.execute(
-        "INSERT INTO agent_attachments (slot_id, original_name, stored_name, content_type, file_path, size_bytes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            slot.id,
-            upload.filename,
-            stored_name,
-            upload.content_type,
-            path.to_string_lossy(),
-            upload.bytes.len() as i64,
-            Utc::now().to_rfc3339()
-        ],
-    )
-    .map_err(io_other)?;
-    Ok(db.last_insert_rowid())
-}
-
 fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) -> bool {
     let trimmed = body.trim();
     let Some((prefix, raw_text)) = agent_control_text(trimmed) else {
@@ -3353,33 +2460,31 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         append_agent_assistant(state, slot.id, &agent_slots_status_text(state));
         return true;
     }
-    if lower == "pwd" {
-        append_agent_assistant(
-            state,
-            slot.id,
-            &format!("{} folder: `{}`", slot.name, slot.workdir),
-        );
-        return true;
-    }
     if lower == "status" {
         let runtime = agent_slot_runtime(state, slot);
-        let usage = codex_index_snapshot(state).and_then(|index| index.usage);
+        let usage = refresh_codex_index_blocking(state).usage;
         append_agent_assistant(
             state,
             slot.id,
             &format!(
-                "{} is {}. Folder: `{}`\n{}",
+                "{} is {}.\n{}",
                 slot.name,
                 runtime.label,
-                slot.workdir,
                 codex_usage_text(usage.as_ref())
             ),
         );
         return true;
     }
     if lower == "usage" || lower == "limits" {
-        let usage = codex_index_snapshot(state).and_then(|index| index.usage);
-        append_agent_assistant(state, slot.id, &codex_usage_text(usage.as_ref()));
+        let usage = refresh_codex_index_blocking(state).usage;
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!(
+                "{}\n\nOpen the 📊 Usage panel to refresh again or use a reset credit manually.",
+                codex_usage_text(usage.as_ref())
+            ),
+        );
         return true;
     }
     if lower == "model" || lower == "settings" {
@@ -3393,23 +2498,9 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         );
         return true;
     }
-    if matches!(lower.as_str(), "fresh" | "new" | "stayfresh") {
-        let keep_workdir = lower == "stayfresh";
-        let workdir = if keep_workdir {
-            slot.workdir.clone()
-        } else {
-            state
-                .config
-                .agent_default_workdir
-                .to_string_lossy()
-                .to_string()
-        };
+    if matches!(lower.as_str(), "fresh" | "new") {
+        let workdir = slot.workdir.clone();
         let stopped = reset_agent_slot_chat(state, slot.id, Path::new(&workdir));
-        let folder_text = if keep_workdir {
-            format!("Folder kept at `{workdir}`.")
-        } else {
-            format!("Folder reset to `{workdir}`.")
-        };
         let stop_text = if stopped {
             " Stopped the current job."
         } else {
@@ -3419,7 +2510,7 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
             state,
             slot.id,
             &format!(
-                "{} chat reset. {folder_text}{stop_text} Your next message starts a new agent chat.",
+                "{} chat reset.{stop_text} Your next message starts a new agent chat.",
                 slot.name
             ),
         );
@@ -3457,41 +2548,6 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
             slot.id,
             &format!("Cleared {cleared} queued follow-up(s) for {}.", slot.name),
         );
-        return true;
-    }
-    if let Some(arg) = command_arg(&text, "cd") {
-        let target = if arg.trim().is_empty() {
-            default_home_dir()
-        } else {
-            resolve_agent_path(arg, &slot.workdir)
-        };
-        if target.is_dir() {
-            let db = state.db.lock().unwrap();
-            let _ = db.execute(
-                "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
-                params![target.to_string_lossy(), slot.id],
-            );
-            let _ = db.execute(
-                "DELETE FROM agent_sessions WHERE slot_id = ?1",
-                params![slot.id],
-            );
-            drop(db);
-            append_agent_assistant(
-                state,
-                slot.id,
-                &format!("{} folder set to `{}`", slot.name, target.display()),
-            );
-        } else {
-            append_agent_assistant(
-                state,
-                slot.id,
-                &format!("Folder does not exist: `{}`", target.display()),
-            );
-        }
-        return true;
-    }
-    if let Some(arg) = command_arg(&text, "ls") {
-        append_agent_assistant(state, slot.id, &list_agent_path_text(slot, arg));
         return true;
     }
     append_agent_assistant(
@@ -3670,11 +2726,7 @@ fn agent_help_text(state: &AppState) -> String {
             "- `/goal` shows the current goal",
             "- `/goal clear` or `/clear-goal` clears it",
             "- `/slots`",
-            "- `/pwd`",
-            "- `/ls [path]`",
-            "- `/cd [path]`",
             "- `/fresh`",
-            "- `/stayfresh`",
             "- `/status`",
             "- `/usage`",
             "- `/stop`",
@@ -3687,10 +2739,7 @@ fn agent_help_text(state: &AppState) -> String {
         .map(str::to_string),
     );
     lines.push(String::new());
-    lines.push("Slots:".into());
-    for slot in slots {
-        lines.push(format!("- `{}` at `{}`", slot.name, slot.workdir));
-    }
+    lines.push(format!("{} slots configured.", slots.len()));
     lines.join("\n")
 }
 
@@ -3715,12 +2764,11 @@ fn agent_slots_status_text(state: &AppState) -> String {
             );
             let goal = slot.goal.trim();
             if goal.is_empty() {
-                format!("{}: {status} | {}", slot.name, slot.workdir)
+                format!("{}: {status}", slot.name)
             } else {
                 format!(
-                    "{}: {status} | {} | goal: {}",
+                    "{}: {status} | goal: {}",
                     slot.name,
-                    slot.workdir,
                     truncate_text(goal, 120)
                 )
             }
@@ -3728,57 +2776,6 @@ fn agent_slots_status_text(state: &AppState) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("Slots:\n```text\n{lines}\n```")
-}
-
-fn list_agent_path_text(slot: &AgentSlotRow, arg: &str) -> String {
-    let target = if arg.trim().is_empty() {
-        PathBuf::from(&slot.workdir)
-    } else {
-        resolve_agent_path(arg, &slot.workdir)
-    };
-    if !target.exists() {
-        return format!("Path does not exist: `{}`", target.display());
-    }
-    if target.is_file() {
-        return format!("{} file:\n```text\n{}\n```", slot.name, target.display());
-    }
-    if !target.is_dir() {
-        return format!("Path is not a directory: `{}`", target.display());
-    }
-    let mut rows = match fs::read_dir(&target) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    return None;
-                }
-                let suffix = if path.is_dir() { "/" } else { "" };
-                Some((
-                    if path.is_dir() { 0 } else { 1 },
-                    name.to_lowercase(),
-                    format!("{name}{suffix}"),
-                ))
-            })
-            .collect::<Vec<_>>(),
-        Err(err) => return format!("Could not list `{}`: {err}", target.display()),
-    };
-    rows.sort();
-    let mut names = rows
-        .into_iter()
-        .take(120)
-        .map(|(_, _, name)| name)
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        names.push("(empty)".into());
-    }
-    format!(
-        "{} listing `{}`:\n```text\n{}\n```",
-        slot.name,
-        target.display(),
-        names.join("\n")
-    )
 }
 
 fn load_codex_index(config: &Config) -> CodexIndex {
@@ -3794,36 +2791,6 @@ fn load_codex_index(config: &Config) -> CodexIndex {
     conversations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     conversations.truncate(MAX_CODEX_CONVERSATIONS);
 
-    let mut projects = configured_codex_projects(&config.codex_home);
-    for conversation in &conversations {
-        projects
-            .entry(conversation.cwd.clone())
-            .and_modify(|project| {
-                project.conversation_count += 1;
-                project.latest_activity = newest_activity(
-                    project.latest_activity.as_deref(),
-                    Some(&conversation.updated_at),
-                );
-            })
-            .or_insert_with(|| CodexProject {
-                path: conversation.cwd.clone(),
-                name: project_display_name(&conversation.cwd),
-                trusted: false,
-                conversation_count: 1,
-                latest_activity: Some(conversation.updated_at.clone()),
-            });
-    }
-    for project in projects.values_mut() {
-        if project.conversation_count == 0 {
-            project.conversation_count = conversations
-                .iter()
-                .filter(|conversation| conversation.cwd == project.path)
-                .count();
-        }
-    }
-    let mut projects = projects.into_values().collect::<Vec<_>>();
-    sort_codex_projects_by_activity(&mut projects);
-
     let dashboard = fetch_codex_app_server_dashboard(config);
     let usage =
         merge_codex_rate_limit_status(latest_codex_usage(&files), dashboard.rate_limits.as_ref());
@@ -3831,37 +2798,7 @@ fn load_codex_index(config: &Config) -> CodexIndex {
     CodexIndex {
         usage,
         conversations,
-        projects,
     }
-}
-
-fn newest_activity(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    match (left, right) {
-        (Some(left), Some(right)) if left >= right => Some(left.to_string()),
-        (Some(_), Some(right)) => Some(right.to_string()),
-        (Some(left), None) => Some(left.to_string()),
-        (None, Some(right)) => Some(right.to_string()),
-        (None, None) => None,
-    }
-}
-
-fn sort_codex_projects_by_activity(projects: &mut [CodexProject]) {
-    projects.sort_by(|left, right| {
-        right
-            .latest_activity
-            .cmp(&left.latest_activity)
-            .then_with(|| right.conversation_count.cmp(&left.conversation_count))
-            .then_with(|| match (left.trusted, right.trusted) {
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                _ => Ordering::Equal,
-            })
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-    });
 }
 
 fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, (String, String)> {
@@ -4574,40 +3511,34 @@ fn codex_reset_credits_summary(
         .get("available_count")
         .or_else(|| value.get("availableCount"))
         .and_then(|value| value.as_i64())?;
+    let credits = value
+        .get("credits")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|credit| {
+            credit
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_none_or(|status| status == "available")
+        })
+        .map(|credit| CodexResetCredit {
+            title: credit
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Reset credit")
+                .to_string(),
+            expires_at: credit
+                .get("expiresAt")
+                .or_else(|| credit.get("expires_at"))
+                .and_then(|value| value.as_i64()),
+        })
+        .collect();
     Some(CodexResetCreditsSummary {
         available_count,
+        credits,
         estimate: None,
     })
-}
-
-fn configured_codex_projects(codex_home: &Path) -> HashMap<String, CodexProject> {
-    let mut projects = HashMap::new();
-    let Ok(raw) = fs::read_to_string(codex_home.join("config.toml")) else {
-        return projects;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-        return projects;
-    };
-    let Some(table) = value.get("projects").and_then(|value| value.as_table()) else {
-        return projects;
-    };
-    for (path, details) in table {
-        let trusted = details
-            .get("trust_level")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("trusted"));
-        projects.insert(
-            path.to_string(),
-            CodexProject {
-                path: path.to_string(),
-                name: project_display_name(path),
-                trusted,
-                conversation_count: 0,
-                latest_activity: None,
-            },
-        );
-    }
-    projects
 }
 
 fn codex_conversation_by_id<'a>(
@@ -5454,15 +4385,6 @@ fn yaml_string_field(line: &str, field: &str) -> Option<String> {
     )
 }
 
-fn resolve_agent_path(raw: &str, base: &str) -> PathBuf {
-    let expanded = expand_local_path(raw.trim());
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        Path::new(base).join(expanded)
-    }
-}
-
 fn default_home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -5584,44 +4506,6 @@ fn normalize_agent_slot_name(value: &str) -> String {
         .collect()
 }
 
-fn sanitize_filename(value: &str) -> String {
-    let sanitized = value
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string();
-    if sanitized.is_empty() {
-        "attachment".into()
-    } else {
-        sanitized.chars().take(120).collect()
-    }
-}
-
-fn project_display_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".into();
-    }
-    Path::new(trimmed)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
-fn url_encode(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
 fn file_modified(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -5634,6 +4518,20 @@ fn system_time_to_rfc3339(value: SystemTime) -> String {
 
 fn epoch_to_rfc3339(epoch: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(epoch, 0).map(|value| value.to_rfc3339())
+}
+
+fn format_epoch_date(epoch: i64) -> String {
+    let Some(value) = epoch_to_rfc3339(epoch) else {
+        return "unknown".into();
+    };
+    let exact = DateTime::parse_from_rfc3339(&value)
+        .map(|date| {
+            date.with_timezone(&Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.clone());
+    format!("{} ({exact})", short_time(&value))
 }
 
 fn short_time(value: &str) -> String {
@@ -5718,31 +4616,6 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(20);
     value.chars().take(keep).collect::<String>() + "\n...[truncated]"
-}
-
-fn terminal_visible_stdout(
-    stdout: &str,
-    marker: &str,
-    fallback_cwd: &str,
-) -> (String, Option<i32>, String) {
-    let status_prefix = format!("{marker}STATUS:");
-    let pwd_prefix = format!("{marker}PWD:");
-    let mut visible = String::new();
-    let mut exit_code = None;
-    let mut cwd = fallback_cwd.to_string();
-    for chunk in stdout.split_inclusive('\n') {
-        let line = chunk.trim_end_matches(|ch| ch == '\r' || ch == '\n');
-        if let Some(rest) = line.strip_prefix(&status_prefix) {
-            exit_code = rest.trim().parse::<i32>().ok();
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(&pwd_prefix) {
-            cwd = rest.trim().to_string();
-            continue;
-        }
-        visible.push_str(chunk);
-    }
-    (visible, exit_code, cwd)
 }
 
 fn page(title: &str, body: &str) -> Response {
@@ -6266,7 +5139,6 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             db_path: PathBuf::new(),
             agent_default_workdir: PathBuf::new(),
-            agent_upload_dir: PathBuf::new(),
             agent_codex_bin: "codex".into(),
             agent_codex_args: Vec::new(),
             agent_progress_notes: false,
@@ -6313,7 +5185,7 @@ mod tests {
     fn slash_command_prefixes_autocorrect_when_unambiguous() {
         assert_eq!(normalize_agent_command_text("go ship it"), "goal ship it");
         assert_eq!(normalize_agent_command_text("mod"), "model");
-        assert_eq!(normalize_agent_command_text("sta"), "sta");
+        assert_eq!(normalize_agent_command_text("sta"), "status");
     }
 
     #[test]
@@ -6404,7 +5276,6 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             db_path: PathBuf::new(),
             agent_default_workdir: PathBuf::new(),
-            agent_upload_dir: PathBuf::new(),
             agent_codex_bin: "/usr/local/bin/codexunsafe".into(),
             agent_codex_args: vec![
                 "--dangerously-bypass-approvals-and-sandbox".into(),
@@ -6550,21 +5421,6 @@ mod tests {
     }
 
     #[test]
-    fn parallel_agent_slot_names_increment_from_base_lane() {
-        let db = Connection::open_in_memory().unwrap();
-        db_migrations::migrate(&db).unwrap();
-        let slot_id = ensure_agent_slot(&db, "codex", Path::new("/work/one")).unwrap();
-        let slot = get_agent_slot(&db, slot_id).unwrap().unwrap();
-
-        let second = create_parallel_agent_slot(&db, &slot, Path::new("/work/two")).unwrap();
-        let third = create_parallel_agent_slot(&db, &second, Path::new("/work/three")).unwrap();
-
-        assert_eq!(second.name, "codex-2");
-        assert_eq!(third.name, "codex-3");
-        assert_eq!(third.workdir, "/work/three");
-    }
-
-    #[test]
     fn prefixed_messages_are_control_requests() {
         assert!(looks_like_agent_control_request("/status"));
         assert!(looks_like_agent_control_request("!stop"));
@@ -6650,43 +5506,6 @@ mod tests {
             created_at: "2026-06-29T12:00:00Z".into(),
             attachment: None,
         }
-    }
-
-    #[test]
-    fn codex_projects_sort_by_recent_activity() {
-        let mut projects = vec![
-            CodexProject {
-                path: "/work/old".into(),
-                name: "Old".into(),
-                trusted: false,
-                conversation_count: 12,
-                latest_activity: Some("2026-06-20T10:00:00Z".into()),
-            },
-            CodexProject {
-                path: "/work/empty".into(),
-                name: "Empty".into(),
-                trusted: true,
-                conversation_count: 0,
-                latest_activity: None,
-            },
-            CodexProject {
-                path: "/work/new".into(),
-                name: "New".into(),
-                trusted: false,
-                conversation_count: 1,
-                latest_activity: Some("2026-06-29T08:00:00Z".into()),
-            },
-        ];
-
-        sort_codex_projects_by_activity(&mut projects);
-
-        assert_eq!(
-            projects
-                .iter()
-                .map(|project| project.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["New", "Old", "Empty"]
-        );
     }
 
     #[test]
@@ -6872,6 +5691,19 @@ mod tests {
         assert_eq!(window.used_percent, 35.0);
         assert_eq!(window.window_minutes, 300);
         assert_eq!(window.resets_at, Some(1782210186));
+
+        let reset_credits = serde_json::json!({
+            "availableCount": 1,
+            "credits": [{
+                "status": "available",
+                "title": "Full reset (Weekly + 5 hr)",
+                "expiresAt": 1785527935
+            }]
+        });
+        let summary = codex_reset_credits_summary(Some(&reset_credits)).unwrap();
+        assert_eq!(summary.available_count, 1);
+        assert_eq!(summary.credits.len(), 1);
+        assert_eq!(summary.credits[0].expires_at, Some(1785527935));
     }
 
     #[test]
@@ -6889,7 +5721,6 @@ mod tests {
                 bind: "127.0.0.1:0".into(),
                 db_path: PathBuf::new(),
                 agent_default_workdir: dir.clone(),
-                agent_upload_dir: PathBuf::new(),
                 agent_codex_bin: "codex".into(),
                 agent_codex_args: Vec::new(),
                 agent_progress_notes: false,
@@ -6923,7 +5754,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_agent_slot_chat_updates_workdir_and_clears_local_chat() {
+    fn reset_agent_slot_chat_clears_local_chat() {
         let old_dir = env::temp_dir().join(format!("mobailmux-old-{}", Uuid::new_v4().simple()));
         let new_dir = env::temp_dir().join(format!("mobailmux-new-{}", Uuid::new_v4().simple()));
         fs::create_dir_all(&old_dir).unwrap();
@@ -6945,7 +5776,6 @@ mod tests {
                 bind: "127.0.0.1:0".into(),
                 db_path: PathBuf::new(),
                 agent_default_workdir: old_dir.clone(),
-                agent_upload_dir: PathBuf::new(),
                 agent_codex_bin: "codex".into(),
                 agent_codex_args: Vec::new(),
                 agent_progress_notes: false,

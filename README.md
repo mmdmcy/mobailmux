@@ -9,12 +9,10 @@ and stop Codex work.
 ## Current Shape
 
 - Rust web service for Agents at `/` and `/agents`.
-- SQLite storage for agent messages, attachments, and saved Codex threads.
-- Saved Codex conversation browser and usage/reset panel.
+- SQLite storage for agent messages and saved Codex thread identifiers.
+- Codex usage and manually confirmed reset controls.
 - Existing `commands/bin/mbx` tmux helper remains available for terminal slots.
 - Private-by-default: run behind localhost, LAN, VPN, or tailnet access.
-
-For a source/runtime map, see `docs/where-things-live.md`.
 
 ## Run The Rust Web UI
 
@@ -37,7 +35,6 @@ MOBAILMUX_AUTH_DISABLED=1 cargo run -- serve
 MOBAILMUX_BIND=127.0.0.1:8765
 MOBAILMUX_DB=data/mobailmux.sqlite
 MOBAILMUX_AGENT_DEFAULT_WORKDIR=~
-MOBAILMUX_AGENT_UPLOAD_DIR=data/agent-uploads
 MOBAILMUX_AGENT_SLOTS=codex
 MOBAILMUX_AGENT_CODEX_BIN=codex
 MOBAILMUX_AGENT_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
@@ -103,5 +100,5 @@ cargo test
 cargo run -- audit-public
 ```
 
-Keep real `.env` files, databases, uploads, logs, local service units, and
+Keep real `.env` files, databases, logs, local service units, and
 host-specific deployment state out of this repository.

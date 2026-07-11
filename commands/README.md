@@ -3,7 +3,7 @@
 This package installs `mbx`, a small command system for managing numbered
 tmux sessions that run Codex.
 
-It does not require the Mobailmux web UI or Mattermost connector.
+It does not require the Mobailmux web UI.
 
 ## Install
 
