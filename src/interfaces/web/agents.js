@@ -67,9 +67,15 @@
       syncReasoningPicker(null, "");
       return;
     }
-    const previousModel = modelPicker.value || storedValue(modelStorageKey);
-    const previousEffort = reasoningPicker?.value || storedValue(reasoningStorageKey);
-    const selectedModel = catalogModel(models, previousModel) || defaultCatalogModel(models);
+    const currentModel = catalogModel(models, modelPicker.value);
+    const storedModel = catalogModel(models, storedValue(modelStorageKey));
+    const selectedModel = currentModel || storedModel || defaultCatalogModel(models);
+    const supportedEfforts = selectedModel?.supported_reasoning_efforts || [];
+    const currentEffort = reasoningPicker?.value || "";
+    const storedEffort = storedValue(reasoningStorageKey);
+    const previousEffort = supportedEfforts.some((item) => item.effort === currentEffort)
+      ? currentEffort
+      : storedEffort;
     modelPicker.replaceChildren();
     models.forEach((model) => setOption(modelPicker, model.model, model.display_name || model.model, model.description));
     modelPicker.value = selectedModel.model;
