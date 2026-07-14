@@ -1,4 +1,3 @@
-use crate::AgentRunSettings;
 use crate::AppState;
 use crate::CodexIndexCache;
 use crate::CodexModelCatalogCache;
@@ -7,19 +6,18 @@ use crate::Connection;
 use crate::HashMap;
 use crate::Mutex;
 use crate::PathBuf;
-use crate::QueuedAgentRequest;
 use crate::Uuid;
-use crate::agent_queue_len;
 use crate::agent_session;
 use crate::append_agent_message;
+use crate::create_parallel_agent_slot;
 use crate::ensure_agent_slot;
 use crate::env;
 use crate::fs;
 use crate::get_agent_slot;
 use crate::list_agent_messages;
 use crate::mark_interrupted_agent_runs;
-use crate::queue_agent_request;
 use crate::reset_agent_slot_chat;
+use crate::set_agent_goal;
 use crate::set_agent_session;
 
 use crate::persistence;
@@ -52,7 +50,6 @@ use crate::persistence;
             },
             agent_jobs: Mutex::new(HashMap::new()),
             agent_cancels: Mutex::new(HashMap::new()),
-            agent_queues: Mutex::new(HashMap::new()),
             codex_index: Mutex::new(CodexIndexCache::default()),
             codex_models: Mutex::new(CodexModelCatalogCache::default()),
         };
@@ -107,22 +104,9 @@ use crate::persistence;
             },
             agent_jobs: Mutex::new(HashMap::new()),
             agent_cancels: Mutex::new(HashMap::new()),
-            agent_queues: Mutex::new(HashMap::new()),
             codex_index: Mutex::new(CodexIndexCache::default()),
             codex_models: Mutex::new(CodexModelCatalogCache::default()),
         };
-        assert_eq!(
-            queue_agent_request(
-                &state,
-                slot_id,
-                QueuedAgentRequest {
-                    body: "next".into(),
-                    settings: AgentRunSettings::default(),
-                },
-            ),
-            1
-        );
-
         assert!(!reset_agent_slot_chat(&state, slot_id, &new_dir));
 
         let db = state.db.lock().unwrap();
@@ -131,7 +115,28 @@ use crate::persistence;
         assert!(agent_session(&db, slot_id).unwrap().is_none());
         assert!(list_agent_messages(&db, slot_id).unwrap().is_empty());
         drop(db);
-        assert_eq!(agent_queue_len(&state, slot_id), 0);
         fs::remove_dir_all(old_dir).unwrap();
         fs::remove_dir_all(new_dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_agent_slots_get_unique_names_and_copy_context() {
+        let dir = env::temp_dir().join(format!("mobailmux-lanes-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        persistence::migrations::migrate(&db).unwrap();
+        let slot_id = ensure_agent_slot(&db, "project", &dir).unwrap();
+        set_agent_goal(&db, slot_id, "ship the project").unwrap();
+        let source = get_agent_slot(&db, slot_id).unwrap().unwrap();
+
+        let second = create_parallel_agent_slot(&db, &source).unwrap();
+        let third = create_parallel_agent_slot(&db, &source).unwrap();
+
+        assert_eq!(second.name, "project-2");
+        assert_eq!(third.name, "project-3");
+        assert_eq!(second.workdir, source.workdir);
+        assert_eq!(second.goal, source.goal);
+        assert_eq!(third.workdir, source.workdir);
+        assert_eq!(third.goal, source.goal);
+        fs::remove_dir_all(dir).unwrap();
     }

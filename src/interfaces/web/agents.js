@@ -19,7 +19,7 @@
   const reasoningStorageKey = "mobailmux.agent.reasoning";
   let selectedSuggestion = 0;
   const viewingTranscript = {viewing_transcript};
-  const activeSlotId = "{}";
+  const activeSlotId = "{active_slot_id}";
   const slotRows = new Map();
   function storedValue(key) {
     try { return window.localStorage.getItem(key) || ""; } catch (_) { return ""; }
@@ -153,6 +153,20 @@
   document.querySelector("[data-codex-open]")?.addEventListener("click", () => openDialog(codexPanel));
   document.querySelector("[data-codex-close]")?.addEventListener("click", () => closeDialog(codexPanel));
   if ({reopen_usage}) openDialog(codexPanel);
+  const projectPanel = document.getElementById("projectPanel");
+  const projectForm = document.querySelector("[data-project-form]");
+  document.querySelector("[data-project-open]")?.addEventListener("click", () => {
+    openDialog(projectPanel);
+    window.setTimeout(() => projectForm?.elements.workdir?.focus(), 0);
+  });
+  document.querySelector("[data-project-close]")?.addEventListener("click", () => closeDialog(projectPanel));
+  projectForm?.addEventListener("submit", () => {
+    const projectModel = projectForm.querySelector("[data-project-model]");
+    const projectReasoning = projectForm.querySelector("[data-project-reasoning]");
+    if (projectModel && modelPicker) projectModel.value = modelPicker.value;
+    if (projectReasoning && reasoningPicker) projectReasoning.value = reasoningPicker.value;
+  });
+  if ({reopen_project}) openDialog(projectPanel);
   const terminalPanel = document.getElementById("terminalPanel");
   const terminalForm = document.querySelector("[data-terminal-form]");
   const terminalOutput = document.querySelector("[data-terminal-output]");
@@ -464,7 +478,7 @@
       return;
     }
     try {
-      const response = await fetch("/agents/slots/{}/state", {cache:"no-store"});
+      const response = await fetch("/agents/slots/{active_slot_id}/state", {cache:"no-store"});
       if (response.ok) {
         const data = await response.json();
         const replaced = replaceMessages(data.messages_html);

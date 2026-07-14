@@ -7,10 +7,11 @@ use crate::Form;
 use crate::HeaderMap;
 use crate::Json;
 use crate::MAX_AGENT_MESSAGE_CHARS;
-use crate::QueuedAgentRequest;
 use crate::Redirect;
 use crate::Response;
 use crate::State;
+use crate::StatusCode;
+use crate::agent_control_text;
 use crate::agent_location;
 use crate::agent_messages_html;
 use crate::agent_run_for;
@@ -19,16 +20,17 @@ use crate::agent_slot_summary;
 use crate::agent_user_message_exists;
 use crate::append_agent_assistant;
 use crate::append_agent_message;
-use crate::clear_agent_queue;
 use crate::codex_model_catalog_snapshot;
+use crate::create_agent_slot;
+use crate::create_parallel_agent_slot;
 use crate::delete_agent_messages_after;
 use crate::delete_agent_session;
+use crate::expand_local_path;
 use crate::get_agent_slot;
 use crate::handle_agent_control;
 use crate::list_agent_messages;
 use crate::list_agent_slots;
 use crate::page_guard;
-use crate::queue_agent_request;
 use crate::raw_guard;
 use crate::requested_agent_run_settings;
 use crate::start_agent_job;
@@ -71,6 +73,21 @@ pub(crate) struct AgentMessageForm {
     reasoning_effort: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct AgentProjectForm {
+    slot_id: Option<i64>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    workdir: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    reasoning_effort: String,
+}
+
 pub(crate) async fn agent_message_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -79,7 +96,9 @@ pub(crate) async fn agent_message_create(
     if let Some(response) = page_guard(&state, &headers) {
         return response;
     }
-    let slot_id = form.slot_id.unwrap_or(1);
+    let Some(slot_id) = form.slot_id.filter(|id| *id > 0) else {
+        return (StatusCode::BAD_REQUEST, "agent slot is required").into_response();
+    };
     let slot = {
         let db = state.db.lock().unwrap();
         get_agent_slot(&db, slot_id).unwrap_or(None)
@@ -90,23 +109,12 @@ pub(crate) async fn agent_message_create(
     let settings = requested_agent_run_settings(&state, &form.model, &form.reasoning_effort);
     if form.control.trim().eq_ignore_ascii_case("stop") {
         let stopped = stop_agent_job(&state, slot.id);
-        let cleared = clear_agent_queue(&state, slot.id);
-        let queue_text = if cleared == 0 {
-            String::new()
-        } else if cleared == 1 {
-            " Cleared 1 queued follow-up.".into()
+        let message = if stopped {
+            "Stop requested."
         } else {
-            format!(" Cleared {cleared} queued follow-ups.")
+            "This slot is not running."
         };
-        append_agent_assistant(
-            &state,
-            slot.id,
-            &if stopped {
-                format!("Stop requested.{queue_text}")
-            } else {
-                format!("This slot is not running.{queue_text}")
-            },
-        );
+        append_agent_assistant(&state, slot.id, message);
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
     let body = form.body.trim().to_string();
@@ -131,37 +139,142 @@ pub(crate) async fn agent_message_create(
             let _ = delete_agent_messages_after(&db, slot.id, message_id);
             let _ = delete_agent_session(&db, slot.id);
         }
-        let _ = clear_agent_queue(&state, slot.id);
         if handle_agent_control(&state, &slot, &body) {
             return Redirect::to(&agent_location(Some(slot.id))).into_response();
         }
         start_agent_job(state.clone(), slot.id, body, settings);
         return Redirect::to(&agent_location(Some(slot.id))).into_response();
     }
+    if agent_control_text(&body).is_some() {
+        {
+            let db = state.db.lock().unwrap();
+            let _ = append_agent_message(&db, slot.id, "user", &body);
+        }
+        let _ = handle_agent_control(&state, &slot, &body);
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    let target_slot = if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+        let created = {
+            let db = state.db.lock().unwrap();
+            create_parallel_agent_slot(&db, &slot)
+        };
+        match created {
+            Ok(created) => {
+                append_agent_assistant(
+                    &state,
+                    slot.id,
+                    &format!(
+                        "{} is still running. Started this request in `{}` as a separate lane.",
+                        slot.name, created.name
+                    ),
+                );
+                created
+            }
+            Err(err) => {
+                append_agent_assistant(
+                    &state,
+                    slot.id,
+                    &format!(
+                        "Could not start a separate lane for this request: {err}. The running lane was left unchanged."
+                    ),
+                );
+                return Redirect::to(&agent_location(Some(slot.id))).into_response();
+            }
+        }
+    } else {
+        slot.clone()
+    };
+    {
+        let db = state.db.lock().unwrap();
+        let _ = append_agent_message(&db, target_slot.id, "user", &body);
+    }
+    start_agent_job(state.clone(), target_slot.id, body, settings);
+    Redirect::to(&agent_location(Some(target_slot.id))).into_response()
+}
+
+pub(crate) async fn agent_project_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AgentProjectForm>,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    let return_slot = form.slot_id.filter(|id| *id > 0);
+    let raw_workdir = form.workdir.trim();
+    if raw_workdir.is_empty() {
+        return Redirect::to(&project_form_location(
+            return_slot,
+            "Choose the folder for the project lane.",
+        ))
+        .into_response();
+    }
+    let requested_workdir = expand_local_path(raw_workdir);
+    let workdir = match requested_workdir.canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => {
+            return Redirect::to(&project_form_location(
+                return_slot,
+                "The project path must be a directory.",
+            ))
+            .into_response();
+        }
+        Err(_) => {
+            return Redirect::to(&project_form_location(
+                return_slot,
+                &format!(
+                    "Project folder does not exist: {}",
+                    requested_workdir.display()
+                ),
+            ))
+            .into_response();
+        }
+    };
+    let body = form.body.trim().to_string();
+    if body.len() > MAX_AGENT_MESSAGE_CHARS {
+        return Redirect::to(&project_form_location(
+            return_slot,
+            "The first message is too long.",
+        ))
+        .into_response();
+    }
+    let slot = {
+        let db = state.db.lock().unwrap();
+        create_agent_slot(&db, &form.name, &workdir)
+    };
+    let slot = match slot {
+        Ok(slot) => slot,
+        Err(err) => {
+            return Redirect::to(&project_form_location(
+                return_slot,
+                &format!("Could not create the project lane: {err}"),
+            ))
+            .into_response();
+        }
+    };
+    if body.is_empty() {
+        append_agent_assistant(
+            &state,
+            slot.id,
+            &format!("`{}` is ready in `{}`.", slot.name, slot.workdir),
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
     {
         let db = state.db.lock().unwrap();
         let _ = append_agent_message(&db, slot.id, "user", &body);
     }
-    if handle_agent_control(&state, &slot, &body) {
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
-    }
-    if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
-        let queued_count =
-            queue_agent_request(&state, slot.id, QueuedAgentRequest { body, settings });
-        let queued_text = if queued_count == 1 {
-            "1 queued follow-up".to_string()
-        } else {
-            format!("{queued_count} queued follow-ups")
-        };
-        append_agent_assistant(
-            &state,
-            slot.id,
-            &format!("Queued behind the current Codex turn. {queued_text}."),
-        );
-        return Redirect::to(&agent_location(Some(slot.id))).into_response();
-    }
+    let settings = requested_agent_run_settings(&state, &form.model, &form.reasoning_effort);
     start_agent_job(state.clone(), slot.id, body, settings);
     Redirect::to(&agent_location(Some(slot.id))).into_response()
+}
+
+fn project_form_location(slot_id: Option<i64>, error: &str) -> String {
+    let mut location = agent_location(slot_id);
+    location.push(if location.contains('?') { '&' } else { '?' });
+    location.push_str("new_project=1&project_error=");
+    location.extend(url::form_urlencoded::byte_serialize(error.as_bytes()));
+    location
 }
 
 pub(crate) async fn agent_slot_state(

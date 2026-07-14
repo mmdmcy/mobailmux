@@ -13,7 +13,6 @@ use crate::Sha256;
 use crate::SlotRuntime;
 use crate::Tag;
 use crate::TagEnd;
-use crate::agent_queue_len;
 use crate::codex_conversation_by_id;
 use crate::codex_transcript_messages;
 use crate::compact_local_time;
@@ -21,7 +20,6 @@ use crate::html;
 use crate::html_attr_escape;
 use crate::html_escape;
 use crate::io;
-use crate::queue_suffix;
 use crate::truncate_text;
 use sha2::Digest;
 
@@ -36,7 +34,6 @@ pub(crate) fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> Agent
         } else {
             run.current.clone()
         };
-        let label = format!("{}{}", label, queue_suffix(agent_queue_len(state, slot.id)));
         return AgentSlotSummary {
             id: slot.id,
             name: slot.name.clone(),
@@ -45,13 +42,12 @@ pub(crate) fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> Agent
             status: label,
         };
     }
-    let idle = format!("idle{}", queue_suffix(agent_queue_len(state, slot.id)));
     AgentSlotSummary {
         id: slot.id,
         name: slot.name.clone(),
         running: false,
         current: String::new(),
-        status: idle,
+        status: "idle".into(),
     }
 }
 
@@ -62,12 +58,10 @@ pub(crate) fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotR
         } else {
             run.current
         };
-        return SlotRuntime {
-            label: format!("{}{}", label, queue_suffix(agent_queue_len(state, slot.id))),
-        };
+        return SlotRuntime { label };
     }
     SlotRuntime {
-        label: format!("idle{}", queue_suffix(agent_queue_len(state, slot.id))),
+        label: "idle".into(),
     }
 }
 
@@ -83,7 +77,7 @@ pub(crate) fn agent_slot_rail_html(
         format!(r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}"><a class="channel-link" href="/agents?slot={}" aria-label="Open {}"><strong>{}</strong><span data-slot-status>{}</span><span class="slot-badge" data-slot-badge hidden></span></a></div>"#, summary.id, summary.running, summary.id, html_escape(&summary.name), html_escape(&summary.name), html_escape(&summary.status))
     }).collect::<Vec<_>>().join("");
     format!(
-        r#"<aside class="channel-rail" aria-label="Agent sessions"><div class="rail-title">Sessions</div><div class="channel-list">{rows}</div></aside>"#
+        r#"<aside class="channel-rail" aria-label="Agent projects"><div class="rail-title">Projects</div><div class="channel-list">{rows}</div></aside>"#
     )
 }
 

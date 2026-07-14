@@ -38,12 +38,6 @@ pub(crate) struct AgentRunSettings {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct QueuedAgentRequest {
-    pub(crate) body: String,
-    pub(crate) settings: AgentRunSettings,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct SlotRuntime {
     pub(crate) label: String,
 }

@@ -15,7 +15,7 @@ use rusqlite::{Connection, params};
 use sha2::Sha256;
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, SeekFrom},
     net::SocketAddr,
@@ -45,15 +45,13 @@ use features::agents::{
 use features::{
     agents::{
         AgentCommandSpec, AgentMessageRow, AgentProgress, AgentRun, AgentRunSettings, AgentSlotRow,
-        AgentSlotSummary, AgentStdoutSummary, ComposerSuggestion, QueuedAgentRequest, SlotRuntime,
-        agent_activity_kind, agent_composer_suggestions_json, agent_control_text, agent_location,
-        agent_messages_html, agent_queue_len, agent_run_for, agent_run_settings_label,
-        agent_slot_rail_html, agent_slot_runtime, agent_slot_summary, apply_agent_run_settings,
-        clear_agent_queue, codex_transcript_count, codex_transcript_html, command_arg,
-        handle_agent_control, is_final_agent_phase, json_for_inline_script,
-        normalize_agent_command_text, queue_agent_request, queue_suffix,
-        requested_agent_run_settings, shell_single_quote, start_agent_job,
-        start_next_queued_agent_job, stop_agent_job,
+        AgentSlotSummary, AgentStdoutSummary, ComposerSuggestion, SlotRuntime, agent_activity_kind,
+        agent_composer_suggestions_json, agent_control_text, agent_location, agent_messages_html,
+        agent_run_for, agent_run_settings_label, agent_slot_rail_html, agent_slot_runtime,
+        agent_slot_summary, apply_agent_run_settings, codex_transcript_count,
+        codex_transcript_html, command_arg, handle_agent_control, is_final_agent_phase,
+        json_for_inline_script, normalize_agent_command_text, requested_agent_run_settings,
+        shell_single_quote, start_agent_job, stop_agent_job,
     },
     usage::{codex_reset_post, codex_usage_dialog, codex_usage_text},
 };
@@ -73,15 +71,17 @@ use integrations::codex::{
     codex_reset_credits_summary,
 };
 use interfaces::web::{
-    agent_message_create, agent_model_catalog, agent_slot_state, agent_slots_state, agents_page,
+    agent_message_create, agent_model_catalog, agent_project_create, agent_slot_state,
+    agent_slots_state, agents_page,
 };
 #[cfg(test)]
 use persistence::ensure_agent_slot;
 use persistence::{
     agent_session, agent_user_message_exists, append_agent_assistant, append_agent_message,
-    delete_agent_messages_after, delete_agent_session, ensure_agent_slot_seeds, get_agent_slot,
-    list_agent_messages, list_agent_slots, mark_interrupted_agent_runs, reset_agent_slot_chat,
-    set_agent_goal, set_agent_session, set_agent_workdir, update_agent_user_message,
+    create_agent_slot, create_parallel_agent_slot, delete_agent_messages_after,
+    delete_agent_session, ensure_agent_slot_seeds, get_agent_slot, list_agent_messages,
+    list_agent_slots, mark_interrupted_agent_runs, reset_agent_slot_chat, set_agent_goal,
+    set_agent_session, set_agent_workdir, update_agent_user_message,
 };
 #[cfg(test)]
 use security::{
@@ -96,8 +96,8 @@ use shared::{
     agent_codex_args_for_command, agent_command_label, agent_execution_mode_html,
     compact_local_time, default_codex_bin, default_home_dir, env_flag, epoch_to_rfc3339,
     expand_local_path, file_modified, format_epoch_date, format_number, html_attr_escape,
-    html_escape, io_other, page, parse_agent_slot_seeds, short_time, split_env_args,
-    system_time_to_rfc3339, truncate_text,
+    html_escape, io_other, normalize_agent_slot_name, page, parse_agent_slot_seeds, short_time,
+    split_env_args, system_time_to_rfc3339, truncate_text,
 };
 
 const DEFAULT_AGENT_SLOTS: &str = "codex";
@@ -153,18 +153,6 @@ const AGENT_COMMAND_SPECS: &[AgentCommandSpec] = &[
         name: "stop",
         usage: "/stop",
         description: "Stop the running Codex job",
-        takes_arg: false,
-    },
-    AgentCommandSpec {
-        name: "queue",
-        usage: "/queue",
-        description: "Show queued follow-ups for this slot",
-        takes_arg: false,
-    },
-    AgentCommandSpec {
-        name: "clear-queue",
-        usage: "/clear-queue",
-        description: "Clear queued follow-ups for this slot",
         takes_arg: false,
     },
     AgentCommandSpec {

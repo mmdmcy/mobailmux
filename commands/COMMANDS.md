@@ -30,13 +30,27 @@ mbx commands
 
 `mbx status`, `mbx slots`, and `mbx sessions` show all fixed session names by
 default. `mbx list` shows only currently running sessions. A slot is a named
-Codex session backed by tmux.
+Codex session backed by tmux. Mobailmux enables tmux mouse mode (`mouse on`)
+for the server so wheel scrolling works in every managed slot.
 
-Slots use letter names `a` through `i`. Legacy aliases `one` through `nine`
-and `1` through `9` still work.
+Slots use letter names `a` through `j`. Legacy aliases `one` through `ten` and
+`1` through `10` still work.
 
-New tmux sessions use `codex-1` through `codex-9`. Existing migration-era
-`plugdeck-a` through `plugdeck-i` sessions are still detected and managed.
+New tmux sessions use `codex-1` through `codex-10`. Existing migration-era
+`plugdeck-a` through `plugdeck-j` sessions are still detected and managed.
+
+## Last-Used Conversation
+
+When `mbx start` or `mbx new` launches Codex, `mbx` remembers the new
+conversation as that slot's last-used conversation under
+`${XDG_STATE_HOME:-~/.local/state}/mbx/slots`. This is a mutable pointer, not a
+permanent project or session assignment. A later fresh start replaces it, so
+slots can be reused for different projects and conversations.
+
+`mbx resume` uses the remembered ID instead of global `codex resume --last`.
+Use `mbx resume <slot> --session-id <id>` when deliberately moving another
+saved conversation into a slot. If a slot has no remembered conversation yet,
+run `mbx start <slot>` or `mbx new <slot>` once.
 
 ## Working Directory Rule
 

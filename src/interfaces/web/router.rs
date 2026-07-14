@@ -17,6 +17,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
             "/agents",
             get(crate::agents_page).post(crate::agent_message_create),
         )
+        .route("/agents/projects", post(crate::agent_project_create))
         .route("/agents/slots/state", get(crate::agent_slots_state))
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
         .route("/agents/models", get(crate::agent_model_catalog))

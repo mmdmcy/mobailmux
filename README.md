@@ -55,7 +55,9 @@ The existing shell command lives at:
 commands/bin/mbx
 ```
 
-It manages tmux-backed Codex sessions. Run:
+It manages reusable tmux-backed Codex slots (`a` through `j`), remembers each
+slot's last-used Codex conversation for safe resume, and enables tmux mouse
+mode for scrolling. Run:
 
 ```sh
 commands/bin/mbx help

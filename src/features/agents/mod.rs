@@ -1,4 +1,4 @@
-//! Owns agent lanes, messages, queues, execution, commands, and rendering.
+//! Owns agent lanes, messages, execution, commands, and rendering.
 
 mod composer;
 mod control;
@@ -18,16 +18,15 @@ pub(crate) use composer::{
 #[cfg(test)]
 pub(crate) use control::validate_agent_run_settings;
 pub(crate) use control::{
-    agent_queue_len, agent_run_settings_label, apply_agent_run_settings, clear_agent_queue,
-    handle_agent_control, queue_agent_request, queue_suffix, requested_agent_run_settings,
-    start_next_queued_agent_job, stop_agent_job,
+    agent_run_settings_label, apply_agent_run_settings, handle_agent_control,
+    requested_agent_run_settings, stop_agent_job,
 };
 #[cfg(test)]
 pub(crate) use runtime::{build_agent_prompt, codex_stdout_agent_message};
 pub(crate) use runtime::{is_final_agent_phase, shell_single_quote, start_agent_job};
 pub(crate) use types::{
     AgentCommandSpec, AgentMessageRow, AgentProgress, AgentRun, AgentRunSettings, AgentSlotRow,
-    AgentSlotSummary, AgentStdoutSummary, ComposerSuggestion, QueuedAgentRequest, SlotRuntime,
+    AgentSlotSummary, AgentStdoutSummary, ComposerSuggestion, SlotRuntime,
 };
 #[cfg(test)]
 pub(crate) use views::message_body_html;

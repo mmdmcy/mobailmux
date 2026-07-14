@@ -26,7 +26,6 @@ pub(crate) async fn serve() -> io::Result<()> {
         config,
         agent_jobs: Mutex::new(HashMap::new()),
         agent_cancels: Mutex::new(HashMap::new()),
-        agent_queues: Mutex::new(HashMap::new()),
         codex_index: Mutex::new(CodexIndexCache::default()),
         codex_models: Mutex::new(CodexModelCatalogCache::default()),
     });

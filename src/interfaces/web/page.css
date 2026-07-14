@@ -107,6 +107,18 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .codex-panel header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line)}
 .codex-panel header strong{font-size:17px}
 .codex-panel main{width:auto;padding:14px;display:grid;gap:12px}
+.project-panel{border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--fg);width:min(560px,calc(100% - 24px));padding:0}
+.project-panel::backdrop{background:rgba(0,0,0,.45)}
+.project-panel header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.project-panel header strong{font-size:17px}
+.project-panel main{width:auto;padding:14px;display:grid;gap:12px}
+.project-panel main>p{margin:0}
+.project-form{display:grid;gap:10px}
+.project-form label{display:grid;gap:4px;font-weight:800}
+.project-form label>span{color:var(--muted);font-size:12px;text-transform:uppercase}
+.project-form label em{font-style:normal;font-weight:700;text-transform:none}
+.project-form textarea{min-height:112px}
+.project-form-actions{display:flex;justify-content:flex-end}
 .usage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .usage-total,.usage-card{border:1px solid var(--line);border-radius:7px;padding:10px;display:grid;gap:5px}
 .usage-total span{color:var(--muted)}
@@ -177,6 +189,7 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
   .tool-label{justify-self:start}
   .tool-row code,.tool-output{grid-column:1/-1}
   .usage-grid{grid-template-columns:1fr}
+  .project-panel{width:calc(100% - 20px)}
   .terminal-panel{height:min(58dvh,520px)}
   .agent-composer{grid-template-columns:minmax(0,1fr) 74px 74px;padding:7px 8px max(8px,env(safe-area-inset-bottom));gap:7px}
   .agent-composer textarea{grid-column:1/-1;min-height:50px;max-height:22dvh;padding:8px 10px;font-size:16px}

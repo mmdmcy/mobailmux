@@ -29,7 +29,6 @@ use crate::io;
 use crate::oneshot;
 use crate::set_agent_session;
 use crate::sleep;
-use crate::start_next_queued_agent_job;
 use crate::truncate_text;
 use std::io::Read;
 use std::io::Seek;
@@ -344,7 +343,6 @@ async fn run_agent_job(
         }
     }
     let _ = tokio::fs::remove_file(&out_path).await;
-    start_next_queued_agent_job(state.clone(), slot_id);
 }
 
 async fn read_agent_stdout(

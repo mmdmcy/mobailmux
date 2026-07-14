@@ -5,9 +5,7 @@ use crate::Arc;
 use crate::CodexModel;
 use crate::MAX_AGENT_GOAL_CHARS;
 use crate::Path;
-use crate::QueuedAgentRequest;
 use crate::TokioCommand;
-use crate::VecDeque;
 use crate::agent_command_label;
 use crate::agent_control_text;
 use crate::agent_slot_runtime;
@@ -20,7 +18,6 @@ use crate::normalize_agent_command_text;
 use crate::refresh_codex_index_blocking;
 use crate::reset_agent_slot_chat;
 use crate::set_agent_goal;
-use crate::start_agent_job;
 use crate::truncate_text;
 
 pub(crate) fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) -> bool {
@@ -141,36 +138,12 @@ pub(crate) fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, b
     }
     if lower == "stop" {
         let stopped = stop_agent_job(state, slot.id);
-        let cleared = clear_agent_queue(state, slot.id);
-        let queue_text = if cleared == 0 {
-            String::new()
-        } else if cleared == 1 {
-            " Cleared 1 queued follow-up.".into()
+        let message = if stopped {
+            "Stop requested."
         } else {
-            format!(" Cleared {cleared} queued follow-ups.")
+            "This slot is not running."
         };
-        append_agent_assistant(
-            state,
-            slot.id,
-            &if stopped {
-                format!("Stop requested.{queue_text}")
-            } else {
-                format!("This slot is not running.{queue_text}")
-            },
-        );
-        return true;
-    }
-    if matches!(lower.as_str(), "queue" | "queued") {
-        append_agent_assistant(state, slot.id, &agent_queue_text(state, slot));
-        return true;
-    }
-    if matches!(lower.as_str(), "clear-queue" | "clearqueue" | "queue clear") {
-        let cleared = clear_agent_queue(state, slot.id);
-        append_agent_assistant(
-            state,
-            slot.id,
-            &format!("Cleared {cleared} queued follow-up(s) for {}.", slot.name),
-        );
+        append_agent_assistant(state, slot.id, message);
         return true;
     }
     append_agent_assistant(
@@ -188,79 +161,6 @@ pub(crate) fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
         true
     } else {
         false
-    }
-}
-
-pub(crate) fn queue_agent_request(
-    state: &AppState,
-    slot_id: i64,
-    request: QueuedAgentRequest,
-) -> usize {
-    let mut queues = state.agent_queues.lock().unwrap();
-    let queue = queues.entry(slot_id).or_default();
-    queue.push_back(request);
-    queue.len()
-}
-
-pub(crate) fn pop_queued_agent_request(
-    state: &AppState,
-    slot_id: i64,
-) -> Option<QueuedAgentRequest> {
-    let mut queues = state.agent_queues.lock().unwrap();
-    queues.entry(slot_id).or_default().pop_front()
-}
-
-pub(crate) fn clear_agent_queue(state: &AppState, slot_id: i64) -> usize {
-    let mut queues = state.agent_queues.lock().unwrap();
-    let queue = queues.entry(slot_id).or_default();
-    let count = queue.len();
-    queue.clear();
-    count
-}
-
-pub(crate) fn agent_queue_len(state: &AppState, slot_id: i64) -> usize {
-    state
-        .agent_queues
-        .lock()
-        .unwrap()
-        .get(&slot_id)
-        .map(VecDeque::len)
-        .unwrap_or(0)
-}
-
-pub(crate) fn agent_queue_text(state: &AppState, slot: &AgentSlotRow) -> String {
-    let items = state
-        .agent_queues
-        .lock()
-        .unwrap()
-        .get(&slot.id)
-        .cloned()
-        .unwrap_or_default();
-    if items.is_empty() {
-        return format!("{} queue is empty.", slot.name);
-    }
-    let rows = items
-        .iter()
-        .enumerate()
-        .map(|(index, request)| {
-            format!(
-                "{}. {}",
-                index + 1,
-                truncate_text(&request.body, 220).replace('\n', " ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{} queued follow-ups:\n```text\n{rows}\n```", slot.name)
-}
-
-pub(crate) fn queue_suffix(count: usize) -> String {
-    if count == 0 {
-        String::new()
-    } else if count == 1 {
-        " · 1 queued".into()
-    } else {
-        format!(" · {count} queued")
     }
 }
 
@@ -321,26 +221,6 @@ pub(crate) fn apply_agent_run_settings(command: &mut TokioCommand, settings: &Ag
     }
 }
 
-pub(crate) fn start_next_queued_agent_job(state: Arc<AppState>, slot_id: i64) {
-    let Some(next) = pop_queued_agent_request(&state, slot_id) else {
-        return;
-    };
-    let remaining = agent_queue_len(&state, slot_id);
-    let remaining_text = if remaining == 0 {
-        String::new()
-    } else if remaining == 1 {
-        " 1 follow-up remains queued.".into()
-    } else {
-        format!(" {remaining} follow-ups remain queued.")
-    };
-    append_agent_assistant(
-        &state,
-        slot_id,
-        &format!("Starting queued follow-up.{remaining_text}"),
-    );
-    start_agent_job(state, slot_id, next.body, next.settings);
-}
-
 pub(crate) fn agent_help_text(state: &AppState) -> String {
     let slots = {
         let db = state.db.lock().unwrap();
@@ -360,8 +240,6 @@ pub(crate) fn agent_help_text(state: &AppState) -> String {
             "- `/status`",
             "- `/usage`",
             "- `/stop`",
-            "- `/queue`",
-            "- `/clear-queue`",
             "- `/model`",
             "- `/help` or `/commands`",
         ]
@@ -387,11 +265,6 @@ pub(crate) fn agent_slots_status_text(state: &AppState) -> String {
             } else {
                 "idle"
             };
-            let status = format!(
-                "{}{}",
-                status,
-                queue_suffix(agent_queue_len(state, slot.id))
-            );
             let goal = slot.goal.trim();
             if goal.is_empty() {
                 format!("{}: {status}", slot.name)

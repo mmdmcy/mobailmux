@@ -3,6 +3,7 @@ use crate::Arc;
 use crate::CodexIndex;
 use crate::HeaderMap;
 use crate::MAX_AGENT_MESSAGE_CHARS;
+use crate::MAX_AGENT_SLOT_CHARS;
 use crate::Query;
 use crate::Response;
 use crate::State;
@@ -36,6 +37,8 @@ pub(crate) struct AgentsQuery {
     thread: Option<String>,
     refresh: Option<String>,
     usage: Option<String>,
+    new_project: Option<String>,
+    project_error: Option<String>,
 }
 
 pub(crate) async fn agents_page(
@@ -85,8 +88,9 @@ pub(crate) async fn agents_page(
         .as_deref()
         .and_then(|thread_id| codex_conversation_by_id(&codex, thread_id))
         .map(|conversation| conversation.title.clone())
-        .unwrap_or_else(|| "Codex".into());
+        .unwrap_or_else(|| active_slot.name.clone());
     let active_title = html_escape(&active_title);
+    let active_workdir = html_escape(&active_slot.workdir);
     let message_count = if selected_thread.is_some() {
         codex_transcript_count(&messages_html).unwrap_or(messages.len())
     } else {
@@ -102,6 +106,13 @@ pub(crate) async fn agents_page(
     let terminal_panel =
         crate::features::terminal::panel_html(active_slot.id, &active_slot.workdir);
     let reopen_usage = query.usage.is_some();
+    let reopen_project = query.new_project.is_some();
+    let project_error_html = query
+        .project_error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+        .map(|error| format!(r#"<p class="error">{}</p>"#, html_escape(error)))
+        .unwrap_or_default();
     let viewing_transcript = selected_thread.is_some();
     let refresh_thread_input = selected_thread
         .as_deref()
@@ -120,18 +131,20 @@ pub(crate) async fn agents_page(
     let agent_script = include_str!("agents.js")
         .replace("{composer_suggestions_json}", &composer_suggestions_json)
         .replace("{model_catalog_json}", &model_catalog_json)
+        .replace("{active_slot_id}", &active_slot.id.to_string())
         .replace("{viewing_transcript}", &viewing_transcript.to_string())
-        .replace("{reopen_usage}", &reopen_usage.to_string());
+        .replace("{reopen_usage}", &reopen_usage.to_string())
+        .replace("{reopen_project}", &reopen_project.to_string());
     page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-project-open aria-label="Start another project" title="Start another project">＋</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
     <header class="chat-head">
-      <div class="chat-title"><strong>{active_title}</strong></div>
+      <div class="chat-title"><strong>{active_title}</strong><span data-active-cwd>{active_workdir}</span></div>
       <div class="chat-stats"><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></div>
     </header>
     <div class="message-list" data-agent-messages>{messages_html}</div>
@@ -155,11 +168,28 @@ pub(crate) async fn agents_page(
 </main>
 {usage_dialog}
 {terminal_panel}
+<dialog class="project-panel" id="projectPanel">
+  <header><strong>Start another project</strong><button type="button" class="icon" data-project-close aria-label="Close">x</button></header>
+  <main>
+    <p class="muted">Each project gets its own lane, transcript, and Codex thread, so it can run independently.</p>
+    {project_error_html}
+    <form action="/agents/projects" method="post" class="project-form" data-project-form>
+      <input name="slot_id" type="hidden" value="{}">
+      <input name="model" type="hidden" data-project-model value="">
+      <input name="reasoning_effort" type="hidden" data-project-reasoning value="">
+      <label><span>Project folder</span><input name="workdir" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="/path/to/project"></label>
+      <label><span>Lane name <em>(optional)</em></span><input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" autocomplete="off" placeholder="defaults to the folder name"></label>
+      <label><span>First task <em>(optional)</em></span><textarea name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Tell Codex what to do now, or open an empty lane."></textarea></label>
+      <div class="project-form-actions"><button type="submit">Open project</button></div>
+    </form>
+  </main>
+</dialog>
 <script>
 {agent_script}</script>
 "##,
             active_slot.id,
             html_escape(&runtime.label),
+            active_slot.id,
             active_slot.id
         ),
     )
