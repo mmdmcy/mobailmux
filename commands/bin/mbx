@@ -6,17 +6,20 @@ program="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  mbx start|s <slot> [options] [directory] [prompt...]
+  mbx start <slot> [options] [directory] [prompt...]
+  mbx s <slot> [options] [directory] [prompt...]
   mbx new|n <slot> [options] [directory] [prompt...]
   mbx resume|r <slot> [options] [directory]
   mbx stop <slot|all>
+  mbx q <slot|all>
   mbx status|slots|sessions [slot|all]
   mbx list
   mbx help|command|commands
   mbx check
 
 Slots:
-  A slot is a named Codex session backed by tmux.
+  A slot is a reusable tmux workspace. Start/new can launch Codex in it,
+  but a slot is not tied to Codex, a project, or a conversation.
   a, b, c, d, e, f, g, h, i, j
   legacy aliases: one..ten and 1..10
 
@@ -26,15 +29,14 @@ Options:
   --unsafe               Bypass Codex approvals and sandbox. Default.
   --restart              Replace an existing slot before starting.
   --no-attach            Start without attaching to tmux.
-  --session-id <id>      Resume a specific saved Codex conversation.
   --dry-run              Print what would run.
   -h, --help             Show help.
 
 Examples:
   mbx start a
-  mbx s b ~/projects/example "check git status"
+  mbx s b
   mbx r a
-  mbx stop a
+  mbx q a
   mbx status
   mbx list
 EOF
@@ -49,17 +51,19 @@ Commands:
 
   mbx new <slot> [directory] [prompt...]
   mbx n <slot> [directory] [prompt...]
-      Stop the slot if it exists, then start a fresh Codex session.
+      Stop the slot if it exists, then start a fresh Codex process.
 
   mbx resume <slot> [directory]
   mbx r <slot> [directory]
-      Resume the last Codex conversation used in that slot.
-      Use --session-id to deliberately switch the slot to another one.
+      Attach to that exact tmux slot. If it does not exist, create a shell slot.
+      Once attached, run Codex, a shell, or anything else in the workspace.
 
   mbx stop <slot>
+  mbx q <slot>
       Stop one slot.
 
   mbx stop all
+  mbx q all
       Stop all slots.
 
   mbx status [slot|all]
@@ -87,10 +91,6 @@ die() {
 
 need_tmux() {
   command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
-}
-
-need_flock() {
-  command -v flock >/dev/null 2>&1 || die "flock is required for safe Codex session tracking"
 }
 
 slot_number() {
@@ -168,152 +168,6 @@ session_for_slot() {
 tmux_mouse_on() {
   # This is a server option, so it applies to every mbx slot in the tmux server.
   tmux set-option -g mouse on >/dev/null 2>&1 || true
-}
-
-slot_state_dir() {
-  echo "${MBX_SLOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mbx/slots}"
-}
-
-slot_state_file() {
-  local slot="$1"
-  echo "$(slot_state_dir)/$(slot_label "$slot")"
-}
-
-valid_session_id() {
-  [[ "${1:-}" =~ ^[[:alnum:]_.:-]+$ ]]
-}
-
-last_slot_session_id() {
-  local slot="$1"
-  local file id
-  file="$(slot_state_file "$slot")"
-  [[ -r "$file" ]] || return 1
-  IFS= read -r id < "$file" || true
-  valid_session_id "$id" || return 1
-  echo "$id"
-}
-
-remember_last_slot_session() {
-  local slot="$1"
-  local id="$2"
-  local file temp
-  file="$(slot_state_file "$slot")"
-  mkdir -p "$(dirname "$file")"
-  chmod 700 "$(dirname "$file")"
-  temp="$(mktemp "${file}.XXXXXX")"
-  printf '%s\n' "$id" > "$temp"
-  mv -f "$temp" "$file"
-}
-
-forget_last_slot_session() {
-  rm -f "$(slot_state_file "$1")"
-}
-
-codex_sessions_dir() {
-  echo "${CODEX_HOME:-$HOME/.codex}/sessions"
-}
-
-snapshot_codex_sessions() {
-  local output="$1"
-  local sessions_dir
-  sessions_dir="$(codex_sessions_dir)"
-  : > "$output"
-  [[ -d "$sessions_dir" ]] || return 0
-  find "$sessions_dir" -type f -name '*.jsonl' -print > "$output"
-}
-
-session_file_id() {
-  local file="$1"
-  local metadata
-  [[ -r "$file" ]] || return 1
-  IFS= read -r metadata < "$file" || true
-  sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<< "$metadata" | head -1
-}
-
-session_file_cwd() {
-  local file="$1"
-  local metadata
-  [[ -r "$file" ]] || return 1
-  IFS= read -r metadata < "$file" || true
-  sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' <<< "$metadata" | head -1
-}
-
-track_slot_session() {
-  local slot="$1"
-  local workdir="$2"
-  local snapshot="$3"
-  local lock_fd="${4:-}"
-  local sessions_dir file id cwd
-  local attempt=0
-  local attempts="${MBX_SESSION_DISCOVERY_ATTEMPTS:-40}"
-
-  if [[ -n "$lock_fd" ]]; then
-    [[ "$lock_fd" =~ ^[0-9]+$ ]] || return 1
-    flock "$lock_fd"
-  fi
-
-  sessions_dir="$(codex_sessions_dir)"
-  while (( attempt < attempts )); do
-    if [[ -d "$sessions_dir" ]]; then
-      while IFS= read -r -d '' file; do
-        grep -Fqx -- "$file" "$snapshot" && continue
-        id="$(session_file_id "$file" || true)"
-        [[ -n "$id" ]] || continue
-        cwd="$(session_file_cwd "$file" || true)"
-        [[ "$cwd" == "$workdir" ]] || continue
-        remember_last_slot_session "$slot" "$id"
-        rm -f "$snapshot"
-        return 0
-      done < <(find "$sessions_dir" -type f -name '*.jsonl' -print0)
-    fi
-    sleep 0.25
-    attempt=$((attempt + 1))
-  done
-
-  rm -f "$snapshot"
-  return 1
-}
-
-start_slot_session_tracker() {
-  local slot="$1"
-  local workdir="$2"
-  local snapshot="$3"
-  local lock_fd="${4:-}"
-  local script_path
-  script_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-  local tracker_args=(__track-session "$slot" "$workdir" "$snapshot")
-  [[ -n "$lock_fd" ]] && tracker_args+=("$lock_fd")
-  nohup "$script_path" "${tracker_args[@]}" >/dev/null 2>&1 </dev/null &
-}
-
-start_codex_and_track() {
-  local slot="$1"
-  local workdir="$2"
-  local session="$3"
-  local cmdline="$4"
-  local state_dir lock_file snapshot lock_fd
-
-  need_flock
-  state_dir="$(slot_state_dir)"
-  mkdir -p "$state_dir"
-  chmod 700 "$state_dir"
-  lock_file="$state_dir/.session-discovery.lock"
-  exec {lock_fd}>"$lock_file"
-  flock "$lock_fd"
-
-  snapshot="$(mktemp "${TMPDIR:-/tmp}/mbx-codex-sessions.XXXXXX")"
-  snapshot_codex_sessions "$snapshot"
-  if ! tmux send-keys -t "$session" "$cmdline" C-m; then
-    rm -f "$snapshot"
-    exec {lock_fd}>&-
-    return 1
-  fi
-  if ! start_slot_session_tracker "$slot" "$workdir" "$snapshot" "$lock_fd"; then
-    rm -f "$snapshot"
-    exec {lock_fd}>&-
-    return 1
-  fi
-  exec {lock_fd}>&-
 }
 
 attach_session() {
@@ -401,16 +255,10 @@ codex_command_array() {
   shift
   local -n output="$output_name"
   local workdir="$1"
-  local mode="$2"
-  local unsafe="$3"
-  local session_id="$4"
-  shift 4
+  local unsafe="$2"
+  shift 2
 
-  if [[ "$mode" == "resume" && "$unsafe" == "1" ]]; then
-    output=(codex --dangerously-bypass-approvals-and-sandbox --cd "$workdir" resume "$session_id")
-  elif [[ "$mode" == "resume" ]]; then
-    output=(codex --cd "$workdir" resume "$session_id")
-  elif [[ "$unsafe" == "1" ]]; then
+  if [[ "$unsafe" == "1" ]]; then
     if command -v codexunsafe >/dev/null 2>&1; then
       output=(codexunsafe --cd "$workdir")
     else
@@ -555,6 +403,89 @@ stop_all_slots() {
   (( found )) || echo "No mbx sessions are running."
 }
 
+resume_slot() {
+  local slot="$1"
+  shift
+
+  local workdir_arg=""
+  local attach=1
+  local dry_run=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -C|--cd|--dir)
+        [[ $# -ge 2 ]] || die "$1 requires a directory"
+        workdir_arg="$2"
+        shift 2
+        ;;
+      --no-attach)
+        attach=0
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --)
+        shift
+        [[ $# -eq 0 ]] || die "resume does not accept a command or prompt"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        [[ -z "$workdir_arg" ]] || die "resume accepts only one directory"
+        workdir_arg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  need_tmux
+
+  local label session workdir
+  label="$(slot_label "$slot")"
+  workdir="$(resolve_workdir "$workdir_arg")"
+  session="$(session_for_slot "$slot")"
+
+  if (( dry_run )); then
+    echo "slot:    $label"
+    echo "session: $session"
+    echo "workdir: $workdir"
+    if tmux has-session -t "$session" 2>/dev/null; then
+      printf 'state:   existing\ncommand: tmux attach-session -t %q\n' "$session"
+    else
+      printf 'state:   new shell\ncommand: tmux new-session -d -s %q -n %q -c %q\n' \
+        "$session" "$session" "$workdir"
+    fi
+    return 0
+  fi
+
+  tmux_mouse_on
+  if tmux has-session -t "$session" 2>/dev/null; then
+    if (( attach )); then
+      echo "Attaching to tmux slot $label ($session)"
+      attach_session "$session"
+    else
+      echo "tmux slot $label is running as $session"
+    fi
+    return 0
+  fi
+
+  tmux new-session -d -s "$session" -n "$session" -c "$workdir"
+  tmux set-option -t "$session" remain-on-exit on >/dev/null 2>&1 || true
+  tmux_mouse_on
+  echo "Started tmux slot $label ($session) in $workdir"
+
+  if (( attach )); then
+    attach_session "$session"
+  fi
+}
+
 run_slot() {
   local action="$1"
   local slot="$2"
@@ -566,7 +497,6 @@ run_slot() {
   local attach=1
   local dry_run=0
   local prompt_parts=()
-  local requested_session_id=""
 
   [[ "$action" == "new" ]] && restart=1
 
@@ -597,12 +527,6 @@ run_slot() {
         attach=0
         shift
         ;;
-      --session-id|--conversation-id)
-        [[ "$action" == "resume" ]] || die "$1 is only valid with resume"
-        [[ $# -ge 2 ]] || die "$1 requires a conversation ID"
-        requested_session_id="$2"
-        shift 2
-        ;;
       --dry-run)
         dry_run=1
         shift
@@ -630,47 +554,12 @@ run_slot() {
 
   need_tmux
 
-  local session label workdir mode cmdline session_id=""
+  local session label workdir cmdline
   local current
   label="$(slot_label "$slot")"
   workdir="$(resolve_workdir "$workdir_arg")"
   session="$(session_for_slot "$slot")"
-  mode="start"
-  [[ "$action" == "resume" ]] && mode="resume"
-
-  if [[ "$action" == "resume" && "${#prompt_parts[@]}" -gt 0 ]]; then
-    die "resume does not accept a prompt; use 'mbx start $label ...' or 'mbx new $label ...'"
-  fi
-
-  if [[ "$action" == "resume" && "$dry_run" == "0" && "$restart" == "0" ]] && tmux has-session -t "$session" 2>/dev/null; then
-    current="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
-    case "$current" in
-      bash|zsh|fish|sh)
-        ;;
-      *)
-        if [[ -n "$requested_session_id" ]]; then
-          die "$label is already running as $session; use --restart with --session-id to switch it"
-        fi
-        echo "$label is already running as $session. Attaching. Use 'mbx new $label' to restart it."
-        if (( attach )); then
-          attach_session "$session"
-        fi
-        return 0
-        ;;
-    esac
-  fi
-
-  if [[ "$action" == "resume" ]]; then
-    if [[ -n "$requested_session_id" ]]; then
-      valid_session_id "$requested_session_id" || die "invalid Codex conversation ID: $requested_session_id"
-      session_id="$requested_session_id"
-    else
-      session_id="$(last_slot_session_id "$slot" || true)"
-      [[ -n "$session_id" ]] || die "slot $label has no remembered Codex conversation; run 'mbx start $label' or 'mbx new $label' first"
-    fi
-  fi
-
-  cmdline="$(codex_command_line "$workdir" "$mode" "$unsafe" "$session_id" "${prompt_parts[@]}")"
+  cmdline="$(codex_command_line "$workdir" "$unsafe" "${prompt_parts[@]}")"
 
   if (( dry_run )); then
     echo "slot:    $label"
@@ -685,38 +574,12 @@ run_slot() {
   if tmux has-session -t "$session" 2>/dev/null; then
     tmux_mouse_on
     if (( restart )); then
-      [[ "$action" == "resume" ]] || forget_last_slot_session "$slot"
       tmux kill-session -t "$session"
-    elif [[ "$action" == "resume" ]]; then
-      current="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
-      case "$current" in
-        bash|zsh|fish|sh)
-          tmux send-keys -t "$session" "$cmdline" C-m
-          [[ -n "$requested_session_id" ]] && remember_last_slot_session "$slot" "$session_id"
-          ;;
-        *)
-          if [[ -n "$requested_session_id" ]]; then
-            die "$label is already running as $session; use --restart with --session-id to switch it"
-          fi
-          echo "$label is already running as $session. Attaching. Use 'mbx new $label' to restart it."
-          if (( attach )); then
-            attach_session "$session"
-          fi
-          return 0
-          ;;
-      esac
-
-      if (( attach )); then
-        attach_session "$session"
-      else
-        echo "Resume sent to $label ($session)"
-      fi
-      return 0
     else
       current="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
       case "$current" in
         bash|zsh|fish|sh)
-          start_codex_and_track "$slot" "$workdir" "$session" "$cmdline"
+          tmux send-keys -t "$session" "$cmdline" C-m
           if (( attach )); then
             attach_session "$session"
           else
@@ -734,23 +597,11 @@ run_slot() {
     fi
   fi
 
-  [[ "$action" == "resume" ]] || forget_last_slot_session "$slot"
   tmux new-session -d -s "$session" -n "$session" -c "$workdir"
   tmux set-option -t "$session" remain-on-exit on >/dev/null
   tmux_mouse_on
-
-  if [[ "$action" == "resume" ]]; then
-    tmux send-keys -t "$session" "$cmdline" C-m
-    [[ -n "$requested_session_id" ]] && remember_last_slot_session "$slot" "$session_id"
-  else
-    start_codex_and_track "$slot" "$workdir" "$session" "$cmdline"
-  fi
-
-  if [[ "$action" == "resume" ]]; then
-    echo "Started $label ($session) with Codex resume in $workdir"
-  else
-    echo "Started $label ($session) in $workdir"
-  fi
+  tmux send-keys -t "$session" "$cmdline" C-m
+  echo "Started Codex in $label ($session) from $workdir"
 
   if (( attach )); then
     attach_session "$session"
@@ -760,10 +611,6 @@ run_slot() {
 main() {
   local command="${1:-}"
   case "$command" in
-    __track-session)
-      [[ $# -eq 4 || $# -eq 5 ]] || die "$command needs a slot, directory, snapshot, and optional lock descriptor"
-      track_slot_session "$2" "$3" "$4" "${5:-}"
-      ;;
     ""|-h|--help)
       usage
       ;;
@@ -790,14 +637,14 @@ main() {
       [[ $# -eq 1 ]] || die "check does not accept arguments"
       check_codex_update
       ;;
-    stop)
+    stop|q)
       case "${2:-}" in
         -h|--help|help)
           commands
           exit 0
           ;;
       esac
-      [[ $# -eq 2 ]] || die "stop needs exactly one slot or all"
+      [[ $# -eq 2 ]] || die "$command needs exactly one slot or all"
       if [[ "$2" == "all" ]]; then
         stop_all_slots
       else
@@ -806,7 +653,7 @@ main() {
         stop_slot "$slot"
       fi
       ;;
-    start|s|new|n|resume|r)
+    start|s|new|n)
       case "${2:-}" in
         -h|--help|help)
           usage
@@ -817,13 +664,25 @@ main() {
       case "$action" in
         s) action="start" ;;
         n) action="new" ;;
-        r) action="resume" ;;
       esac
       [[ $# -ge 2 ]] || die "$command needs a slot"
       local slot
       slot="$(slot_number "$2")" || die "unknown slot: $2"
       shift 2
       run_slot "$action" "$slot" "$@"
+      ;;
+    resume|r)
+      case "${2:-}" in
+        -h|--help|help)
+          usage
+          exit 0
+          ;;
+      esac
+      [[ $# -ge 2 ]] || die "$command needs a slot"
+      local slot
+      slot="$(slot_number "$2")" || die "unknown slot: $2"
+      shift 2
+      resume_slot "$slot" "$@"
       ;;
     *)
       die "unknown command: $command. Run 'mbx help' for commands."

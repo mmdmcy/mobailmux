@@ -55,9 +55,10 @@ The existing shell command lives at:
 commands/bin/mbx
 ```
 
-It manages reusable tmux-backed Codex slots (`a` through `j`), remembers each
-slot's last-used Codex conversation for safe resume, and enables tmux mouse
-mode for scrolling. Run:
+It manages reusable tmux workspaces (`a` through `j`) and enables tmux mouse
+mode for scrolling. `mbx r <slot>` attaches to that exact tmux workspace;
+`mbx q <slot>` stops one, and `mbx s`/`mbx start`/`mbx new` remain optional
+Codex-launcher conveniences. Run:
 
 ```sh
 commands/bin/mbx help

@@ -2,7 +2,7 @@
 
 `commands/` is the upstream interface for Mobailmux automation. Other packages
 should call `mbx` or consume a future machine-readable interface from this
-directory instead of duplicating tmux or Codex session logic.
+directory instead of duplicating tmux slot logic.
 
 Run this for the live command list:
 
@@ -13,11 +13,14 @@ mbx commands
 ## Commands
 
 ```bash
-mbx start|s <slot> [directory] [prompt...]
+mbx start <slot> [directory] [prompt...]
+mbx s <slot> [directory] [prompt...]
 mbx new|n <slot> [directory] [prompt...]
 mbx resume|r <slot> [directory]
 mbx stop <slot>
+mbx q <slot>
 mbx stop all
+mbx q all
 mbx status [slot|all]
 mbx list
 mbx slots [slot|all]
@@ -29,33 +32,44 @@ mbx commands
 ```
 
 `mbx status`, `mbx slots`, and `mbx sessions` show all fixed session names by
-default. `mbx list` shows only currently running sessions. A slot is a named
-Codex session backed by tmux. Mobailmux enables tmux mouse mode (`mouse on`)
-for the server so wheel scrolling works in every managed slot.
+default. `mbx list` shows only currently running sessions. A slot is a reusable
+tmux workspace, not a permanent Codex session, project, or conversation.
+Mobailmux enables tmux mouse mode (`mouse on`) for the server so wheel scrolling
+works in every managed slot.
 
 Slots use letter names `a` through `j`. Legacy aliases `one` through `ten` and
 `1` through `10` still work.
 
-New tmux sessions use `codex-1` through `codex-10`. Existing migration-era
-`plugdeck-a` through `plugdeck-j` sessions are still detected and managed.
+New tmux sessions use `codex-1` through `codex-10` for compatibility with the
+older command surface. Existing migration-era `plugdeck-a` through `plugdeck-j`
+sessions are still detected and managed. These names do not bind a slot to
+Codex.
 
-## Last-Used Conversation
+## Generic tmux slots
 
-When `mbx start` or `mbx new` launches Codex, `mbx` remembers the new
-conversation as that slot's last-used conversation under
-`${XDG_STATE_HOME:-~/.local/state}/mbx/slots`. This is a mutable pointer, not a
-permanent project or session assignment. A later fresh start replaces it, so
-slots can be reused for different projects and conversations.
+`mbx resume <slot>` and `mbx r <slot>` target the selected tmux session directly.
+They never inspect Codex history, invoke `codex resume`, or choose a global
+latest conversation. If the tmux session does not exist, they create a plain
+shell workspace in the requested directory (or the current directory).
+After attaching, the slot can run any shell command, editor, Codex process, or
+other program.
 
-`mbx resume` uses the remembered ID instead of global `codex resume --last`.
-Use `mbx resume <slot> --session-id <id>` when deliberately moving another
-saved conversation into a slot. If a slot has no remembered conversation yet,
-run `mbx start <slot>` or `mbx new <slot>` once.
+`mbx start <slot>` and `mbx new <slot>` remain optional Codex launcher
+conveniences. `start` attaches to a running slot, starts Codex in an idle shell
+slot, or creates a new slot with Codex. `new` replaces the slot and starts a
+fresh Codex process. Neither command creates a permanent slot-to-Codex
+assignment.
+
+`mbx stop <slot>` and `mbx q <slot>` kill the selected tmux session. After a
+slot is stopped, the next `mbx r <slot>` creates a new tmux shell workspace
+because there is no session left to resume. `mbx s <slot>` is the short form
+of the optional Codex-launching `mbx start <slot>` command.
 
 ## Working Directory Rule
 
-When no directory is provided, `mbx start`, `mbx new`, and `mbx resume` use the
-current directory.
+When no directory is provided, `mbx start`, `mbx new`, and a missing `mbx
+resume` slot use the current directory. Resuming an existing tmux slot keeps
+the directory already active inside that slot.
 
 If a slot already exists but is sitting at a shell prompt, `mbx start <slot>`
 starts Codex inside that idle slot using the current directory from the command
