@@ -4,6 +4,7 @@ use crate::AgentSlotRow;
 use crate::AgentSlotSummary;
 use crate::AppState;
 use crate::CodeBlockKind;
+#[cfg(test)]
 use crate::CodexIndex;
 use crate::CowStr;
 use crate::Event;
@@ -13,12 +14,15 @@ use crate::Sha256;
 use crate::SlotRuntime;
 use crate::Tag;
 use crate::TagEnd;
+#[cfg(test)]
 use crate::codex_conversation_by_id;
+#[cfg(test)]
 use crate::codex_transcript_messages;
 use crate::compact_local_time;
 use crate::html;
 use crate::html_attr_escape;
 use crate::html_escape;
+#[cfg(test)]
 use crate::io;
 use crate::truncate_text;
 use sha2::Digest;
@@ -40,6 +44,7 @@ pub(crate) fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> Agent
             running: true,
             current: label.clone(),
             status: label,
+            harness: slot.harness,
         };
     }
     AgentSlotSummary {
@@ -48,6 +53,7 @@ pub(crate) fn agent_slot_summary(state: &AppState, slot: &AgentSlotRow) -> Agent
         running: false,
         current: String::new(),
         status: "idle".into(),
+        harness: slot.harness,
     }
 }
 
@@ -74,7 +80,7 @@ pub(crate) fn agent_slot_rail_html(
         let summary = agent_slot_summary(state, slot);
         let active_class = if slot.id == active_id { " active" } else { "" };
         let running_class = if summary.running { " running" } else { "" };
-        format!(r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}"><a class="channel-link" href="/agents?slot={}" aria-label="Open {}"><strong>{}</strong><span data-slot-status>{}</span><span class="slot-badge" data-slot-badge hidden></span></a></div>"#, summary.id, summary.running, summary.id, html_escape(&summary.name), html_escape(&summary.name), html_escape(&summary.status))
+        format!(r#"<div class="channel-row{active_class}{running_class}" data-slot-row data-slot-id="{}" data-slot-running="{}"><a class="channel-link" href="/agents?slot={}" aria-label="Open {}"><strong>{}</strong><span data-slot-status>{} · {}</span><span class="slot-badge" data-slot-badge hidden></span></a></div>"#, summary.id, summary.running, summary.id, html_escape(&summary.name), html_escape(&summary.name), html_escape(summary.harness.as_str()), html_escape(&summary.status))
     }).collect::<Vec<_>>().join("");
     format!(
         r#"<aside class="channel-rail" aria-label="Agent projects"><div class="rail-title">Projects</div><div class="channel-list">{rows}</div></aside>"#
@@ -241,7 +247,7 @@ pub(crate) fn agent_role_class(role: &str) -> &'static str {
 }
 
 pub(crate) fn agent_role_label(role: &str) -> &str {
-    if role == "user" { "You" } else { "Codex" }
+    if role == "user" { "You" } else { "Agent" }
 }
 
 pub(crate) fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String {
@@ -260,7 +266,7 @@ pub(crate) fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String
     let preview = messages
         .iter()
         .find_map(|message| agent_activity_preview(message))
-        .unwrap_or_else(|| "Codex command activity".into());
+        .unwrap_or_else(|| "Agent command activity".into());
     let started_at = messages
         .first()
         .map(|message| html_escape(&compact_local_time(&message.created_at)))
@@ -273,7 +279,7 @@ pub(crate) fn agent_activity_stack_html(messages: &[&AgentMessageRow]) -> String
     <div class="message-meta"><strong>Activity</strong><span class="message-log">{started_at}</span></div>
     <details class="tool-fold" data-fold-key="{fold_key}">
       <summary><span>{}</span><code>{}</code></summary>
-      <ol class="tool-stack" aria-label="Codex command activity">{rows}</ol>
+      <ol class="tool-stack" aria-label="Agent command activity">{rows}</ol>
     </details>
   </div>
  </article>"#,
@@ -379,6 +385,7 @@ pub(crate) fn fenced_text(text: &str) -> &str {
         .unwrap_or("")
 }
 
+#[cfg(test)]
 pub(crate) fn codex_transcript_html(index: &CodexIndex, thread_id: &str) -> io::Result<String> {
     let Some(conversation) = codex_conversation_by_id(index, thread_id) else {
         return Ok(r#"<p class="empty">Conversation not found.</p>"#.into());
@@ -390,6 +397,7 @@ pub(crate) fn codex_transcript_html(index: &CodexIndex, thread_id: &str) -> io::
     Ok(agent_messages_html(&messages))
 }
 
+#[cfg(test)]
 pub(crate) fn codex_transcript_count(html: &str) -> Option<usize> {
     let count = html.matches("data-message-entry").count();
     (count > 0).then_some(count)

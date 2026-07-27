@@ -1,3 +1,4 @@
+use crate::AgentHarness;
 use crate::AgentMessageRow;
 use crate::AgentSlotRow;
 use crate::AgentSlotSeed;
@@ -14,13 +15,16 @@ use crate::stop_agent_job;
 use rusqlite::OptionalExtension;
 
 pub(crate) fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlotRow>> {
-    let mut stmt = db.prepare("SELECT id, name, workdir, goal FROM agent_slots ORDER BY id ASC")?;
+    let mut stmt =
+        db.prepare("SELECT id, name, workdir, goal, harness FROM agent_slots ORDER BY id ASC")?;
     stmt.query_map([], |row| {
+        let harness = row.get::<_, String>(4)?;
         Ok(AgentSlotRow {
             id: row.get(0)?,
             name: row.get(1)?,
             workdir: row.get(2)?,
             goal: row.get(3)?,
+            harness: AgentHarness::parse(&harness).unwrap_or(AgentHarness::LegacyCodex),
         })
     })?
     .collect()
@@ -28,24 +32,36 @@ pub(crate) fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlo
 
 pub(crate) fn get_agent_slot(db: &Connection, id: i64) -> rusqlite::Result<Option<AgentSlotRow>> {
     db.query_row(
-        "SELECT id, name, workdir, goal FROM agent_slots WHERE id = ?1",
+        "SELECT id, name, workdir, goal, harness FROM agent_slots WHERE id = ?1",
         params![id],
         |row| {
+            let harness = row.get::<_, String>(4)?;
             Ok(AgentSlotRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 workdir: row.get(2)?,
                 goal: row.get(3)?,
+                harness: AgentHarness::parse(&harness).unwrap_or(AgentHarness::LegacyCodex),
             })
         },
     )
     .optional()
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_agent_slot(
     db: &Connection,
     name: &str,
     workdir: &Path,
+) -> rusqlite::Result<i64> {
+    ensure_agent_slot_with_harness(db, name, workdir, AgentHarness::Pi)
+}
+
+pub(crate) fn ensure_agent_slot_with_harness(
+    db: &Connection,
+    name: &str,
+    workdir: &Path,
+    harness: AgentHarness,
 ) -> rusqlite::Result<i64> {
     let existing = db
         .query_row(
@@ -58,8 +74,13 @@ pub(crate) fn ensure_agent_slot(
         return Ok(id);
     }
     db.execute(
-        "INSERT INTO agent_slots (name, workdir, created_at) VALUES (?1, ?2, ?3)",
-        params![name, workdir.to_string_lossy(), Utc::now().to_rfc3339()],
+        "INSERT INTO agent_slots (name, workdir, harness, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            name,
+            workdir.to_string_lossy(),
+            harness.as_str(),
+            Utc::now().to_rfc3339()
+        ],
     )?;
     Ok(db.last_insert_rowid())
 }
@@ -74,21 +95,28 @@ pub(crate) fn create_agent_slot(
     db: &Connection,
     requested_name: &str,
     workdir: &Path,
+    harness: AgentHarness,
 ) -> rusqlite::Result<AgentSlotRow> {
     let base = agent_slot_base_name(requested_name, workdir);
     let name = next_agent_slot_name(db, &base)?;
-    insert_agent_slot(db, &name, workdir, "")
+    insert_agent_slot(db, &name, workdir, "", harness)
 }
 
 /// Creates a sibling lane for work that must run in parallel with an existing
-/// Codex turn.  The sibling gets its own message log and saved Codex thread.
+/// turn. The sibling gets its own message log, harness, and saved session.
 pub(crate) fn create_parallel_agent_slot(
     db: &Connection,
     source: &AgentSlotRow,
 ) -> rusqlite::Result<AgentSlotRow> {
     let base = parallel_agent_slot_base(&source.name);
     let name = next_agent_slot_name(db, &base)?;
-    insert_agent_slot(db, &name, Path::new(&source.workdir), &source.goal)
+    insert_agent_slot(
+        db,
+        &name,
+        Path::new(&source.workdir),
+        &source.goal,
+        source.harness,
+    )
 }
 
 fn insert_agent_slot(
@@ -96,17 +124,26 @@ fn insert_agent_slot(
     name: &str,
     workdir: &Path,
     goal: &str,
+    harness: AgentHarness,
 ) -> rusqlite::Result<AgentSlotRow> {
     let workdir = workdir.to_string_lossy().to_string();
     db.execute(
-        "INSERT INTO agent_slots (name, workdir, goal, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![name, workdir, goal, Utc::now().to_rfc3339()],
+        "INSERT INTO agent_slots (name, workdir, goal, harness, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            name,
+            workdir,
+            goal,
+            harness.as_str(),
+            Utc::now().to_rfc3339()
+        ],
     )?;
     Ok(AgentSlotRow {
         id: db.last_insert_rowid(),
         name: name.to_string(),
         workdir,
         goal: goal.to_string(),
+        harness,
     })
 }
 
@@ -135,7 +172,7 @@ fn parallel_agent_slot_base(name: &str) -> String {
         .map(|(base, _)| base)
         .unwrap_or(&normalized);
     if base.is_empty() {
-        "codex".into()
+        "agent".into()
     } else {
         base.to_string()
     }
@@ -172,15 +209,16 @@ pub(crate) fn ensure_agent_slot_seeds(
     db: &Connection,
     seeds: &[AgentSlotSeed],
     default_workdir: &Path,
+    default_harness: AgentHarness,
 ) -> rusqlite::Result<()> {
     if seeds.is_empty() {
         for name in DEFAULT_AGENT_SLOTS.split(',') {
-            ensure_agent_slot(db, name, default_workdir)?;
+            ensure_agent_slot_with_harness(db, name, default_workdir, default_harness)?;
         }
         return Ok(());
     }
     for seed in seeds {
-        ensure_agent_slot(db, &seed.name, &seed.workdir)?;
+        ensure_agent_slot_with_harness(db, &seed.name, &seed.workdir, default_harness)?;
     }
     Ok(())
 }
@@ -304,8 +342,9 @@ pub(crate) fn mark_interrupted_agent_runs(state: &AppState) {
                 slot.id,
                 "assistant",
                 &format!(
-                    "Mobailmux restarted while `{}` was running, so this local web transcript ended before Codex returned a final answer. Send a new message to continue from the saved Codex session.",
-                    slot.name
+                    "Mobailmux restarted while `{}` was running, so this local web transcript ended before {} returned a final answer. Send a new message to continue from the saved harness session.",
+                    slot.name,
+                    slot.harness.display_name()
                 ),
             );
         }

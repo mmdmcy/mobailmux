@@ -1,7 +1,9 @@
+use crate::AgentHarness;
 use crate::AgentSlotSummary;
 use crate::AppState;
 use crate::Arc;
 use crate::AxumPath;
+#[cfg(test)]
 use crate::CodexModel;
 use crate::Form;
 use crate::HeaderMap;
@@ -20,6 +22,7 @@ use crate::agent_slot_summary;
 use crate::agent_user_message_exists;
 use crate::append_agent_assistant;
 use crate::append_agent_message;
+#[cfg(test)]
 use crate::codex_model_catalog_snapshot;
 use crate::create_agent_slot;
 use crate::create_parallel_agent_slot;
@@ -54,6 +57,7 @@ struct AgentSlotsPoll {
     slots: Vec<AgentSlotSummary>,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct AgentModelCatalogPoll {
     models: Vec<CodexModel>,
@@ -86,6 +90,8 @@ pub(crate) struct AgentProjectForm {
     model: String,
     #[serde(default)]
     reasoning_effort: String,
+    #[serde(default)]
+    harness: String,
 }
 
 pub(crate) async fn agent_message_create(
@@ -106,7 +112,7 @@ pub(crate) async fn agent_message_create(
     let Some(slot) = slot else {
         return Redirect::to("/agents").into_response();
     };
-    let settings = requested_agent_run_settings(&state, &form.model, &form.reasoning_effort);
+    let settings = requested_agent_run_settings(&slot, &form.model, &form.reasoning_effort);
     if form.control.trim().eq_ignore_ascii_case("stop") {
         let stopped = stop_agent_job(&state, slot.id);
         let message = if stopped {
@@ -240,7 +246,10 @@ pub(crate) async fn agent_project_create(
     }
     let slot = {
         let db = state.db.lock().unwrap();
-        create_agent_slot(&db, &form.name, &workdir)
+        let harness = AgentHarness::parse(&form.harness)
+            .filter(|harness| harness.is_runnable())
+            .unwrap_or(state.config.default_harness);
+        create_agent_slot(&db, &form.name, &workdir, harness)
     };
     let slot = match slot {
         Ok(slot) => slot,
@@ -264,7 +273,7 @@ pub(crate) async fn agent_project_create(
         let db = state.db.lock().unwrap();
         let _ = append_agent_message(&db, slot.id, "user", &body);
     }
-    let settings = requested_agent_run_settings(&state, &form.model, &form.reasoning_effort);
+    let settings = requested_agent_run_settings(&slot, &form.model, &form.reasoning_effort);
     start_agent_job(state.clone(), slot.id, body, settings);
     Redirect::to(&agent_location(Some(slot.id))).into_response()
 }
@@ -325,6 +334,7 @@ pub(crate) async fn agent_slots_state(
     Json(AgentSlotsPoll { slots: summaries }).into_response()
 }
 
+#[cfg(test)]
 pub(crate) async fn agent_model_catalog(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

@@ -15,7 +15,7 @@ pub(crate) use api::{codex_models_from_payload, codex_rate_window, codex_reset_c
 pub(crate) use sessions::codex_conversation_from_file;
 pub(crate) use sessions::{codex_content_text, codex_transcript_messages, load_codex_index};
 pub(crate) use state::{
-    codex_index_snapshot, codex_model_catalog_snapshot, open_db, refresh_codex_index,
+    codex_index_snapshot, codex_model_catalog_snapshot, refresh_codex_index,
     refresh_codex_index_blocking, refresh_codex_model_catalog,
 };
 pub(crate) use types::{

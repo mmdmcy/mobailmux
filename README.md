@@ -4,13 +4,14 @@ Mobailmux is the private control surface for local AI agent lanes. It includes
 a Rust browser UI and the existing `mbx` terminal command assets.
 
 Use it when you want a browser and tmux-oriented way to start, resume, monitor,
-and stop Codex work.
+and stop Pi or OpenCode work.
 
 ## Current Shape
 
 - Rust web service for Agents at `/` and `/agents`.
-- SQLite storage for agent messages and saved Codex thread identifiers.
-- Codex usage and manually confirmed reset controls.
+- SQLite storage for agent messages, selected harnesses, and saved session IDs.
+- Pi is the default harness; OpenCode is selectable for each new project lane.
+- Existing Codex-linked lanes migrate to read-only `legacy-codex` records.
 - Embedded web terminal, isolated as its own capability.
 - Existing `commands/bin/mbx` tmux helper remains available for terminal slots.
 - Private-by-default: run behind localhost, LAN, VPN, or tailnet access.
@@ -39,9 +40,12 @@ MOBAILMUX_AUTH_DISABLED=1 cargo run -- serve
 MOBAILMUX_BIND=127.0.0.1:8765
 MOBAILMUX_DB=data/mobailmux.sqlite
 MOBAILMUX_AGENT_DEFAULT_WORKDIR=~
-MOBAILMUX_AGENT_SLOTS=codex
-MOBAILMUX_AGENT_CODEX_BIN=codex
-MOBAILMUX_AGENT_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
+MOBAILMUX_AGENT_SLOTS=agent
+MOBAILMUX_DEFAULT_HARNESS=pi
+MOBAILMUX_PI_BIN=pi
+MOBAILMUX_PI_ARGS=--approve
+MOBAILMUX_OPENCODE_BIN=opencode
+MOBAILMUX_OPENCODE_ARGS=--auto
 MOBAILMUX_AGENT_PROGRESS_NOTES=0
 MOBAILMUX_PASSWORD_HASH=<argon2 hash>
 MOBAILMUX_COOKIE_SECRET=<random hex>
@@ -57,8 +61,8 @@ commands/bin/mbx
 
 It manages reusable tmux workspaces (`a` through `j`) and enables tmux mouse
 mode for scrolling. `mbx r <slot>` attaches to that exact tmux workspace;
-`mbx q <slot>` stops one, and `mbx s`/`mbx start`/`mbx new` remain optional
-Codex-launcher conveniences. Run:
+`mbx q <slot>` stops one, and `mbx s`/`mbx start`/`mbx new` launch Pi by
+default or OpenCode with `--harness opencode`. Run:
 
 ```sh
 commands/bin/mbx help

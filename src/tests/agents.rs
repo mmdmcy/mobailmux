@@ -1,4 +1,5 @@
 use crate::AgentMessageRow;
+use crate::AgentHarness;
 use crate::AgentRunSettings;
 use crate::AgentSlotRow;
 use crate::CodexModel;
@@ -9,7 +10,7 @@ use crate::Path;
 use crate::PathBuf;
 use crate::TokioCommand;
 use crate::Uuid;
-use crate::agent_codex_args_for_command;
+use crate::agent_command_label;
 use crate::agent_execution_mode_html;
 use crate::agent_messages_html;
 use crate::agent_session;
@@ -23,6 +24,8 @@ use crate::discover_codex_skill_suggestions;
 use crate::ensure_agent_slot;
 use crate::env;
 use crate::fs;
+use crate::harness_session_id;
+use crate::harness_stdout_agent_message;
 use crate::json_for_inline_script;
 use crate::looks_like_agent_control_request;
 use crate::message_body_html;
@@ -39,6 +42,46 @@ use crate::persistence;
         assert_eq!(normalize_agent_command_text("go ship it"), "goal ship it");
         assert_eq!(normalize_agent_command_text("mod"), "model");
         assert_eq!(normalize_agent_command_text("sta"), "status");
+    }
+
+    #[test]
+    fn harness_json_parsers_keep_sessions_and_final_text() {
+        let pi_session = serde_json::json!({
+            "type": "session",
+            "id": "pi-session"
+        });
+        let pi_message = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Pi done"}]
+            }
+        });
+        assert_eq!(
+            harness_session_id(AgentHarness::Pi, &pi_session),
+            Some("pi-session")
+        );
+        assert_eq!(
+            harness_stdout_agent_message(AgentHarness::Pi, &pi_message),
+            Some(("Pi done".into(), true))
+        );
+
+        let opencode_message = serde_json::json!({
+            "type": "text",
+            "sessionID": "oc-session",
+            "part": {
+                "text": "OpenCode done",
+                "metadata": {"openai": {"phase": "final_answer"}}
+            }
+        });
+        assert_eq!(
+            harness_session_id(AgentHarness::OpenCode, &opencode_message),
+            Some("oc-session")
+        );
+        assert_eq!(
+            harness_stdout_agent_message(AgentHarness::OpenCode, &opencode_message),
+            Some(("OpenCode done".into(), true))
+        );
     }
 
     #[test]
@@ -105,8 +148,8 @@ use crate::persistence;
             AgentRunSettings::default()
         );
 
-        let mut command = TokioCommand::new("codex");
-        apply_agent_run_settings(&mut command, &settings);
+        let mut command = TokioCommand::new("pi");
+        apply_agent_run_settings(&mut command, &settings, AgentHarness::Pi);
         let args = command
             .as_std()
             .get_args()
@@ -117,27 +160,28 @@ use crate::persistence;
             vec![
                 "--model",
                 "gpt-test",
-                "--config",
-                "model_reasoning_effort=\"high\""
+                "--thinking",
+                "high"
             ]
         );
     }
 
     #[test]
-    fn codexunsafe_wrapper_drops_duplicate_yolo_flag() {
+    fn harness_command_labels_are_explicit() {
         let config = Config {
             bind: "127.0.0.1:0".into(),
             db_path: PathBuf::new(),
             agent_default_workdir: PathBuf::new(),
-            agent_codex_bin: "/usr/local/bin/codexunsafe".into(),
-            agent_codex_args: vec![
-                "--dangerously-bypass-approvals-and-sandbox".into(),
-                "--color".into(),
-                "never".into(),
-            ],
+            default_harness: AgentHarness::Pi,
+            pi_bin: "/usr/local/bin/pi".into(),
+            pi_args: vec!["--approve".into()],
+            opencode_bin: "/usr/local/bin/opencode".into(),
+            opencode_args: vec!["--auto".into()],
             agent_progress_notes: false,
-            codex_home: PathBuf::new(),
-            codex_reset_command: None,
+            legacy_codex_bin: "codex".into(),
+            legacy_codex_args: Vec::new(),
+            legacy_codex_home: PathBuf::new(),
+            legacy_codex_reset_command: None,
             agent_slots: Vec::new(),
             user: "mobailmux".into(),
             password_hash: None,
@@ -146,10 +190,12 @@ use crate::persistence;
         };
 
         assert_eq!(
-            agent_codex_args_for_command(&config),
-            vec!["--color", "never"]
+            agent_command_label(&config, AgentHarness::Pi),
+            "/usr/local/bin/pi --approve"
         );
-        assert!(agent_execution_mode_html(&config).contains("data-yolo-mode"));
+        assert!(
+            agent_execution_mode_html(&config, AgentHarness::OpenCode).contains("OpenCode")
+        );
     }
 
     #[test]
@@ -166,6 +212,7 @@ use crate::persistence;
             name: "codex".into(),
             workdir: "/work/app".into(),
             goal: String::new(),
+            harness: AgentHarness::Pi,
         };
 
         let prompt = build_agent_prompt(&slot, "fix the bug", false);
@@ -182,6 +229,7 @@ use crate::persistence;
             name: "codex".into(),
             workdir: "/work/app".into(),
             goal: "Keep the app deployable.".into(),
+            harness: AgentHarness::Pi,
         };
 
         let prompt = build_agent_prompt(&slot, "fix the bug", false);

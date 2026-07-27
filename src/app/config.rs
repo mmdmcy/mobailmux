@@ -1,5 +1,5 @@
+use crate::AgentHarness;
 use crate::PathBuf;
-use crate::default_codex_bin;
 use crate::default_home_dir;
 use crate::env;
 use crate::env_flag;
@@ -14,11 +14,20 @@ pub(crate) struct Config {
     pub(crate) bind: String,
     pub(crate) db_path: PathBuf,
     pub(crate) agent_default_workdir: PathBuf,
-    pub(crate) agent_codex_bin: String,
-    pub(crate) agent_codex_args: Vec<String>,
+    pub(crate) default_harness: AgentHarness,
+    pub(crate) pi_bin: String,
+    pub(crate) pi_args: Vec<String>,
+    pub(crate) opencode_bin: String,
+    pub(crate) opencode_args: Vec<String>,
     pub(crate) agent_progress_notes: bool,
-    pub(crate) codex_home: PathBuf,
-    pub(crate) codex_reset_command: Option<Vec<String>>,
+    #[cfg(test)]
+    pub(crate) legacy_codex_bin: String,
+    #[cfg(test)]
+    pub(crate) legacy_codex_args: Vec<String>,
+    #[cfg(test)]
+    pub(crate) legacy_codex_home: PathBuf,
+    #[cfg(test)]
+    pub(crate) legacy_codex_reset_command: Option<Vec<String>>,
     pub(crate) agent_slots: Vec<AgentSlotSeed>,
     pub(crate) user: String,
     pub(crate) password_hash: Option<String>,
@@ -41,20 +50,34 @@ impl Config {
         let agent_default_workdir = env::var("MOBAILMUX_AGENT_DEFAULT_WORKDIR")
             .map(|value| expand_local_path(&value))
             .unwrap_or_else(|_| default_home_dir());
-        let agent_codex_bin =
-            env::var("MOBAILMUX_AGENT_CODEX_BIN").unwrap_or_else(|_| default_codex_bin());
-        let agent_codex_args = env::var("MOBAILMUX_AGENT_CODEX_ARGS")
+        let default_harness = env::var("MOBAILMUX_DEFAULT_HARNESS")
+            .ok()
+            .and_then(|value| AgentHarness::parse(&value))
+            .filter(|harness| harness.is_runnable())
+            .unwrap_or_default();
+        let pi_bin = env::var("MOBAILMUX_PI_BIN").unwrap_or_else(|_| "pi".into());
+        let pi_args = env::var("MOBAILMUX_PI_ARGS")
+            .ok()
+            .map(|value| split_env_args(&value))
+            .unwrap_or_else(|| vec!["--approve".into()]);
+        let opencode_bin = env::var("MOBAILMUX_OPENCODE_BIN").unwrap_or_else(|_| "opencode".into());
+        let opencode_args = env::var("MOBAILMUX_OPENCODE_ARGS")
+            .ok()
+            .map(|value| split_env_args(&value))
+            .unwrap_or_else(|| vec!["--auto".into()]);
+        let agent_progress_notes = env_flag("MOBAILMUX_AGENT_PROGRESS_NOTES", false);
+        #[cfg(test)]
+        let legacy_codex_bin =
+            env::var("MOBAILMUX_LEGACY_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+        #[cfg(test)]
+        let legacy_codex_args = env::var("MOBAILMUX_LEGACY_CODEX_ARGS")
             .ok()
             .map(|value| split_env_args(&value))
             .unwrap_or_default();
-        let agent_progress_notes = env_flag("MOBAILMUX_AGENT_PROGRESS_NOTES", false);
-        let codex_home = env::var("CODEX_HOME")
+        #[cfg(test)]
+        let legacy_codex_home = env::var("MOBAILMUX_LEGACY_CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_home_dir().join(".codex"));
-        let codex_reset_command = env::var("MOBAILMUX_CODEX_RESET_COMMAND")
-            .ok()
-            .map(|value| split_env_args(&value))
-            .filter(|parts| !parts.is_empty());
         let agent_slots = parse_agent_slot_seeds(
             env::var("MOBAILMUX_AGENT_SLOTS").ok(),
             &agent_default_workdir,
@@ -80,11 +103,20 @@ impl Config {
             bind,
             db_path,
             agent_default_workdir,
-            agent_codex_bin,
-            agent_codex_args,
+            default_harness,
+            pi_bin,
+            pi_args,
+            opencode_bin,
+            opencode_args,
             agent_progress_notes,
-            codex_home,
-            codex_reset_command,
+            #[cfg(test)]
+            legacy_codex_bin,
+            #[cfg(test)]
+            legacy_codex_args,
+            #[cfg(test)]
+            legacy_codex_home,
+            #[cfg(test)]
+            legacy_codex_reset_command: None,
             agent_slots,
             user,
             password_hash,

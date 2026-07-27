@@ -1,3 +1,4 @@
+use crate::AgentHarness;
 use crate::AgentProgress;
 use crate::AgentRun;
 use crate::AgentRunSettings;
@@ -16,11 +17,11 @@ use crate::Stdio;
 use crate::TokioCommand;
 use crate::Utc;
 use crate::Uuid;
-use crate::agent_codex_args_for_command;
 use crate::agent_run_settings_label;
 use crate::agent_session;
 use crate::append_agent_assistant;
 use crate::apply_agent_run_settings;
+#[cfg(test)]
 use crate::codex_content_text;
 use crate::env;
 use crate::fs;
@@ -145,12 +146,22 @@ async fn run_agent_job(
         state.agent_jobs.lock().unwrap().remove(&slot_id);
         return;
     };
+    if !slot.harness.is_runnable() {
+        append_agent_assistant(
+            &state,
+            slot_id,
+            "This is a retained legacy Codex lane. Its messages are preserved, but Mobailmux will not resume or launch Codex. Start a new Pi or OpenCode project lane to continue.",
+        );
+        state.agent_jobs.lock().unwrap().remove(&slot_id);
+        return;
+    }
     append_agent_assistant(
         &state,
         slot_id,
         &format!(
-            "{} started in `{}`{}.",
+            "{} started {} in `{}`{}.",
             slot.name,
+            slot.harness.display_name(),
             slot.workdir,
             agent_run_settings_label(&settings)
         ),
@@ -168,35 +179,47 @@ async fn run_agent_job(
     let use_resume = session
         .as_ref()
         .is_some_and(|(_, workdir)| workdir == &slot.workdir);
-    let out_path = env::temp_dir().join(format!(
-        "mobailmux-agent-{}-{}.txt",
-        slot_id,
-        Uuid::new_v4().simple()
-    ));
-    let mut command = TokioCommand::new(&state.config.agent_codex_bin);
-    command.arg("exec");
-    if use_resume {
-        command.arg("resume").arg("--json");
-    } else {
-        command.arg("--json");
-    }
-    command.args(agent_codex_args_for_command(&state.config));
-    apply_agent_run_settings(&mut command, &settings);
-    if use_resume {
-        if let Some((thread_id, _)) = session {
+    let binary = match slot.harness {
+        AgentHarness::Pi => &state.config.pi_bin,
+        AgentHarness::OpenCode => &state.config.opencode_bin,
+        AgentHarness::LegacyCodex => unreachable!(),
+    };
+    let mut command = TokioCommand::new(binary);
+    match slot.harness {
+        AgentHarness::Pi => {
+            let session_id = session
+                .filter(|(_, workdir)| workdir == &slot.workdir)
+                .map(|(session_id, _)| session_id)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            if !use_resume {
+                let db = state.db.lock().unwrap();
+                let _ = set_agent_session(&db, slot_id, &session_id, &slot.workdir);
+            }
             command
-                .arg("--output-last-message")
-                .arg(&out_path)
-                .arg(thread_id)
-                .arg(prompt);
+                .args(&state.config.pi_args)
+                .arg("--mode")
+                .arg("json")
+                .arg("--session-id")
+                .arg(session_id)
+                .arg("--print");
+            apply_agent_run_settings(&mut command, &settings, slot.harness);
+            command.arg(prompt);
         }
-    } else {
-        command
-            .arg("--cd")
-            .arg(&slot.workdir)
-            .arg("--output-last-message")
-            .arg(&out_path)
-            .arg(prompt);
+        AgentHarness::OpenCode => {
+            command
+                .arg("run")
+                .arg("--format")
+                .arg("json")
+                .arg("--dir")
+                .arg(&slot.workdir)
+                .args(&state.config.opencode_args);
+            if use_resume && let Some((session_id, _)) = session {
+                command.arg("--session").arg(session_id);
+            }
+            apply_agent_run_settings(&mut command, &settings, slot.harness);
+            command.arg(prompt);
+        }
+        AgentHarness::LegacyCodex => unreachable!(),
     }
     command
         .current_dir(&slot.workdir)
@@ -214,7 +237,7 @@ async fn run_agent_job(
             append_agent_assistant(
                 &state,
                 slot_id,
-                &format!("Could not start `{}`: {err}", state.config.agent_codex_bin),
+                &format!("Could not start `{binary}`: {err}"),
             );
             state.agent_jobs.lock().unwrap().remove(&slot_id);
             if let Some(progress) = progress {
@@ -234,6 +257,7 @@ async fn run_agent_job(
             state.clone(),
             slot_id,
             slot.workdir.clone(),
+            slot.harness,
             stdout,
         ))
     });
@@ -294,30 +318,27 @@ async fn run_agent_job(
             slot_id,
             &format!("{} stopped after {elapsed}s.", slot.name),
         );
-        let _ = tokio::fs::remove_file(&out_path).await;
         return;
     }
     match status {
         Ok(status) if status.success() => {
-            let final_text = tokio::fs::read_to_string(&out_path)
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let streamed_final = stdout_summary
+            let final_text = stdout_summary
                 .final_text
                 .as_deref()
                 .or(stdout_summary.last_assistant_text.as_deref())
-                .is_some_and(|streamed| streamed.trim() == final_text.trim());
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if final_text.is_empty() {
-                if stdout_summary.last_assistant_text.is_none() {
-                    append_agent_assistant(
-                        &state,
-                        slot_id,
-                        "(Codex completed without a final message.)",
-                    );
-                }
-            } else if !streamed_final {
+                append_agent_assistant(
+                    &state,
+                    slot_id,
+                    &format!(
+                        "({} completed without a final message.)",
+                        slot.harness.display_name()
+                    ),
+                );
+            } else {
                 append_agent_assistant(&state, slot_id, &final_text);
             }
         }
@@ -342,13 +363,13 @@ async fn run_agent_job(
             );
         }
     }
-    let _ = tokio::fs::remove_file(&out_path).await;
 }
 
 async fn read_agent_stdout(
     state: Arc<AppState>,
     slot_id: i64,
     workdir: String,
+    harness: AgentHarness,
     stdout: tokio::process::ChildStdout,
 ) -> AgentStdoutSummary {
     let mut lines = BufReader::new(stdout).lines();
@@ -357,18 +378,11 @@ async fn read_agent_stdout(
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let event_type = event
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if event_type == "thread.started"
-            && let Some(thread_id) = event.get("thread_id").and_then(|value| value.as_str())
-        {
+        if let Some(thread_id) = harness_session_id(harness, &event) {
             let db = state.db.lock().unwrap();
             let _ = set_agent_session(&db, slot_id, thread_id, &workdir);
-            continue;
         }
-        if let Some((message, final_answer)) = codex_stdout_agent_message(&event) {
+        if let Some((message, final_answer)) = harness_stdout_agent_message(harness, &event) {
             let message = truncate_text(&message, MAX_AGENT_MESSAGE_CHARS);
             if !message.trim().is_empty()
                 && summary.last_assistant_text.as_deref() != Some(message.as_str())
@@ -386,7 +400,6 @@ async fn read_agent_stdout(
                         };
                         run.current.clear();
                     });
-                append_agent_assistant(&state, slot_id, &message);
                 summary.last_assistant_text = Some(message.clone());
                 if final_answer {
                     summary.final_text = Some(message);
@@ -394,63 +407,70 @@ async fn read_agent_stdout(
             }
             continue;
         }
-        if !matches!(event_type, "item.started" | "item.completed") {
-            continue;
-        }
-        let item = event.get("item").unwrap_or(&serde_json::Value::Null);
-        if item.get("type").and_then(|value| value.as_str()) != Some("command_execution") {
-            continue;
-        }
-        let command = item
-            .get("command")
-            .and_then(|value| value.as_str())
-            .unwrap_or("(unknown command)");
-        if event_type == "item.started" {
-            state
-                .agent_jobs
-                .lock()
-                .unwrap()
-                .entry(slot_id)
-                .and_modify(|run| {
-                    run.status = "running".into();
-                    run.current = truncate_text(command, 160);
-                });
-            append_agent_assistant(
-                &state,
-                slot_id,
-                &format!("running: `{}`", truncate_text(command, 700)),
-            );
-        } else {
-            state
-                .agent_jobs
-                .lock()
-                .unwrap()
-                .entry(slot_id)
-                .and_modify(|run| {
-                    run.current.clear();
-                });
-            let exit_code = item.get("exit_code").and_then(|value| value.as_i64());
-            if exit_code.is_some_and(|code| code != 0) {
-                let output = item
-                    .get("aggregated_output")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                append_agent_assistant(
-                    &state,
-                    slot_id,
-                    &format!(
-                        "command exit {}: `{}`\n```text\n{}\n```",
-                        exit_code.unwrap_or(-1),
-                        truncate_text(command, 500),
-                        truncate_text(output, 1200)
-                    ),
-                );
-            }
-        }
     }
     summary
 }
 
+pub(crate) fn harness_session_id(harness: AgentHarness, value: &serde_json::Value) -> Option<&str> {
+    match harness {
+        AgentHarness::Pi => (value.get("type").and_then(|item| item.as_str()) == Some("session"))
+            .then(|| value.get("id").and_then(|item| item.as_str()))
+            .flatten(),
+        AgentHarness::OpenCode => value.get("sessionID").and_then(|item| item.as_str()),
+        AgentHarness::LegacyCodex => None,
+    }
+}
+
+pub(crate) fn harness_stdout_agent_message(
+    harness: AgentHarness,
+    value: &serde_json::Value,
+) -> Option<(String, bool)> {
+    match harness {
+        AgentHarness::Pi => {
+            if value.get("type").and_then(|item| item.as_str()) != Some("message_end") {
+                return None;
+            }
+            let message = value.get("message")?;
+            if message.get("role").and_then(|item| item.as_str()) != Some("assistant") {
+                return None;
+            }
+            let text = json_content_text(message.get("content")?);
+            Some((text, true))
+        }
+        AgentHarness::OpenCode => {
+            if value.get("type").and_then(|item| item.as_str()) != Some("text") {
+                return None;
+            }
+            let part = value.get("part")?;
+            let text = part.get("text")?.as_str()?.to_string();
+            let final_answer = part
+                .pointer("/metadata/openai/phase")
+                .and_then(|item| item.as_str())
+                .is_some_and(is_final_agent_phase);
+            Some((text, final_answer))
+        }
+        AgentHarness::LegacyCodex => None,
+    }
+}
+
+fn json_content_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                let item_type = item.get("type").and_then(|value| value.as_str());
+                matches!(item_type, Some("text") | Some("output_text"))
+                    .then(|| item.get("text").and_then(|value| value.as_str()))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn codex_stdout_agent_message(value: &serde_json::Value) -> Option<(String, bool)> {
     let event_type = value.get("type").and_then(|value| value.as_str())?;
     if event_type == "response_item" {

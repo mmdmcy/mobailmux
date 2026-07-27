@@ -1,5 +1,52 @@
 use crate::PathBuf;
 use serde::Serialize;
+use std::fmt;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AgentHarness {
+    #[default]
+    Pi,
+    OpenCode,
+    LegacyCodex,
+}
+
+impl AgentHarness {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pi" => Some(Self::Pi),
+            "opencode" => Some(Self::OpenCode),
+            "legacy-codex" | "codex" => Some(Self::LegacyCodex),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::LegacyCodex => "legacy-codex",
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Pi => "Pi",
+            Self::OpenCode => "OpenCode",
+            Self::LegacyCodex => "Legacy Codex",
+        }
+    }
+
+    pub(crate) fn is_runnable(self) -> bool {
+        !matches!(self, Self::LegacyCodex)
+    }
+}
+
+impl fmt::Display for AgentHarness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Copy, Clone, Serialize)]
 pub(crate) struct AgentCommandSpec {
@@ -48,6 +95,7 @@ pub(crate) struct AgentSlotRow {
     pub(crate) name: String,
     pub(crate) workdir: String,
     pub(crate) goal: String,
+    pub(crate) harness: AgentHarness,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,4 +118,5 @@ pub(crate) struct AgentSlotSummary {
     pub(crate) running: bool,
     pub(crate) current: String,
     pub(crate) status: String,
+    pub(crate) harness: AgentHarness,
 }

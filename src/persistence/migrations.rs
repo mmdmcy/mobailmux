@@ -1,8 +1,6 @@
 use rusqlite::{Connection, params};
 
-use super::reset_ledger;
-
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 const BASE_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -10,6 +8,7 @@ CREATE TABLE IF NOT EXISTS agent_slots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
     workdir TEXT NOT NULL,
+    harness TEXT NOT NULL DEFAULT 'pi',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -44,7 +43,6 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current = current_version(conn)?;
     if current < 1 {
         conn.execute_batch(BASE_SCHEMA)?;
-        conn.execute_batch(reset_ledger::SCHEMA)?;
         record_migration(conn, 1)?;
     }
     if current < 2 {
@@ -58,6 +56,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if current < 4 {
         migrate_remove_attachments(conn)?;
         record_migration(conn, 4)?;
+    }
+    if current < 5 {
+        migrate_agent_slot_harness(conn)?;
+        record_migration(conn, 5)?;
     }
     debug_assert!(current_version(conn)? >= LATEST_SCHEMA_VERSION);
     Ok(())
@@ -147,6 +149,22 @@ fn migrate_remove_attachments(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_agent_slot_harness(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(agent_slots)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|column| column == "harness") {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE agent_slots
+         ADD COLUMN harness TEXT NOT NULL DEFAULT 'legacy-codex'",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BASE_SCHEMA, LATEST_SCHEMA_VERSION, current_version, migrate};
@@ -165,6 +183,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.iter().any(|column| column == "goal"));
+        assert!(columns.iter().any(|column| column == "harness"));
     }
 
     #[test]
@@ -287,5 +306,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attachments, 0);
+    }
+
+    #[test]
+    fn migration_five_marks_existing_slots_as_legacy_codex() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO schema_migrations (version) VALUES (1), (2), (3), (4);
+            CREATE TABLE agent_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                workdir TEXT NOT NULL,
+                goal TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO agent_slots (name, workdir, created_at)
+                VALUES ('existing', '/tmp', 'now');
+            "#,
+        )
+        .unwrap();
+
+        migrate(&db).unwrap();
+
+        let harness: String = db
+            .query_row(
+                "SELECT harness FROM agent_slots WHERE name = 'existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(harness, "legacy-codex");
     }
 }

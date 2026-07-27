@@ -1,7 +1,10 @@
 //! SQLite schema and reset-credit persistence.
 
+use crate::{Connection, Path, fs, io, io_other};
+
 mod agents;
 pub(crate) mod migrations;
+#[cfg(test)]
 pub(crate) mod reset_ledger;
 
 #[cfg(test)]
@@ -13,3 +16,12 @@ pub(crate) use agents::{
     list_agent_slots, mark_interrupted_agent_runs, reset_agent_slot_chat, set_agent_goal,
     set_agent_session, set_agent_workdir, update_agent_user_message,
 };
+
+pub(crate) fn open_db(path: &Path) -> io::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(path).map_err(io_other)?;
+    migrations::migrate(&conn).map_err(io_other)?;
+    Ok(conn)
+}

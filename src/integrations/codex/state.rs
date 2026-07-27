@@ -3,14 +3,9 @@ use crate::Arc;
 use crate::CODEX_INDEX_REFRESH_AFTER;
 use crate::CodexIndex;
 use crate::CodexModel;
-use crate::Connection;
 use crate::Instant;
-use crate::Path;
 use crate::Utc;
 use crate::fetch_codex_model_catalog;
-use crate::fs;
-use crate::io;
-use crate::io_other;
 use crate::load_codex_index;
 use crate::persistence;
 
@@ -107,13 +102,4 @@ pub(crate) fn attach_codex_reset_credit_estimate(state: &Arc<AppState>, index: &
     {
         summary.estimate = Some(estimate);
     }
-}
-
-pub(crate) fn open_db(path: &Path) -> io::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(path).map_err(io_other)?;
-    persistence::migrations::migrate(&conn).map_err(io_other)?;
-    Ok(conn)
 }

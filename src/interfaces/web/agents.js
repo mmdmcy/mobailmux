@@ -149,10 +149,6 @@
     dialog.addEventListener("close", syncDialogLock);
     dialog.addEventListener("cancel", () => setTimeout(syncDialogLock, 0));
   });
-  const codexPanel = document.getElementById("codexPanel");
-  document.querySelector("[data-codex-open]")?.addEventListener("click", () => openDialog(codexPanel));
-  document.querySelector("[data-codex-close]")?.addEventListener("click", () => closeDialog(codexPanel));
-  if ({reopen_usage}) openDialog(codexPanel);
   const projectPanel = document.getElementById("projectPanel");
   const projectForm = document.querySelector("[data-project-form]");
   document.querySelector("[data-project-open]")?.addEventListener("click", () => {
@@ -207,10 +203,6 @@
       button.setAttribute("aria-label", "Refreshing");
       button.setAttribute("title", "Refreshing");
     });
-  });
-   document.querySelector("[data-reset-form]")?.addEventListener("submit", (event) => {
-    const ok = window.confirm("Use a Codex reset now? This cannot be undone.");
-    if (!ok) event.preventDefault();
   });
   let dirty = false;
   let agentPollTimer = 0;

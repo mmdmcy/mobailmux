@@ -18,15 +18,16 @@ Usage:
   mbx check
 
 Slots:
-  A slot is a reusable tmux workspace. Start/new can launch Codex in it,
-  but a slot is not tied to Codex, a project, or a conversation.
+  A slot is a reusable tmux workspace. Start/new can launch Pi or OpenCode in
+  it, but a slot is not tied to one harness, project, or conversation.
   a, b, c, d, e, f, g, h, i, j
   legacy aliases: one..ten and 1..10
 
 Options:
   -C, --cd, --dir <dir>  Project directory.
-  --safe                 Use normal Codex approvals.
-  --unsafe               Bypass Codex approvals and sandbox. Default.
+  --harness <name>       pi or opencode. Default: pi.
+  --safe                 Use the harness's normal approval behavior.
+  --unsafe               Use the harness's autonomous mode. Default.
   --restart              Replace an existing slot before starting.
   --no-attach            Start without attaching to tmux.
   --dry-run              Print what would run.
@@ -34,7 +35,7 @@ Options:
 
 Examples:
   mbx start a
-  mbx s b
+  mbx s b --harness opencode
   mbx r a
   mbx q a
   mbx status
@@ -47,16 +48,16 @@ commands() {
 Commands:
   mbx start <slot> [directory] [prompt...]
   mbx s <slot> [directory] [prompt...]
-      Attach to a running slot, start Codex in an idle slot, or create it.
+      Attach to a running slot, start a harness in an idle slot, or create it.
 
   mbx new <slot> [directory] [prompt...]
   mbx n <slot> [directory] [prompt...]
-      Stop the slot if it exists, then start a fresh Codex process.
+      Stop the slot if it exists, then start a fresh harness process.
 
   mbx resume <slot> [directory]
   mbx r <slot> [directory]
       Attach to that exact tmux slot. If it does not exist, create a shell slot.
-      Once attached, run Codex, a shell, or anything else in the workspace.
+      Once attached, run Pi, OpenCode, a shell, or anything else.
 
   mbx stop <slot>
   mbx q <slot>
@@ -75,7 +76,7 @@ Commands:
       Show only currently running sessions.
 
   mbx check
-      Check the installed and latest Codex versions without changing npm config.
+      Show installed Pi and OpenCode versions.
 
   mbx help
   mbx command
@@ -128,7 +129,11 @@ slot_label() {
 }
 
 session_name() {
-  echo "${MBX_SESSION_PREFIX:-codex}-$1"
+  echo "${MBX_SESSION_PREFIX:-agent}-$1"
+}
+
+legacy_codex_session_name() {
+  echo "codex-$1"
 }
 
 legacy_session_name() {
@@ -139,8 +144,13 @@ legacy_session_name() {
 
 session_slot() {
   local session="$1"
-  local prefix="${MBX_SESSION_PREFIX:-codex}"
+  local prefix="${MBX_SESSION_PREFIX:-agent}"
   if [[ "$session" =~ ^${prefix}-([1-9]|10)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${MBX_INCLUDE_LEGACY_CODEX_SESSIONS:-1}" == "1" &&
+    "$session" =~ ^codex-([1-9]|10)$ ]]; then
     echo "${BASH_REMATCH[1]}"
     return 0
   fi
@@ -153,11 +163,15 @@ session_slot() {
 
 session_for_slot() {
   local slot="$1"
-  local session legacy
+  local session legacy_codex legacy
   session="$(session_name "$slot")"
+  legacy_codex="$(legacy_codex_session_name "$slot")"
   legacy="$(legacy_session_name "$slot")"
   if tmux has-session -t "$session" 2>/dev/null; then
     echo "$session"
+  elif [[ "${MBX_INCLUDE_LEGACY_CODEX_SESSIONS:-1}" == "1" ]] &&
+    tmux has-session -t "$legacy_codex" 2>/dev/null; then
+    echo "$legacy_codex"
   elif [[ "${MBX_INCLUDE_LEGACY_PLUGDECK_SESSIONS:-1}" == "1" ]] && tmux has-session -t "$legacy" 2>/dev/null; then
     echo "$legacy"
   else
@@ -179,105 +193,69 @@ attach_session() {
   fi
 }
 
-current_codex_version() {
-  codex --version 2>/dev/null | awk '{print $2}' | head -1
-}
-
-latest_codex_version() {
-  timeout 5 npm view @openai/codex version --min-release-age=0 2>/dev/null | tr -d '"[:space:]'
-}
-
-check_codex_update() {
-  local current latest
-  current="$(current_codex_version || true)"
-  latest="$(latest_codex_version || true)"
-
-  if [[ -z "$current" ]]; then
-    echo "Codex is not available on PATH."
-    return 1
-  fi
-
-  echo "Codex current: $current"
-
-  if [[ -z "$latest" ]]; then
-    echo "Codex latest:  unable to check npm right now"
-    return 0
-  fi
-
-  echo "Codex latest:  $latest"
-  echo "Npm gate:      min-release-age=14 remains enabled globally"
-
-  if [[ "$latest" != "$current" ]]; then
-    echo "Update note:   update Codex after the release has aged in, or deliberately bypass the npm gate for Codex only."
-  else
-    echo "Update note:   already current"
-  fi
-}
-
-maybe_codex_update_notice() {
-  [[ "${MBX_NO_UPDATE_CHECK:-}" == "1" ]] && return 0
-  [[ "${MBX_UPDATE_CHECK_ON_START:-0}" == "1" ]] || return 0
-
-  local cache_dir cache_file now last interval current latest
-  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mbx"
-  cache_file="$cache_dir/codex-latest"
-  interval="${MBX_UPDATE_CHECK_INTERVAL:-86400}"
-  now="$(date +%s)"
-  last=0
-
-  if [[ -f "$cache_file" ]]; then
-    last="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
-  fi
-
-  if (( now - last > interval )); then
-    mkdir -p "$cache_dir"
-    latest="$(latest_codex_version || true)"
-    if [[ -n "$latest" ]]; then
-      printf '%s\n' "$latest" > "$cache_file"
+check_harnesses() {
+  local failed=0 item binary version
+  for item in pi opencode; do
+    binary="$(harness_binary "$item")"
+    if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
+      printf '%-10s missing (%s)\n' "$item" "$binary"
+      failed=1
+      continue
     fi
-  elif [[ -f "$cache_file" ]]; then
-    latest="$(head -1 "$cache_file" 2>/dev/null || true)"
-  else
-    latest=""
-  fi
-
-  [[ -n "${latest:-}" ]] || return 0
-  current="$(current_codex_version || true)"
-  [[ -n "$current" ]] || return 0
-
-  if [[ "$latest" != "$current" ]]; then
-    echo "Codex update available: $current -> $latest. Check npm's release age before updating."
-  fi
+    version="$("$binary" --version 2>/dev/null | head -1)"
+    printf '%-10s %s\n' "$item" "${version:-installed}"
+  done
+  (( failed == 0 ))
 }
 
-codex_command_array() {
+normalize_harness() {
+  local value="${1:-${MOBAILMUX_DEFAULT_HARNESS:-pi}}"
+  value="${value,,}"
+  case "$value" in
+    pi|opencode) printf '%s\n' "$value" ;;
+    *) die "unknown harness: $value (expected pi or opencode)" ;;
+  esac
+}
+
+harness_binary() {
+  case "$1" in
+    pi) printf '%s\n' "${MOBAILMUX_PI_BIN:-pi}" ;;
+    opencode) printf '%s\n' "${MOBAILMUX_OPENCODE_BIN:-opencode}" ;;
+    *) return 1 ;;
+  esac
+}
+
+harness_command_array() {
   local output_name="$1"
   shift
   local -n output="$output_name"
-  local workdir="$1"
-  local unsafe="$2"
-  shift 2
-
-  if [[ "$unsafe" == "1" ]]; then
-    if command -v codexunsafe >/dev/null 2>&1; then
-      output=(codexunsafe --cd "$workdir")
-    else
-      output=(codex --dangerously-bypass-approvals-and-sandbox --cd "$workdir")
-    fi
-  else
-    output=(codex --cd "$workdir")
-  fi
-
-  if [[ $# -gt 0 ]]; then
-    output+=("$*")
-  fi
+  local harness="$1" workdir="$2" unsafe="$3"
+  shift 3
+  local binary
+  binary="$(harness_binary "$harness")"
+  case "$harness" in
+    pi)
+      output=("$binary")
+      [[ "$unsafe" == "1" ]] && output+=(--approve)
+      if [[ $# -gt 0 ]]; then
+        output+=("$*")
+      fi
+      ;;
+    opencode)
+      output=("$binary")
+      [[ "$unsafe" == "1" ]] && output+=(--auto)
+      output+=("$workdir")
+      if [[ $# -gt 0 ]]; then
+        output+=(--prompt "$*")
+      fi
+      ;;
+  esac
 }
 
-codex_command_line() {
-  local codex_cmd=()
-  codex_command_array codex_cmd "$@"
-
-  printf '%q ' "${codex_cmd[@]}"
+harness_command_line() {
+  local harness_cmd=()
+  harness_command_array harness_cmd "$@"
+  printf '%q ' "${harness_cmd[@]}"
 }
 
 resolve_workdir() {
@@ -493,6 +471,7 @@ run_slot() {
 
   local workdir_arg=""
   local unsafe=1
+  local harness="${MOBAILMUX_DEFAULT_HARNESS:-pi}"
   local restart=0
   local attach=1
   local dry_run=0
@@ -518,6 +497,11 @@ run_slot() {
       --unsafe)
         unsafe=1
         shift
+        ;;
+      --harness)
+        [[ $# -ge 2 ]] || die "$1 requires pi or opencode"
+        harness="$2"
+        shift 2
         ;;
       --restart)
         restart=1
@@ -556,10 +540,11 @@ run_slot() {
 
   local session label workdir cmdline
   local current
+  harness="$(normalize_harness "$harness")"
   label="$(slot_label "$slot")"
   workdir="$(resolve_workdir "$workdir_arg")"
   session="$(session_for_slot "$slot")"
-  cmdline="$(codex_command_line "$workdir" "$unsafe" "${prompt_parts[@]}")"
+  cmdline="$(harness_command_line "$harness" "$workdir" "$unsafe" "${prompt_parts[@]}")"
 
   if (( dry_run )); then
     echo "slot:    $label"
@@ -568,8 +553,6 @@ run_slot() {
     echo "command: $cmdline"
     return 0
   fi
-
-  maybe_codex_update_notice
 
   if tmux has-session -t "$session" 2>/dev/null; then
     tmux_mouse_on
@@ -583,7 +566,7 @@ run_slot() {
           if (( attach )); then
             attach_session "$session"
           else
-            echo "Started Codex in idle $label ($session) from $workdir"
+            echo "Started $harness in idle $label ($session) from $workdir"
           fi
           return 0
           ;;
@@ -601,7 +584,7 @@ run_slot() {
   tmux set-option -t "$session" remain-on-exit on >/dev/null
   tmux_mouse_on
   tmux send-keys -t "$session" "$cmdline" C-m
-  echo "Started Codex in $label ($session) from $workdir"
+  echo "Started $harness in $label ($session) from $workdir"
 
   if (( attach )); then
     attach_session "$session"
@@ -635,7 +618,7 @@ main() {
       ;;
     check)
       [[ $# -eq 1 ]] || die "check does not accept arguments"
-      check_codex_update
+      check_harnesses
       ;;
     stop|q)
       case "${2:-}" in

@@ -45,7 +45,7 @@ pub(crate) async fn codex_reset_post(
         "/agents?slot={}&refresh=1&usage=1",
         form.slot_id.unwrap_or_default()
     );
-    if let Some(command) = &state.config.codex_reset_command {
+    if let Some(command) = &state.config.legacy_codex_reset_command {
         let Some((program, args)) = command.split_first() else {
             return (StatusCode::CONFLICT, "no reset command configured").into_response();
         };
@@ -104,11 +104,14 @@ pub(crate) fn codex_usage_dialog(
     loaded: bool,
     slot_id: i64,
 ) -> String {
-    let command = html_escape(&agent_command_label(config));
+    let command = html_escape(&agent_command_label(
+        config,
+        crate::AgentHarness::LegacyCodex,
+    ));
     let reset_available = usage
         .and_then(|usage| usage.reset_credits.as_ref())
         .is_some_and(|credits| credits.available_count > 0);
-    let reset = if config.codex_reset_command.is_some() || reset_available {
+    let reset = if config.legacy_codex_reset_command.is_some() || reset_available {
         format!(
             r#"<form class="reset-form" action="/agents/codex/reset" method="post" data-reset-form>
   <input type="hidden" name="confirm" value="USE_RESET">

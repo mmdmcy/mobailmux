@@ -1,4 +1,5 @@
 use crate::Config;
+use crate::AgentHarness;
 use crate::PathBuf;
 use crate::audit_path;
 use crate::contains_tailscale_ipv4;
@@ -19,11 +20,16 @@ use crate::verify_password;
             bind: "127.0.0.1:0".into(),
             db_path: PathBuf::new(),
             agent_default_workdir: PathBuf::new(),
-            agent_codex_bin: "codex".into(),
-            agent_codex_args: Vec::new(),
+            default_harness: AgentHarness::Pi,
+            pi_bin: "pi".into(),
+            pi_args: Vec::new(),
+            opencode_bin: "opencode".into(),
+            opencode_args: Vec::new(),
             agent_progress_notes: false,
-            codex_home: PathBuf::new(),
-            codex_reset_command: None,
+            legacy_codex_bin: "codex".into(),
+            legacy_codex_args: Vec::new(),
+            legacy_codex_home: PathBuf::new(),
+            legacy_codex_reset_command: None,
             agent_slots: Vec::new(),
             user: "mobailmux".into(),
             password_hash: Some(hash),

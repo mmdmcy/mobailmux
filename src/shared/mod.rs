@@ -1,3 +1,4 @@
+use crate::AgentHarness;
 use crate::AgentSlotSeed;
 use crate::Config;
 use crate::DEFAULT_AGENT_SLOTS;
@@ -9,9 +10,12 @@ use crate::PAGE_CSS;
 use crate::Path;
 use crate::PathBuf;
 use crate::Response;
+#[cfg(test)]
 use crate::SystemTime;
+#[cfg(test)]
 use crate::Utc;
 use crate::env;
+#[cfg(test)]
 use crate::fs;
 use crate::io;
 use axum::response::IntoResponse;
@@ -37,66 +41,23 @@ pub(crate) fn expand_local_path(value: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
-pub(crate) fn default_codex_bin() -> String {
-    if command_in_path("codexunsafe") {
-        "codexunsafe".into()
-    } else {
-        let user_alias = default_home_dir().join(".local/bin/codexunsafe");
-        if user_alias.is_file() {
-            user_alias.to_string_lossy().into_owned()
-        } else {
-            "codex".into()
-        }
-    }
-}
-
-pub(crate) fn command_in_path(command: &str) -> bool {
-    if command.contains('/') {
-        return Path::new(command).is_file();
-    }
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|path| path.join(command).is_file()))
-        .unwrap_or(false)
-}
-
-pub(crate) fn agent_command_label(config: &Config) -> String {
-    let mut parts = vec![config.agent_codex_bin.clone()];
-    parts.extend(
-        agent_codex_args_for_command(config)
-            .into_iter()
-            .map(str::to_string),
-    );
+pub(crate) fn agent_command_label(config: &Config, harness: AgentHarness) -> String {
+    let (binary, args) = match harness {
+        AgentHarness::Pi => (&config.pi_bin, &config.pi_args),
+        AgentHarness::OpenCode => (&config.opencode_bin, &config.opencode_args),
+        AgentHarness::LegacyCodex => return "legacy-codex (read-only)".into(),
+    };
+    let mut parts = vec![binary.clone()];
+    parts.extend(args.iter().cloned());
     parts.join(" ")
 }
 
-pub(crate) fn agent_codex_args_for_command(config: &Config) -> Vec<&str> {
-    let wrapper_adds_yolo = Path::new(&config.agent_codex_bin)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "codexunsafe");
-    config
-        .agent_codex_args
-        .iter()
-        .map(String::as_str)
-        .filter(|arg| !(wrapper_adds_yolo && *arg == "--dangerously-bypass-approvals-and-sandbox"))
-        .collect()
-}
-
-pub(crate) fn agent_execution_mode_html(config: &Config) -> String {
-    let wrapper_adds_yolo = Path::new(&config.agent_codex_bin)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "codexunsafe");
-    if wrapper_adds_yolo
-        || config
-            .agent_codex_args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-    {
-        r#"<span class="agent-execution-mode yolo" data-yolo-mode title="YOLO mode: Codex bypasses approvals and sandboxing for this service" aria-label="YOLO mode: approvals and sandbox bypassed"><span aria-hidden="true">🔓</span><span>YOLO</span></span>"#.into()
-    } else {
-        r#"<span class="agent-execution-mode" title="Codex is using its configured approvals and sandbox policy" aria-label="Configured approvals and sandbox policy"><span aria-hidden="true">🔒</span><span>Guarded</span></span>"#.into()
-    }
+pub(crate) fn agent_execution_mode_html(config: &Config, harness: AgentHarness) -> String {
+    let label = harness.display_name();
+    let command = html_attr_escape(&agent_command_label(config, harness));
+    format!(
+        r#"<span class="agent-execution-mode" title="{command}" aria-label="{label} harness"><span>Harness</span><strong>{label}</strong></span>"#
+    )
 }
 
 pub(crate) fn split_env_args(value: &str) -> Vec<String> {
@@ -141,20 +102,24 @@ pub(crate) fn normalize_agent_slot_name(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn file_modified(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
 }
 
+#[cfg(test)]
 pub(crate) fn system_time_to_rfc3339(value: SystemTime) -> String {
     DateTime::<Utc>::from(value).to_rfc3339()
 }
 
+#[cfg(test)]
 pub(crate) fn epoch_to_rfc3339(epoch: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(epoch, 0).map(|value| value.to_rfc3339())
 }
 
+#[cfg(test)]
 pub(crate) fn format_epoch_date(epoch: i64) -> String {
     let Some(value) = epoch_to_rfc3339(epoch) else {
         return "unknown".into();
@@ -169,6 +134,7 @@ pub(crate) fn format_epoch_date(epoch: i64) -> String {
     format!("{} ({exact})", short_time(&value))
 }
 
+#[cfg(test)]
 pub(crate) fn short_time(value: &str) -> String {
     let Ok(parsed) = DateTime::parse_from_rfc3339(value) else {
         return if value.trim().is_empty() {
@@ -212,6 +178,7 @@ pub(crate) fn compact_local_time(value: &str) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
+#[cfg(test)]
 pub(crate) fn format_duration(seconds: i64, prefix: &str) -> String {
     let seconds = seconds.max(0);
     let minutes = seconds / 60;
@@ -225,6 +192,7 @@ pub(crate) fn format_duration(seconds: i64, prefix: &str) -> String {
     format!("{prefix}{}d", hours / 24)
 }
 
+#[cfg(test)]
 pub(crate) fn format_number(value: i64) -> String {
     let mut digits = value.abs().to_string();
     let mut out = String::new();

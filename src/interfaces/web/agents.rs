@@ -1,6 +1,5 @@
 use crate::AppState;
 use crate::Arc;
-use crate::CodexIndex;
 use crate::HeaderMap;
 use crate::MAX_AGENT_MESSAGE_CHARS;
 use crate::MAX_AGENT_SLOT_CHARS;
@@ -14,29 +13,17 @@ use crate::agent_messages_html;
 use crate::agent_run_for;
 use crate::agent_slot_rail_html;
 use crate::agent_slot_runtime;
-use crate::codex_conversation_by_id;
-use crate::codex_index_snapshot;
-use crate::codex_model_catalog_snapshot;
-use crate::codex_transcript_count;
-use crate::codex_transcript_html;
-use crate::codex_usage_dialog;
-use crate::html_attr_escape;
 use crate::html_escape;
-use crate::json_for_inline_script;
 use crate::list_agent_messages;
 use crate::list_agent_slots;
 use crate::page;
 use crate::page_guard;
-use crate::refresh_codex_index_blocking;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub(crate) struct AgentsQuery {
     slot: Option<i64>,
-    thread: Option<String>,
-    refresh: Option<String>,
-    usage: Option<String>,
     new_project: Option<String>,
     project_error: Option<String>,
 }
@@ -60,52 +47,19 @@ pub(crate) async fn agents_page(
     let Some(active_slot) = active_slot else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "missing agent slot").into_response();
     };
-    let mut codex_snapshot = if query.refresh.is_some() {
-        Some(refresh_codex_index_blocking(&state))
-    } else {
-        codex_index_snapshot(&state)
-    };
-    let selected_thread = query.thread.clone();
-    if selected_thread.as_ref().is_some_and(|thread_id| {
-        codex_snapshot
-            .as_ref()
-            .is_none_or(|index| codex_conversation_by_id(index, thread_id).is_none())
-    }) {
-        codex_snapshot = Some(refresh_codex_index_blocking(&state));
-    }
-    let codex_loaded = codex_snapshot.is_some();
-    let codex = codex_snapshot.unwrap_or_else(CodexIndex::empty);
     let messages = {
         let db = state.db.lock().unwrap();
         list_agent_messages(&db, active_slot.id).unwrap_or_default()
     };
     let runtime = agent_slot_runtime(&state, active_slot);
-    let messages_html = selected_thread
-        .as_deref()
-        .and_then(|thread_id| codex_transcript_html(&codex, thread_id).ok())
-        .unwrap_or_else(|| agent_messages_html(&messages));
-    let active_title = selected_thread
-        .as_deref()
-        .and_then(|thread_id| codex_conversation_by_id(&codex, thread_id))
-        .map(|conversation| conversation.title.clone())
-        .unwrap_or_else(|| active_slot.name.clone());
+    let messages_html = agent_messages_html(&messages);
+    let active_title = active_slot.name.clone();
     let active_title = html_escape(&active_title);
     let active_workdir = html_escape(&active_slot.workdir);
-    let message_count = if selected_thread.is_some() {
-        codex_transcript_count(&messages_html).unwrap_or(messages.len())
-    } else {
-        messages.len()
-    };
+    let message_count = messages.len();
     let slot_rail = agent_slot_rail_html(&state, &slots, active_slot.id);
-    let usage_dialog = codex_usage_dialog(
-        &state.config,
-        codex.usage.as_ref(),
-        codex_loaded,
-        active_slot.id,
-    );
     let terminal_panel =
         crate::features::terminal::panel_html(active_slot.id, &active_slot.workdir);
-    let reopen_usage = query.usage.is_some();
     let reopen_project = query.new_project.is_some();
     let project_error_html = query
         .project_error
@@ -113,19 +67,20 @@ pub(crate) async fn agents_page(
         .filter(|error| !error.trim().is_empty())
         .map(|error| format!(r#"<p class="error">{}</p>"#, html_escape(error)))
         .unwrap_or_default();
-    let viewing_transcript = selected_thread.is_some();
-    let refresh_thread_input = selected_thread
-        .as_deref()
-        .map(|thread| {
-            format!(
-                r#"<input type="hidden" name="thread" value="{}">"#,
-                html_attr_escape(thread)
-            )
-        })
-        .unwrap_or_default();
+    let viewing_transcript = false;
     let composer_suggestions_json = agent_composer_suggestions_json(&state.config);
-    let model_catalog_json = json_for_inline_script(&codex_model_catalog_snapshot(&state));
-    let execution_mode = agent_execution_mode_html(&state.config);
+    let model_catalog_json = "[]";
+    let execution_mode = agent_execution_mode_html(&state.config, active_slot.harness);
+    let pi_selected = if state.config.default_harness.as_str() == "pi" {
+        " selected"
+    } else {
+        ""
+    };
+    let opencode_selected = if state.config.default_harness.as_str() == "opencode" {
+        " selected"
+    } else {
+        ""
+    };
     let active_running = agent_run_for(&state, active_slot.id).is_some();
     let cancel_disabled = if active_running { "" } else { " disabled" };
     let agent_script = include_str!("agents.js")
@@ -133,13 +88,12 @@ pub(crate) async fn agents_page(
         .replace("{model_catalog_json}", &model_catalog_json)
         .replace("{active_slot_id}", &active_slot.id.to_string())
         .replace("{viewing_transcript}", &viewing_transcript.to_string())
-        .replace("{reopen_usage}", &reopen_usage.to_string())
         .replace("{reopen_project}", &reopen_project.to_string());
     page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-project-open aria-label="Start another project" title="Start another project">＋</button><button type="button" class="ghost nav-icon" data-codex-open aria-label="Usage" title="Usage">📊</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1">{refresh_thread_input}<button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
+<nav><a href="/">Mobailmux</a><div class="nav-actions"><button type="button" class="ghost nav-icon" data-project-open aria-label="Start another project" title="Start another project">＋</button><button type="button" class="ghost nav-icon" data-terminal-open aria-label="Terminal" title="Terminal">⌨</button><form action="/agents" method="get" data-refresh-form><input type="hidden" name="slot" value="{}"><input type="hidden" name="refresh" value="1"><button type="submit" class="ghost nav-icon" aria-label="Refresh" title="Refresh" data-refresh-button>↻</button></form><strong>Agents</strong></div></nav>
 <main class="chat-shell agent-shell">
   {slot_rail}
   <section class="chat-pane agent-pane">
@@ -152,12 +106,10 @@ pub(crate) async fn agents_page(
       <form action="/agents" method="post" class="agent-composer">
         <input name="slot_id" type="hidden" value="{}">
         <input name="edit_message_id" id="editMessageId" type="hidden" value="">
-        <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message Codex"></textarea>
+        <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message {}"></textarea>
         <div class="command-suggestions" id="commandSuggestions" role="listbox" hidden></div>
         <div class="edit-strip" id="editStrip" hidden><span>Editing message</span><button type="button" class="ghost" data-edit-clear>Discard</button></div>
         <div class="agent-settings" data-agent-settings>
-          <label class="agent-setting"><span>Model</span><select name="model" data-agent-model aria-label="Codex model" disabled><option>Loading models…</option></select></label>
-          <label class="agent-setting"><span>Thinking</span><select name="reasoning_effort" data-agent-reasoning aria-label="Thinking difficulty" disabled><option>Loading…</option></select></label>
           {execution_mode}
         </div>
         <button type="submit" name="control" value="stop" class="ghost cancel-button" data-cancel-button{cancel_disabled}>Cancel</button>
@@ -166,20 +118,18 @@ pub(crate) async fn agents_page(
     </section>
   </section>
 </main>
-{usage_dialog}
 {terminal_panel}
 <dialog class="project-panel" id="projectPanel">
   <header><strong>Start another project</strong><button type="button" class="icon" data-project-close aria-label="Close">x</button></header>
   <main>
-    <p class="muted">Each project gets its own lane, transcript, and Codex thread, so it can run independently.</p>
+    <p class="muted">Each project gets its own lane, transcript, and harness session, so it can run independently.</p>
     {project_error_html}
     <form action="/agents/projects" method="post" class="project-form" data-project-form>
       <input name="slot_id" type="hidden" value="{}">
-      <input name="model" type="hidden" data-project-model value="">
-      <input name="reasoning_effort" type="hidden" data-project-reasoning value="">
+      <label><span>Harness</span><select name="harness"><option value="pi"{pi_selected}>Pi</option><option value="opencode"{opencode_selected}>OpenCode</option></select></label>
       <label><span>Project folder</span><input name="workdir" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="/path/to/project"></label>
       <label><span>Lane name <em>(optional)</em></span><input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" autocomplete="off" placeholder="defaults to the folder name"></label>
-      <label><span>First task <em>(optional)</em></span><textarea name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Tell Codex what to do now, or open an empty lane."></textarea></label>
+      <label><span>First task <em>(optional)</em></span><textarea name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Tell the harness what to do now, or open an empty lane."></textarea></label>
       <div class="project-form-actions"><button type="submit">Open project</button></div>
     </form>
   </main>
@@ -190,6 +140,7 @@ pub(crate) async fn agents_page(
             active_slot.id,
             html_escape(&runtime.label),
             active_slot.id,
+            active_slot.harness.display_name(),
             active_slot.id
         ),
     )

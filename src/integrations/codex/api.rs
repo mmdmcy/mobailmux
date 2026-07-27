@@ -12,7 +12,6 @@ use crate::Config;
 use crate::StdCommand;
 use crate::Utc;
 use crate::Uuid;
-use crate::agent_codex_args_for_command;
 use crate::shell_single_quote;
 
 pub(crate) fn merge_codex_rate_limit_status(
@@ -211,8 +210,8 @@ pub(crate) fn consume_codex_rate_limit_reset_credit(config: &Config) -> Option<S
 }
 
 pub(crate) fn codex_app_server_request(config: &Config, input: &str) -> Option<String> {
-    let mut command_parts = vec![config.agent_codex_bin.as_str()];
-    command_parts.extend(agent_codex_args_for_command(config));
+    let mut command_parts = vec![config.legacy_codex_bin.as_str()];
+    command_parts.extend(config.legacy_codex_args.iter().map(String::as_str));
     command_parts.extend(["app-server", "--stdio"]);
     let command = command_parts
         .into_iter()

@@ -105,7 +105,7 @@ esac
         self.assertIn("b", status.stdout)
         self.assertIn("available", status.stdout)
         self.assertIn("j", status.stdout)
-        self.assertIn("codex-10", status.stdout)
+        self.assertIn("agent-10", status.stdout)
 
     def test_status_can_target_one_session(self) -> None:
         result = self.run_mbx_with_fake_tmux("status", "a")
@@ -156,10 +156,10 @@ esac
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Started tmux slot j (codex-10)", result.stdout)
+            self.assertIn("Started tmux slot j (agent-10)", result.stdout)
             self.assertNotIn("Codex", result.stdout)
             log = tmux_log.read_text(encoding="utf-8")
-            self.assertIn(f"new-session -d -s codex-10 -n codex-10 -c {workdir}", log)
+            self.assertIn(f"new-session -d -s agent-10 -n agent-10 -c {workdir}", log)
             self.assertIn("set-option -g mouse on", log)
             self.assertNotIn("send-keys", log)
 
@@ -182,9 +182,9 @@ esac
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("slot:    j", result.stdout)
-        self.assertIn("session: codex-10", result.stdout)
+        self.assertIn("session: agent-10", result.stdout)
         self.assertIn("state:   new shell", result.stdout)
-        self.assertIn("tmux new-session -d -s codex-10", result.stdout)
+        self.assertIn("tmux new-session -d -s agent-10", result.stdout)
 
     def test_short_quit_alias_kills_the_requested_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -199,7 +199,7 @@ esac
             self.assertIn("Stopped a (codex-1)", result.stdout)
             self.assertIn("kill-session -t codex-1", tmux_log.read_text(encoding="utf-8"))
 
-    def test_short_start_alias_launches_codex_in_a_new_slot(self) -> None:
+    def test_short_start_alias_launches_pi_in_a_new_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             workdir = root / "workspace"
@@ -218,8 +218,8 @@ esac
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Started Codex in a (codex-1)", result.stdout)
-            self.assertIn("send-keys -t codex-1", tmux_log.read_text(encoding="utf-8"))
+            self.assertIn("Started pi in a (agent-1)", result.stdout)
+            self.assertIn("send-keys -t agent-1", tmux_log.read_text(encoding="utf-8"))
 
     def test_tmux_mouse_mode_is_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,7 +232,7 @@ esac
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("set-option -g mouse on", tmux_log.read_text(encoding="utf-8"))
 
-    def test_start_remains_a_codex_launcher_convenience(self) -> None:
+    def test_start_uses_pi_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             workdir = root / "workspace"
@@ -251,10 +251,30 @@ esac
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Started Codex in a (codex-1)", result.stdout)
-            self.assertIn("send-keys -t codex-1", tmux_log.read_text(encoding="utf-8"))
+            self.assertIn("Started pi in a (agent-1)", result.stdout)
+            self.assertIn("send-keys -t agent-1", tmux_log.read_text(encoding="utf-8"))
 
-    def test_resume_rejects_codex_conversation_options(self) -> None:
+    def test_start_can_select_opencode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "workspace"
+            workdir.mkdir()
+            result = self.run_mbx_with_fake_tmux(
+                "start",
+                "b",
+                "--harness",
+                "opencode",
+                "--dry-run",
+                "-C",
+                str(workdir),
+                env_overrides={"MBX_FAKE_TMUX_NO_SESSION": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("session: agent-2", result.stdout)
+            self.assertIn(f"opencode --auto {workdir}", result.stdout)
+
+    def test_resume_rejects_harness_conversation_options(self) -> None:
         result = self.run_mbx_with_fake_tmux("r", "a", "--session-id", "anything")
 
         self.assertNotEqual(result.returncode, 0)

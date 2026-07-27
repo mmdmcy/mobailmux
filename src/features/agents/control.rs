@@ -1,8 +1,8 @@
+use crate::AgentHarness;
 use crate::AgentRunSettings;
 use crate::AgentSlotRow;
 use crate::AppState;
 use crate::Arc;
-use crate::CodexModel;
 use crate::MAX_AGENT_GOAL_CHARS;
 use crate::Path;
 use crate::TokioCommand;
@@ -10,12 +10,9 @@ use crate::agent_command_label;
 use crate::agent_control_text;
 use crate::agent_slot_runtime;
 use crate::append_agent_assistant;
-use crate::codex_model_catalog_snapshot;
-use crate::codex_usage_text;
 use crate::command_arg;
 use crate::list_agent_slots;
 use crate::normalize_agent_command_text;
-use crate::refresh_codex_index_blocking;
 use crate::reset_agent_slot_chat;
 use crate::set_agent_goal;
 use crate::truncate_text;
@@ -64,7 +61,7 @@ pub(crate) fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, b
             state,
             slot.id,
             &format!(
-                "Goal set for this slot. Future Codex messages will include:\n```text\n{goal}\n```"
+                "Goal set for this slot. Future harness messages will include:\n```text\n{goal}\n```"
             ),
         );
         return true;
@@ -82,27 +79,25 @@ pub(crate) fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, b
     }
     if lower == "status" {
         let runtime = agent_slot_runtime(state, slot);
-        let usage = refresh_codex_index_blocking(state).usage;
         append_agent_assistant(
             state,
             slot.id,
             &format!(
-                "{} is {}.\n{}",
+                "{} is {} using {}.",
                 slot.name,
                 runtime.label,
-                codex_usage_text(usage.as_ref())
+                slot.harness.display_name()
             ),
         );
         return true;
     }
     if lower == "usage" || lower == "limits" {
-        let usage = refresh_codex_index_blocking(state).usage;
         append_agent_assistant(
             state,
             slot.id,
             &format!(
-                "{}\n\nOpen the 📊 Usage panel to refresh again or use a reset credit manually.",
-                codex_usage_text(usage.as_ref())
+                "{} owns subscription usage and limit reporting. Mobailmux does not poll or reset provider credits.",
+                slot.harness.display_name()
             ),
         );
         return true;
@@ -113,7 +108,7 @@ pub(crate) fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, b
             slot.id,
             &format!(
                 "Choose a model and thinking difficulty in the composer. Agent command: `{}`",
-                agent_command_label(&state.config)
+                agent_command_label(&state.config, slot.harness)
             ),
         );
         return true;
@@ -165,16 +160,33 @@ pub(crate) fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
 }
 
 pub(crate) fn requested_agent_run_settings(
-    state: &Arc<AppState>,
+    slot: &AgentSlotRow,
     requested_model: &str,
     requested_reasoning_effort: &str,
 ) -> AgentRunSettings {
-    let models = codex_model_catalog_snapshot(state);
-    validate_agent_run_settings(&models, requested_model, requested_reasoning_effort)
+    if !slot.harness.is_runnable() {
+        return AgentRunSettings::default();
+    }
+    let model = requested_model
+        .trim()
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':'))
+        .then(|| requested_model.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let reasoning_effort = matches!(
+        requested_reasoning_effort.trim(),
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+    .then(|| requested_reasoning_effort.trim().to_string());
+    AgentRunSettings {
+        model,
+        reasoning_effort,
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_agent_run_settings(
-    models: &[CodexModel],
+    models: &[crate::CodexModel],
     requested_model: &str,
     requested_reasoning_effort: &str,
 ) -> AgentRunSettings {
@@ -209,15 +221,24 @@ pub(crate) fn agent_run_settings_label(settings: &AgentRunSettings) -> String {
     }
 }
 
-pub(crate) fn apply_agent_run_settings(command: &mut TokioCommand, settings: &AgentRunSettings) {
+pub(crate) fn apply_agent_run_settings(
+    command: &mut TokioCommand,
+    settings: &AgentRunSettings,
+    harness: AgentHarness,
+) {
     if let Some(model) = &settings.model {
         command.arg("--model").arg(model);
     }
     if let Some(effort) = &settings.reasoning_effort {
-        let value = serde_json::to_string(effort).unwrap_or_else(|_| "\"medium\"".into());
-        command
-            .arg("--config")
-            .arg(format!("model_reasoning_effort={value}"));
+        match harness {
+            AgentHarness::Pi => {
+                command.arg("--thinking").arg(effort);
+            }
+            AgentHarness::OpenCode => {
+                command.arg("--variant").arg(effort);
+            }
+            AgentHarness::LegacyCodex => {}
+        }
     }
 }
 
@@ -232,7 +253,7 @@ pub(crate) fn agent_help_text(state: &AppState) -> String {
     ];
     lines.extend(
         [
-            "- `/goal <objective>` sets a goal that is included in future Codex prompts",
+            "- `/goal <objective>` sets a goal that is included in future harness prompts",
             "- `/goal` shows the current goal",
             "- `/goal clear` or `/clear-goal` clears it",
             "- `/slots`",
@@ -267,11 +288,12 @@ pub(crate) fn agent_slots_status_text(state: &AppState) -> String {
             };
             let goal = slot.goal.trim();
             if goal.is_empty() {
-                format!("{}: {status}", slot.name)
+                format!("{} [{}]: {status}", slot.name, slot.harness)
             } else {
                 format!(
-                    "{}: {status} | goal: {}",
+                    "{} [{}]: {status} | goal: {}",
                     slot.name,
+                    slot.harness,
                     truncate_text(goal, 120)
                 )
             }

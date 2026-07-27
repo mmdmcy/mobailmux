@@ -24,8 +24,8 @@ use crate::truncate_text;
 use std::io::BufRead;
 
 pub(crate) fn load_codex_index(config: &Config) -> CodexIndex {
-    let thread_names = load_codex_thread_names(&config.codex_home);
-    let mut files = collect_codex_session_files(&config.codex_home);
+    let thread_names = load_codex_thread_names(&config.legacy_codex_home);
+    let mut files = collect_codex_session_files(&config.legacy_codex_home);
     files.sort_by_key(|path| Reverse(file_modified(path)));
     files.truncate(CODEX_SESSION_SCAN_LIMIT);
 

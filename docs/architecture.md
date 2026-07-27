@@ -9,10 +9,10 @@ entry point; `src/lib.rs` composes the application and exposes `run`.
 | --- | --- | --- |
 | Application | `src/lib.rs` | Process startup, configuration, and global state wiring |
 | Agent chat | `src/features/agents/` | Lanes, messages, queues, commands, prompts, and rendering |
-| Usage | `src/features/usage/` | Codex usage display and explicitly confirmed resets |
+| Harness runtime | `src/features/agents/runtime.rs` | Short-lived Pi and OpenCode subprocess adapters |
 | Terminal | `src/features/terminal/` | Authenticated embedded command execution |
 | Web | `src/interfaces/web/` | Routes, forms, polling responses, HTML, CSS, and JavaScript |
-| Codex | `src/integrations/codex/` | App-server, saved-session, model, and usage protocols |
+| Legacy parsers | `src/integrations/codex/` | Test-only compatibility for archived Codex data |
 | Persistence | `src/persistence/` | SQLite schema migrations and reset-credit ledger |
 | Security | `src/security/` | Authentication and public-source privacy audit |
 | Shared | `src/shared/` | Small helpers used by at least three ownership areas |
@@ -35,7 +35,7 @@ decisions in `security`. Do not create a generic `utils.rs`.
 ## Product boundaries
 
 File uploads, file browsing, folder browsing, and Mattermost are not Mobailmux
-capabilities. The working directory remains because Codex and the embedded
+capabilities. The working directory remains because the harness and embedded
 terminal execute inside it. Refreshing usage never consumes a reset credit;
 resets require a separate, explicit confirmation.
 

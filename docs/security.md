@@ -16,15 +16,18 @@ The Rust web UI uses password-hash auth and a signed HTTP-only cookie. It does n
 
 The agent transcript is stored in the Rust service SQLite database configured by `MOBAILMUX_DB`.
 
-## Codex Autonomy
+## Harness autonomy
 
 The example config uses:
 
 ```text
-MOBAILMUX_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
+MOBAILMUX_PI_ARGS=--approve
+MOBAILMUX_OPENCODE_ARGS=--auto
 ```
 
-That is convenient, but it lets Codex execute shell commands without approval. Use it only on machines and repositories where you understand the blast radius.
+Those defaults let the selected harness execute tools without repeated
+approval prompts. Use them only on machines and repositories where you
+understand the blast radius.
 
 Safer options:
 
@@ -41,7 +44,7 @@ Never commit:
 - web password hashes and cookie secrets
 - admin passwords
 - Mobailmux runtime state
-- Codex auth files
+- Pi and OpenCode auth files
 - private hostnames, private IPs, or personal restore docs
 
 Before publishing, run a secret scanner such as `gitleaks` or `trufflehog`.

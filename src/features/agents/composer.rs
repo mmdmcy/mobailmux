@@ -3,9 +3,13 @@ use crate::AGENT_COMMAND_SPECS;
 use crate::ComposerSuggestion;
 use crate::Config;
 use crate::HashSet;
+#[cfg(test)]
 use crate::Path;
+#[cfg(test)]
 use crate::PathBuf;
+#[cfg(test)]
 use crate::fs;
+#[cfg(test)]
 use crate::truncate_text;
 use serde::Serialize;
 
@@ -87,7 +91,7 @@ pub(crate) fn known_agent_command_names() -> Vec<&'static str> {
     names
 }
 
-pub(crate) fn agent_composer_suggestions_json(config: &Config) -> String {
+pub(crate) fn agent_composer_suggestions_json(_config: &Config) -> String {
     let mut suggestions = AGENT_COMMAND_SPECS
         .iter()
         .map(|command| ComposerSuggestion {
@@ -98,8 +102,6 @@ pub(crate) fn agent_composer_suggestions_json(config: &Config) -> String {
             takes_arg: command.takes_arg,
         })
         .collect::<Vec<_>>();
-    suggestions.extend(discover_codex_skill_suggestions(&config.codex_home));
-    suggestions.extend(discover_codex_plugin_suggestions(&config.codex_home));
     let mut seen = HashSet::new();
     suggestions.retain(|suggestion| {
         seen.insert(format!(
@@ -139,6 +141,7 @@ pub(crate) fn suggestion_kind_rank(kind: &str) -> usize {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn discover_codex_skill_suggestions(codex_home: &Path) -> Vec<ComposerSuggestion> {
     let mut files = Vec::new();
     collect_named_files(&codex_home.join("skills"), "SKILL.md", 5, &mut files);
@@ -167,6 +170,7 @@ pub(crate) fn discover_codex_skill_suggestions(codex_home: &Path) -> Vec<Compose
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn discover_codex_plugin_suggestions(codex_home: &Path) -> Vec<ComposerSuggestion> {
     let mut files = Vec::new();
     collect_named_files(&codex_home.join("plugins"), "plugin.json", 9, &mut files);
@@ -188,11 +192,13 @@ pub(crate) fn discover_codex_plugin_suggestions(codex_home: &Path) -> Vec<Compos
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn compact_text(value: &str, max_chars: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_text(&compact, max_chars).replace('\n', " ")
 }
 
+#[cfg(test)]
 pub(crate) fn collect_named_files(
     dir: &Path,
     file_name: &str,
@@ -215,6 +221,7 @@ pub(crate) fn collect_named_files(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn plugin_root_for_path(path: &Path) -> Option<PathBuf> {
     for ancestor in path.ancestors() {
         if ancestor.join(".codex-plugin/plugin.json").is_file() {
@@ -224,12 +231,14 @@ pub(crate) fn plugin_root_for_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn skill_description_from_file(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     raw.lines()
         .find_map(|line| yaml_string_field(line, "description"))
 }
 
+#[cfg(test)]
 pub(crate) fn plugin_manifest_description(plugin_root: &Path) -> Option<String> {
     let manifest = plugin_manifest_json(plugin_root)?;
     manifest
@@ -240,6 +249,7 @@ pub(crate) fn plugin_manifest_description(plugin_root: &Path) -> Option<String> 
         .map(str::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn plugin_manifest_field(plugin_root: &Path, field: &str) -> Option<String> {
     plugin_manifest_json(plugin_root)?
         .get(field)
@@ -247,11 +257,13 @@ pub(crate) fn plugin_manifest_field(plugin_root: &Path, field: &str) -> Option<S
         .map(str::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn plugin_manifest_json(plugin_root: &Path) -> Option<serde_json::Value> {
     let raw = fs::read_to_string(plugin_root.join(".codex-plugin/plugin.json")).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
+#[cfg(test)]
 pub(crate) fn yaml_string_field(line: &str, field: &str) -> Option<String> {
     let value = line.trim().strip_prefix(&format!("{field}:"))?.trim();
     if value.is_empty() {
