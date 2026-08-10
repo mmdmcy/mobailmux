@@ -25,13 +25,16 @@ MOBAILMUX_PI_ARGS=--approve
 MOBAILMUX_OPENCODE_ARGS=--auto
 ```
 
-Those defaults let the selected harness execute tools without repeated
-approval prompts. Use them only on machines and repositories where you
-understand the blast radius.
+OpenCode's `--auto` enables automatic approval, so use it only on machines and
+repositories where you understand the blast radius. Pi's `--approve` has a
+narrower meaning: it pre-approves project trust and does not bypass general tool
+permissions. Project trust still allows project-local Pi configuration and
+extensions to load, so it should only be granted to trusted repositories.
 
 Safer options:
 
-- remove the dangerous flag and handle approvals manually where possible
+- remove OpenCode `--auto` and handle approvals manually where possible
+- remove Pi `--approve` to keep its project-trust prompt
 - run Mobailmux in a container or VM
 - restrict the configured execution directory to a disposable clone
 - keep secrets out of the execution environment

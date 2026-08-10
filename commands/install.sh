@@ -54,10 +54,18 @@ mkdir -p "$bin_dir"
 
 src="$script_dir/bin/mbx"
 target="$bin_dir/mbx"
+resource_src="$script_dir/libexec/mobailmux"
+resource_target="$prefix/libexec/mobailmux"
 [[ -f "$src" ]] || die "missing $src"
+[[ -d "$resource_src" ]] || die "missing $resource_src"
 
 if (( copy_mode )); then
+  [[ -L "$target" ]] && rm -f "$target"
   install -m 0755 "$src" "$target"
+  mkdir -p "$resource_target"
+  install -m 0644 "$resource_src/opencode-state.js" "$resource_target/opencode-state.js"
+  install -m 0644 "$resource_src/opencode.json" "$resource_target/opencode.json"
+  install -m 0644 "$resource_src/pi-state.ts" "$resource_target/pi-state.ts"
 else
   ln -sfn "$src" "$target"
 fi

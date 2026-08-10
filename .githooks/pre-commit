@@ -6,7 +6,10 @@ github_o_marker='gh''o_'
 openai_marker='sk''-'
 blocked_private_content="(/home/[^[:space:]]+|/Users/[^[:space:]]+|/opt/[^[:space:]]+|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|${github_o_marker}[A-Za-z0-9_]+|${openai_marker}[A-Za-z0-9_-]+)"
 
-mapfile -t staged_paths < <(git diff --cached --name-only --diff-filter=ACMR)
+staged_paths=()
+while IFS= read -r path; do
+  staged_paths+=("$path")
+done < <(git diff --cached --name-only --diff-filter=ACMR)
 
 bad_paths=()
 for path in "${staged_paths[@]}"; do
@@ -25,7 +28,7 @@ if (( ${#bad_paths[@]} )); then
   exit 1
 fi
 
-if bad_content="$(git grep --cached -l -I -E "$blocked_private_content" -- . ':!.env.example' 2>/dev/null || true)"; [[ -n "$bad_content" ]]; then
+if bad_content="$(git grep --cached -l -I -E "$blocked_private_content" -- . ':!.env.example' ':!.githooks/pre-commit' 2>/dev/null || true)"; [[ -n "$bad_content" ]]; then
   printf 'Blocked commit: staged content contains local/private identifiers:\n' >&2
   printf '%s\n' "$bad_content" | sed 's/^/  /' >&2
   exit 1

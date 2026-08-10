@@ -51,18 +51,22 @@ MOBAILMUX_PASSWORD_HASH=<argon2 hash>
 MOBAILMUX_COOKIE_SECRET=<random hex>
 ```
 
+Pi's `--approve` flag pre-approves project trust; it is not a general
+tool-permission bypass. OpenCode's `--auto` enables automatic approval.
+
 ## Terminal `mbx`
 
-The existing shell command lives at:
+The shell command lives at:
 
 ```sh
 commands/bin/mbx
 ```
 
-It manages reusable tmux workspaces (`a` through `j`) and enables tmux mouse
-mode for scrolling. `mbx r <slot>` attaches to that exact tmux workspace;
-`mbx q <slot>` stops one, and `mbx s`/`mbx start`/`mbx new` launch Pi by
-default or OpenCode with `--harness opencode`. Run:
+It links reusable workspaces (`a` through `j`) into one mobile AI hub with
+clickable, folder-named tmux tabs and exact `RUNNING`, `WAITING`, `DONE`, and
+`ERROR` lifecycle badges. Tap `AGENTS` for the overview, `+NEW` to start a
+project, or `STOP` to close the selected agent. Pi is preferred when installed;
+otherwise Mobailmux uses OpenCode. Run:
 
 ```sh
 commands/bin/mbx help
