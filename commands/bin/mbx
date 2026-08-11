@@ -349,6 +349,33 @@ tmux_supports_control_ranges() {
   (( major > 3 || (major == 3 && minor >= 7) ))
 }
 
+# Termius (VTE) silently no-ops tmux display-menu/popup — menus return in milliseconds.
+tmux_menus_work() {
+  local term
+  [[ "${MBX_FORCE_TEXT_MENU:-}" == "1" ]] && return 1
+  [[ "${MBX_FORCE_TMUX_MENU:-}" == "1" ]] && return 0
+  term="$(tmux display-message -p '#{client_termtype}' 2>/dev/null || true)"
+  case "$term" in
+    VTE*|vte*|Termius*|termius*) return 1 ;;
+  esac
+  return 0
+}
+
+run_menu_in_home_pane() {
+  local hub pane cmd arg
+  hub="$(hub_session_name)"
+  ensure_hub
+  pane="$(tmux display-message -p -t "$hub:0" '#{pane_id}' 2>/dev/null || true)"
+  [[ -n "$pane" ]] || return 1
+  tmux select-window -t "$hub:0" >/dev/null 2>&1 || true
+  cmd="$(printf '%q' "$script_path")"
+  for arg in "$@"; do
+    cmd+=" $(printf '%q' "$arg")"
+  done
+  tmux send-keys -t "$pane" C-u 2>/dev/null || true
+  tmux send-keys -t "$pane" "$cmd" Enter
+}
+
 configure_slot_window() {
   local slot="$1" target="$2" requested_workdir="${3:-}"
   local label path name saved_workdir badge
@@ -395,7 +422,11 @@ configure_hub() {
     tmux bind-key -T "$key_table" MouseDown1Control2 run-shell "$stop_command"
   else
     tmux set-option -t "$hub" status-left '#[bold]#[range=left] AGENTS #[norange]#[default]' >/dev/null
-    tmux set-option -t "$hub" status-right 'tap AGENTS' >/dev/null
+    if tmux_menus_work; then
+      tmux set-option -t "$hub" status-right 'tap AGENTS' >/dev/null
+    else
+      tmux set-option -t "$hub" status-right 'type: mbx' >/dev/null
+    fi
     tmux set-option -t "$hub" status-right-length 11 >/dev/null
     tmux bind-key -T "$key_table" MouseDown1StatusLeft run-shell "$agents_command"
   fi
@@ -493,7 +524,7 @@ sync_hub() {
 
 attach_hub() {
   local slot="${1:-}"
-  local hub
+  local hub current_session
   sync_hub
   hub="$(hub_session_name)"
 
@@ -501,12 +532,20 @@ attach_hub() {
     tmux select-window -t "$(hub_target_for_slot "$slot")"
   fi
   if [[ -n "${TMUX:-}" ]]; then
+    current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
     if [[ -n "$slot" ]]; then
       tmux switch-client -t "$(hub_target_for_slot "$slot")"
+    elif [[ "$current_session" == "$hub" ]]; then
+      # Already inside the hub: bare `mbx` used to no-op switch-client and look
+      # like an instant exit. Open the clickable overview instead.
+      show_agents_menu
     else
       tmux switch-client -t "$hub"
     fi
   else
+    if [[ ! -t 0 || ! -t 1 ]]; then
+      die "mbx needs an interactive terminal. From Termius/SSH run: mbx"
+    fi
     exec tmux attach-session -t "$hub"
   fi
 }
@@ -1092,6 +1131,130 @@ project_menu_page_size() {
   printf '%s\n' "$size"
 }
 
+show_agents_text_ui() {
+  local slot label target state path name reply
+  sync_hub
+  printf '\nAI AGENTS\n'
+  printf '%s\n' '------------------------------'
+  for slot in 1 2 3 4 5 6 7 8 9 10; do
+    label="$(slot_label "$slot")"
+    target="$(slot_target "$slot" 2>/dev/null || true)"
+    if [[ -n "$target" ]]; then
+      state="$(agent_state "$target")"
+      path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
+      name="$(basename "${path:-project}")"
+      printf '  %s) %-8s %s\n' "$label" "$state" "$name"
+    else
+      printf '  %s) AVAILABLE\n' "$label"
+    fi
+  done
+  printf '%s\n' '------------------------------'
+  printf '  n) start a project\n'
+  printf '  x) stop current agent\n'
+  printf '  q) cancel\n\n'
+  printf 'Select: '
+  read -r reply || return 0
+  case "$reply" in
+    q|Q|'') return 0 ;;
+    n|N) show_projects_text_ui 1 ;;
+    x|X) show_stop_text_ui ;;
+    *)
+      slot="$(slot_number "$reply" 2>/dev/null || true)"
+      if [[ -z "$slot" ]]; then
+        printf 'unknown option: %s\n' "$reply"
+        return 0
+      fi
+      target="$(slot_target "$slot" 2>/dev/null || true)"
+      if [[ -n "$target" ]]; then
+        tmux select-window -t "$(hub_target_for_slot "$slot")"
+      else
+        printf 'slot %s is empty; choose n to start a project\n' "$reply"
+      fi
+      ;;
+  esac
+}
+
+show_projects_text_ui() {
+  local page="${1:-1}"
+  local root path name existing_slot target state index harness
+  local page_size first last has_next=0
+  local -a paths=()
+  local reply
+  [[ "$page" =~ ^[0-9]+$ ]] && (( page > 0 )) || die "project menu page must be a positive number"
+  root="$(projects_root)"
+  [[ -d "$root" ]] || die "projects directory does not exist: $root (set MBX_PROJECTS_DIR)"
+  sync_hub
+  page_size="$(project_menu_page_size)"
+  first=$(((page - 1) * page_size + 1))
+  last=$((first + page_size - 1))
+  index=0
+  while IFS= read -r path; do
+    paths+=("$path")
+  done < <(project_paths)
+  (( ${#paths[@]} > 0 )) || die "no project directories found in $root"
+  harness="$(normalize_harness "$(default_harness)" | tr '[:lower:]' '[:upper:]')"
+  printf '\nSTART WITH %s - PAGE %s\n' "$harness" "$page"
+  printf '%s\n' '------------------------------'
+  for path in "${paths[@]}"; do
+    index=$((index + 1))
+    if (( index > last )); then
+      has_next=1
+      break
+    fi
+    (( index >= first )) || continue
+    name="$(basename "$path")"
+    existing_slot="$(slot_for_workdir "$path" 2>/dev/null || true)"
+    if [[ -n "$existing_slot" ]]; then
+      target="$(slot_target "$existing_slot")"
+      state="$(agent_state "$target")"
+      printf '  %2d) %-8s %s\n' "$index" "$state" "$name"
+    else
+      printf '  %2d) +        %s\n' "$index" "$name"
+    fi
+  done
+  printf '%s\n' '------------------------------'
+  (( page > 1 )) && printf '  p) previous page\n'
+  (( has_next )) && printf '  n) next page\n'
+  printf '  q) cancel\n\n'
+  printf 'Project number: '
+  read -r reply || return 0
+  case "$reply" in
+    q|Q|'') return 0 ;;
+    p|P)
+      (( page > 1 )) || { printf 'already on first page\n'; return 0; }
+      show_projects_text_ui "$((page - 1))"
+      ;;
+    n|N)
+      (( has_next )) || { printf 'already on last page\n'; return 0; }
+      show_projects_text_ui "$((page + 1))"
+      ;;
+    *)
+      [[ "$reply" =~ ^[0-9]+$ ]] || { printf 'unknown option: %s\n' "$reply"; return 0; }
+      menu_project "$reply"
+      ;;
+  esac
+}
+
+show_stop_text_ui() {
+  local slot target state path name reply
+  slot="$(current_slot 2>/dev/null || true)"
+  if [[ -z "$slot" ]]; then
+    printf '\nSelect an agent tab first, then run stop again.\n'
+    return 0
+  fi
+  target="$(slot_target "$slot")"
+  state="$(agent_state "$target")"
+  path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
+  name="$(basename "${path:-project}")"
+  printf '\nStop %s (%s) — %s?\n' "$(slot_label "$slot")" "$state" "$name"
+  printf '  y) stop\n  q) cancel\n\nConfirm: '
+  read -r reply || return 0
+  case "$reply" in
+    y|Y|x|X) menu_stop "$slot" ;;
+    *) printf 'cancelled\n' ;;
+  esac
+}
+
 show_agents_menu() {
   local slot target label path name state state_label action
   local items=()
@@ -1101,6 +1264,17 @@ show_agents_menu() {
   fi
 
   sync_hub
+  if ! tmux_menus_work; then
+    # Termius/VTE: use a plain text UI in the pane. Status-bar run-shell has no
+    # tty, so re-dispatch into the home pane instead.
+    if [[ -t 1 ]]; then
+      show_agents_text_ui
+    else
+      run_menu_in_home_pane menu
+    fi
+    return 0
+  fi
+
   for slot in 1 2 3 4 5 6 7 8 9 10; do
     label="$(slot_label "$slot")"
     target="$(slot_target "$slot" 2>/dev/null || true)"
@@ -1127,8 +1301,16 @@ show_projects_menu() {
   local root path name existing_slot target state state_label action index harness
   local page_size first last has_next=0
   local items=()
-  [[ -n "${TMUX:-}" ]] || die "the clickable project menu requires an attached tmux client"
+  [[ -n "${TMUX:-}" ]] || die "the project menu requires an attached tmux client"
   [[ "$page" =~ ^[0-9]+$ ]] && (( page > 0 )) || die "project menu page must be a positive number"
+  if ! tmux_menus_work; then
+    if [[ -t 1 ]]; then
+      show_projects_text_ui "$page"
+    else
+      run_menu_in_home_pane projects-menu "$page"
+    fi
+    return 0
+  fi
   root="$(projects_root)"
   [[ -d "$root" ]] || die "projects directory does not exist: $root (set MBX_PROJECTS_DIR)"
   sync_hub
@@ -1196,7 +1378,15 @@ menu_project() {
 show_stop_menu() {
   local slot target state state_label path name
   local items=()
-  [[ -n "${TMUX:-}" ]] || die "the clickable stop menu requires an attached tmux client"
+  [[ -n "${TMUX:-}" ]] || die "the stop menu requires an attached tmux client"
+  if ! tmux_menus_work; then
+    if [[ -t 1 ]]; then
+      show_stop_text_ui
+    else
+      run_menu_in_home_pane stop-menu
+    fi
+    return 0
+  fi
   slot="$(current_slot 2>/dev/null || true)"
   if [[ -z "$slot" ]]; then
     items+=("- Select an agent tab first" "" "")
@@ -1224,10 +1414,12 @@ welcome() {
   cat <<'EOF'
 Mobailmux AI agent hub
 
-  Tap AGENTS   visual overview and agent states
-  Tap +NEW     pick and start a project
-  Tap STOP     stop the selected agent
-  Tap a tab    switch directly to that project
+  Type:  mbx          open agent menu (Termius-friendly)
+  Type:  mbx p        pick and start a project
+  Type:  mbx overview show all agent states
+
+  Tap AGENTS / +NEW / STOP when your terminal supports tmux menus.
+  Tap a tab to switch projects.
 
 States: READY, RUNNING, WAITING, DONE, ERROR
 
