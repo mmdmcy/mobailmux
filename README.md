@@ -1,120 +1,103 @@
 # Mobailmux
 
-Mobailmux is the private control surface for local AI agent lanes. It includes
-a Rust browser UI and the existing `mbx` terminal command assets.
+Mobailmux is an ultra-small wrapper around tmux. It gives you ten persistent,
+plain terminal slots named `a` through `j`.
 
-Use it when you want a browser and tmux-oriented way to start, resume, monitor,
-and stop Pi or OpenCode work.
+It has no agent integration, configuration service, database, browser UI,
+automatic commands, or terminal-output scraping. A slot is just a normal shell;
+use it for Pi, Codex, another harness, a development server, or ordinary command
+line work.
 
-## Current Shape
+## Install
 
-- Rust web service for Agents at `/` and `/agents`.
-- SQLite storage for agent messages, selected harnesses, and saved session IDs.
-- Pi is the default harness; OpenCode is selectable for each new project lane.
-- Existing Codex-linked lanes migrate to read-only `legacy-codex` records.
-- Embedded web terminal, isolated as its own capability.
-- Existing `commands/bin/mbx` tmux helper remains available for terminal slots.
-- Private-by-default: run behind localhost, LAN, VPN, or tailnet access.
+Requirements: Bash and tmux.
 
-Architecture and feature boundaries are documented in
-[`docs/architecture.md`](docs/architecture.md).
-
-## Run The Rust Web UI
-
-```sh
-cargo run -- hash-password --stdin
-MOBAILMUX_PASSWORD_HASH='$argon2id$...' cargo run -- serve
+```bash
+commands/install.sh
 ```
 
-Default bind: `127.0.0.1:8765`.
+This creates `~/.local/bin/mbx`. The default installation is a symlink to this
+checkout. Use `commands/install.sh --copy` for a standalone copy.
 
-For local-only development without auth:
+## Use
 
-```sh
-MOBAILMUX_AUTH_DISABLED=1 cargo run -- serve
+```bash
+mbx r a        # create terminal a, or return to it
+mbx r b        # create terminal b, or return to it
+mbx check      # estimate which commands are working or quiet
+mbx check b    # check terminal b
+mbx status     # inspect all ten terminals from outside tmux
+mbx status b   # inspect terminal b
+mbx stop a     # stop terminal a
+mbx stop all   # stop every Mobailmux terminal
 ```
 
-## Configuration
+A new slot starts as an untouched shell in your home directory. From there,
+`cd` wherever you want and run whatever you want. Mobailmux does not type a
+command, launch a harness, clear the screen, change an existing slot's working
+directory, or restart a process.
+
+Detach without stopping your work with `Ctrl-b d`. Running `mbx r a` later
+returns to exactly the terminal you left.
+
+Mouse support is enabled for each Mobailmux slot, including existing slots when
+you resume them. Use the mouse wheel or a touchpad to scroll through tmux
+history; press `q` or `Esc` to leave scrollback mode.
+
+## Status
+
+`mbx status` works inside or outside tmux:
 
 ```text
-MOBAILMUX_BIND=127.0.0.1:8765
-MOBAILMUX_DB=data/mobailmux.sqlite
-MOBAILMUX_AGENT_DEFAULT_WORKDIR=~
-MOBAILMUX_AGENT_SLOTS=agent
-MOBAILMUX_DEFAULT_HARNESS=pi
-MOBAILMUX_PI_BIN=pi
-MOBAILMUX_PI_ARGS=--approve
-MOBAILMUX_OPENCODE_BIN=opencode
-MOBAILMUX_OPENCODE_ARGS=--auto
-MOBAILMUX_AGENT_PROGRESS_NOTES=0
-MOBAILMUX_PASSWORD_HASH=<argon2 hash>
-MOBAILMUX_COOKIE_SECRET=<random hex>
+SLOT  STATE    ATTACHED  COMMAND        DIRECTORY
+a     IDLE     no        bash           /terminal-home
+b     ACTIVE   no        pi             /projects/site
+c     EMPTY    -         -              -
 ```
 
-Pi's `--approve` flag pre-approves project trust; it is not a general
-tool-permission bypass. OpenCode's `--auto` enables automatic approval.
+- `IDLE`: the terminal is at a shell prompt and ready for another command.
+- `ACTIVE`: a foreground command currently owns the terminal.
+- `EXITED`: tmux is retaining a pane whose command exited.
+- `EMPTY`: the slot does not exist.
 
-## Terminal `mbx`
+This is deliberately tmux-level status. An interactive AI harness remains
+`ACTIVE` while it is open, even when it is waiting at its own prompt; Mobailmux
+does not install hooks or inspect its output to guess whether an agent turn is
+finished.
 
-The shell command lives at:
+## Activity Check
 
-```sh
-commands/bin/mbx
+`mbx check` adds a deliberately conservative heuristic based on tmux's native
+last-activity timestamp:
+
+```text
+SLOT  SIGNAL   SILENT    COMMAND        DIRECTORY
+a     DONE     -         bash           /terminal-home
+b     WORKING  4s        pi             /projects/site
+c     QUIET    83s       codex          /projects/app
 ```
 
-It links reusable workspaces (`a` through `j`) into one mobile AI hub with
-clickable, folder-named tmux tabs and exact `RUNNING`, `WAITING`, `DONE`, and
-`ERROR` lifecycle badges. Tap `AGENTS` for the overview, `+NEW` to start a
-project, or `STOP` to close the selected agent. Pi is preferred when installed;
-otherwise Mobailmux uses OpenCode. Run:
+- `DONE`: the foreground command ended and the shell is back.
+- `WORKING`: the terminal produced activity within the last 5 seconds.
+- `QUIET`: a foreground command is still open, but its terminal has been silent
+  for at least 5 seconds.
 
-```sh
-commands/bin/mbx help
+`QUIET` is a useful "probably done or waiting" signal, not proof. An agent can
+be silently thinking, waiting on a network request, or running a command that
+does not print output. Conversely, an idle TUI may occasionally redraw itself.
+The command never reads the terminal text; it only reads tmux's activity time.
+Full-screen TUI redraws count as activity, including counters such as Codex's
+`Thinking... 17s`, even when they repeatedly overwrite the same line.
+
+Set `MBX_QUIET_SECONDS` to change the default 5-second threshold:
+
+```bash
+MBX_QUIET_SECONDS=120 mbx check
 ```
 
-## Manual Live Deploy
+## Check
 
-There is no background auto-deploy watcher. Deploy only when a human or agent
-explicitly runs:
-
-```sh
-scripts/deploy-live.sh
+```bash
+shellcheck commands/bin/mbx commands/install.sh
+python3 -m unittest discover -s tests -v
 ```
-
-The command refuses to run if `mobailmux-autodeploy.service` is active. It runs
-the host's one-shot deploy helper, which checks, builds, installs the live
-binary, restarts `mobailmux.service`, and verifies that it came back active.
-
-## iPhone WebKit Smoke Test
-
-Set up the private Playwright/WebKit toolchain once:
-
-```sh
-scripts/ensure-playwright-webkit.sh
-```
-
-Then test a Mobailmux page with the iPhone 13 WebKit profile:
-
-```sh
-PLAYWRIGHT_BROWSERS_PATH=private/playwright-webkit/browsers \
-  private/playwright-webkit/venv/bin/python \
-  scripts/smoke-iphone-webkit.py \
-  --url http://127.0.0.1:8765/agents \
-  --expect-selector '[data-agent-messages]' \
-  --expect-selector '.agent-composer'
-```
-
-The Playwright virtualenv, browser binaries, screenshots, and logs live under
-ignored `private/playwright-webkit/`.
-
-## Checks
-
-```sh
-cargo fmt --check
-cargo test
-cargo run -- audit-public
-cargo katrust check
-```
-
-Keep real `.env` files, databases, logs, local service units, and
-host-specific deployment state out of this repository.
