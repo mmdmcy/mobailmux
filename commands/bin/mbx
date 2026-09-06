@@ -2,132 +2,38 @@
 set -euo pipefail
 
 program="$(basename "$0")"
-source_path="${BASH_SOURCE[0]}"
-while [[ -L "$source_path" ]]; do
-  source_dir="$(cd "$(dirname "$source_path")" && pwd -P)"
-  source_path="$(readlink "$source_path")"
-  [[ "$source_path" == /* ]] || source_path="$source_dir/$source_path"
-done
-source_dir="$(cd "$(dirname "$source_path")" && pwd -P)"
-script_path="$source_dir/$(basename "$source_path")"
-if [[ -n "${MBX_RESOURCE_DIR:-}" ]]; then
-  resource_dir="$(cd "$MBX_RESOURCE_DIR" 2>/dev/null && pwd -P || true)"
-else
-  resource_dir="$(cd "$source_dir/../libexec/mobailmux" 2>/dev/null && pwd -P || true)"
-fi
 
 usage() {
   cat <<'EOF'
+Mobailmux: ten plain tmux terminals, a through j.
+
 Usage:
-  mbx
-  mbx open|o
-  mbx overview
-  mbx menu
-  mbx project|p [options]
-  mbx start|s [slot] [options] [directory] [prompt...]
-  mbx new|n [slot] [options] [directory] [prompt...]
-  mbx resume|r [slot] [options] [directory]
-  mbx stop|q [slot|all]
-  mbx status|slots|sessions [slot|all]
-  mbx list
-  mbx help|command|commands
-  mbx check
+  mbx r <a-j>
+  mbx status [a-j]
+  mbx check [a-j]
+  mbx stop <a-j|all>
+  mbx help
 
-Slots:
-  Slots appear together as clickable, folder-named tabs in one Mobailmux hub.
-  Omit the slot from start/new to use the first free one.
-  a, b, c, d, e, f, g, h, i, j
-  legacy aliases: one..ten and 1..10
-
-Options:
-  -C, --cd, --dir <dir>  Project directory.
-  --harness <name>       pi or opencode. Default: first installed harness.
-  --safe                 Use the harness's normal approval/trust behavior.
-  --unsafe               OpenCode auto-approval; Pi project pre-approval. Default.
-  --restart              Replace an existing slot before starting.
-  --no-attach            Start without attaching to tmux.
-  --dry-run              Print what would run.
-  -h, --help             Show help.
+Commands:
+  r, resume   Create or return to a terminal.
+  status      Show whether each terminal is IDLE, ACTIVE, EXITED, or EMPTY.
+  check       Guess whether work is ongoing from tmux's last activity time.
+  stop        Stop one terminal, or all Mobailmux terminals.
 
 Examples:
-  mbx                         # open the mobile tab view
-  mbx overview                # show every agent state
-  mbx p                       # pick a project by number
-  mbx s mobailmux             # first free slot, project shorthand
-  mbx s b --harness opencode
   mbx r a
-  mbx q                       # stop the current tab
+  mbx check a
   mbx status
-EOF
-}
+  mbx stop a
 
-commands() {
-  cat <<'EOF'
-Commands:
-  mbx
-  mbx open
-  mbx o
-      Open the Mobailmux hub. Tap its folder-named tabs to switch projects.
-
-  mbx overview
-      Show every agent as READY, RUNNING, WAITING, DONE, ERROR, or AVAILABLE.
-
-  mbx menu
-      Open the clickable AI agent overview inside tmux.
-
-  mbx project [options]
-  mbx p [options]
-      Keyboard fallback: pick a project by number, then open or start it.
-
-  mbx start [slot] [directory] [prompt...]
-  mbx s [slot] [directory] [prompt...]
-      Attach to a running slot, start a harness in an idle slot, or create it.
-      With no slot, use the first available slot.
-
-  mbx new [slot] [directory] [prompt...]
-  mbx n [slot] [directory] [prompt...]
-      Stop the slot if it exists, then start a fresh harness process.
-
-  mbx resume [slot] [directory]
-  mbx r [slot] [directory]
-      Open the hub, or attach to one exact slot. A missing slot becomes a shell.
-
-  mbx stop [slot]
-  mbx q [slot]
-      Stop one slot. With no slot, stop the current project tab.
-
-  mbx stop all
-  mbx q all
-      Stop all slots.
-
-  mbx status [slot|all]
-  mbx sessions [slot|all]
-  mbx slots [slot|all]
-      Show every tab, its current command, and its live working folder.
-
-  mbx list
-      Show only currently running agent tabs.
-
-Mobile tmux controls:
-  tap AGENTS             Open the visual agent overview.
-  tap +NEW               Pick and start a project.
-  tap STOP               Stop the selected project.
-  tap a folder tab       Switch project.
-  Ctrl-b w               Keyboard fallback: show every tab.
-  Ctrl-b d               Leave tmux without stopping projects.
-
-  mbx check
-      Show installed Pi and OpenCode versions.
-
-  mbx help
-  mbx command
-  mbx commands
-      Show this command list.
+New terminals start in your home directory. Detach with Ctrl-b d.
+Mouse-wheel scrolling is enabled in every Mobailmux terminal.
+Mobailmux never runs, clears, or restarts commands inside a terminal.
 EOF
 }
 
 die() {
-  echo "$program: $*" >&2
+  printf '%s: %s\n' "$program" "$*" >&2
   exit 1
 }
 
@@ -135,1448 +41,215 @@ need_tmux() {
   command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
 }
 
-slot_number() {
-  local value="${1:-}"
-  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-  case "$value" in
-    a|1|one) echo 1 ;;
-    b|2|two) echo 2 ;;
-    c|3|three) echo 3 ;;
-    d|4|four) echo 4 ;;
-    e|5|five) echo 5 ;;
-    f|6|six) echo 6 ;;
-    g|7|seven) echo 7 ;;
-    h|8|eight) echo 8 ;;
-    i|9|nine) echo 9 ;;
-    j|10|ten) echo 10 ;;
-    *) return 1 ;;
-  esac
-}
-
-slot_label() {
-  case "$1" in
-    1) echo a ;;
-    2) echo b ;;
-    3) echo c ;;
-    4) echo d ;;
-    5) echo e ;;
-    6) echo f ;;
-    7) echo g ;;
-    8) echo h ;;
-    9) echo i ;;
-    10) echo j ;;
-    *) return 1 ;;
-  esac
+require_slot() {
+  local slot="${1:-}"
+  [[ "$slot" =~ ^[a-j]$ ]] || die "unknown slot: ${slot:-<missing>} (expected a through j)"
+  printf '%s\n' "$slot"
 }
 
 session_name() {
-  echo "${MBX_SESSION_PREFIX:-agent}-$1"
+  printf '%s-%s\n' "${MBX_SESSION_PREFIX:-mbx}" "$1"
 }
 
-legacy_codex_session_name() {
-  echo "codex-$1"
-}
-
-legacy_session_name() {
-  local label
-  label="$(slot_label "$1")" || return 1
-  echo "plugdeck-$label"
-}
-
-session_for_slot() {
-  local slot="$1"
-  local session legacy_codex legacy
-  session="$(session_name "$slot")"
-  legacy_codex="$(legacy_codex_session_name "$slot")"
-  legacy="$(legacy_session_name "$slot")"
-  if tmux has-session -t "$session" 2>/dev/null; then
-    echo "$session"
-  elif [[ "${MBX_INCLUDE_LEGACY_CODEX_SESSIONS:-1}" == "1" ]] &&
-    tmux has-session -t "$legacy_codex" 2>/dev/null; then
-    echo "$legacy_codex"
-  elif [[ "${MBX_INCLUDE_LEGACY_PLUGDECK_SESSIONS:-1}" == "1" ]] && tmux has-session -t "$legacy" 2>/dev/null; then
-    echo "$legacy"
-  else
-    echo "$session"
-  fi
-}
-
-hub_session_name() {
-  printf '%s\n' "${MBX_HUB_SESSION:-mobailmux}"
-}
-
-projects_root() {
-  printf '%s\n' "${MBX_PROJECTS_DIR:-$HOME/Documents/github}"
-}
-
-canonical_dir() {
-  [[ -d "$1" ]] || return 1
-  (cd "$1" && pwd -P)
-}
-
-project_paths() {
-  local root raw path known duplicate
-  local seen=()
-  root="$(projects_root)"
-  [[ -d "$root" ]] || return 1
-  for raw in "$root"/*; do
-    [[ -d "$raw" ]] || continue
-    path="$(canonical_dir "$raw")" || continue
-    duplicate=0
-    for known in "${seen[@]+"${seen[@]}"}"; do
-      if [[ "$known" == "$path" ]]; then
-        duplicate=1
-        break
-      fi
-    done
-    (( duplicate )) && continue
-    seen+=("$path")
-    printf '%s\n' "$path"
-  done
-}
-
-is_workdir_arg() {
-  local value="$1"
-  local root
-  root="$(projects_root)"
-  [[ -d "$value" || ( "$value" != */* && -d "$root/$value" ) ]]
-}
-
-hub_target_for_slot() {
-  local slot="$1"
-  printf '%s:%s\n' "$(hub_session_name)" "$((slot + 10))"
-}
-
-hub_window_value() {
-  local slot="$1" format="$2"
-  hub_index_value "$((slot + 10))" "$format"
-}
-
-hub_index_value() {
-  local wanted="$1" format="$2"
-  local hub index value
-  hub="$(hub_session_name)"
-  while IFS='|' read -r index value; do
-    if [[ "$index" == "$wanted" ]]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
-  done < <(tmux list-windows -t "$hub" -F "#{window_index}|$format" 2>/dev/null || true)
-  return 1
-}
-
-hub_slot_target() {
-  local slot="$1"
-  local hub target expected actual
-  hub="$(hub_session_name)"
-  target="$(hub_target_for_slot "$slot")"
-  expected="$(slot_label "$slot")"
-
-  tmux has-session -t "$hub" 2>/dev/null || return 1
-  actual="$(hub_window_value "$slot" '#{@mbx_slot}' 2>/dev/null || true)"
-  [[ "$actual" == "$expected" ]] || return 1
-  printf '%s\n' "$target"
-}
-
-slot_target() {
-  local slot="$1"
-  local target session
-  target="$(hub_slot_target "$slot" 2>/dev/null || true)"
-  if [[ -n "$target" ]]; then
-    printf '%s\n' "$target"
-    return 0
-  fi
-
-  session="$(session_for_slot "$slot")"
-  tmux has-session -t "$session" 2>/dev/null || return 1
-  printf '%s\n' "$session"
-}
-
-normalize_agent_state() {
-  local state="${1:-}"
-  state="$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')"
-  case "$state" in
-    READY|RUNNING|WAITING|DONE|ERROR|UNKNOWN) printf '%s\n' "$state" ;;
+is_shell() {
+  case "${1##*/}" in
+    bash|dash|fish|ksh|sh|tcsh|zsh) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-agent_state() {
-  local target="$1"
-  local state
-  state="$(tmux display-message -p -t "$target" '#{@mbx_state}' 2>/dev/null || true)"
-  normalize_agent_state "$state" 2>/dev/null || printf 'UNKNOWN\n'
-}
-
-set_agent_state() {
-  local target="$1" state="$2"
-  state="$(normalize_agent_state "$state")" || die "invalid agent state: $state"
-  [[ "$state" != "UNKNOWN" ]] || die "UNKNOWN is reserved for uninstrumented sessions"
-  tmux set-option -w -t "$target" @mbx_state "$state" >/dev/null
-  tmux set-option -w -t "$target" @mbx_state_at "$(date +%s)" >/dev/null
-  tmux refresh-client -S >/dev/null 2>&1 || true
-}
-
-set_current_agent_state() {
-  local state="$1"
-  [[ -n "${TMUX_PANE:-}" ]] || die "agent state updates require a managed tmux pane"
-  set_agent_state "$TMUX_PANE" "$state"
-}
-
-finish_current_agent_state() {
-  local exit_status="$1"
-  local current
-  [[ "$exit_status" =~ ^[0-9]+$ ]] || die "agent exit status must be numeric"
-  [[ -n "${TMUX_PANE:-}" ]] || die "agent state updates require a managed tmux pane"
-  current="$(agent_state "$TMUX_PANE")"
-  if (( exit_status != 0 )); then
-    set_agent_state "$TMUX_PANE" ERROR
-  elif [[ "$current" != "DONE" && "$current" != "ERROR" ]]; then
-    set_agent_state "$TMUX_PANE" DONE
-  fi
-}
-
-window_state_badge_format() {
-  printf '%s\n' '#{?#{==:#{@mbx_state},RUNNING},#[fg=yellow]#[bold][RUN],#{?#{==:#{@mbx_state},WAITING},#[fg=cyan]#[bold][WAIT],#{?#{==:#{@mbx_state},DONE},#[fg=green]#[bold][DONE],#{?#{==:#{@mbx_state},ERROR},#[fg=red]#[bold][ERR],#{?#{==:#{@mbx_state},READY},#[fg=blue]#[bold][READY],#[dim][?]}}}}}'
-}
-
-tmux_supports_control_ranges() {
-  local version major minor
-  version="$(tmux display-message -p '#{version}' 2>/dev/null || true)"
-  [[ "$version" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
-  major="${BASH_REMATCH[1]}"
-  minor="${BASH_REMATCH[2]}"
-  (( major > 3 || (major == 3 && minor >= 7) ))
-}
-
-# Termius (VTE) silently no-ops tmux display-menu/popup — menus return in milliseconds.
-tmux_menus_work() {
-  local term
-  [[ "${MBX_FORCE_TEXT_MENU:-}" == "1" ]] && return 1
-  [[ "${MBX_FORCE_TMUX_MENU:-}" == "1" ]] && return 0
-  term="$(tmux display-message -p '#{client_termtype}' 2>/dev/null || true)"
-  case "$term" in
-    VTE*|vte*|Termius*|termius*) return 1 ;;
-  esac
-  return 0
-}
-
-run_menu_in_home_pane() {
-  local hub pane cmd arg
-  hub="$(hub_session_name)"
-  ensure_hub
-  pane="$(tmux display-message -p -t "$hub:0" '#{pane_id}' 2>/dev/null || true)"
-  [[ -n "$pane" ]] || return 1
-  tmux select-window -t "$hub:0" >/dev/null 2>&1 || true
-  cmd="$(printf '%q' "$script_path")"
-  for arg in "$@"; do
-    cmd+=" $(printf '%q' "$arg")"
-  done
-  tmux send-keys -t "$pane" C-u 2>/dev/null || true
-  tmux send-keys -t "$pane" "$cmd" Enter
-}
-
-configure_slot_window() {
-  local slot="$1" target="$2" requested_workdir="${3:-}"
-  local label path name saved_workdir badge
-  label="$(slot_label "$slot")"
-  path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-  [[ -n "$path" ]] || path="$requested_workdir"
-  name="$(basename "${path:-project}")"
-  [[ -n "$name" && "$name" != "/" ]] || name="root"
-
-  tmux set-option -w -t "$target" @mbx_slot "$label" >/dev/null
-  saved_workdir="$(tmux display-message -p -t "$target" '#{@mbx_workdir}' 2>/dev/null || true)"
-  if [[ -n "$requested_workdir" ]]; then
-    tmux set-option -w -t "$target" @mbx_workdir "$requested_workdir" >/dev/null
-  elif [[ -z "$saved_workdir" && -n "$path" ]]; then
-    tmux set-option -w -t "$target" @mbx_workdir "$path" >/dev/null
-  fi
-  tmux rename-window -t "$target" "$label:$name" >/dev/null
-  tmux set-option -w -t "$target" automatic-rename-format '#{@mbx_slot}:#{b:pane_current_path}' >/dev/null
-  tmux set-option -w -t "$target" automatic-rename on >/dev/null
-  badge="$(window_state_badge_format)"
-  tmux set-option -w -t "$target" window-status-format " $badge #[default]#{qh:window_name} " >/dev/null
-  tmux set-option -w -t "$target" window-status-current-format "#[reverse,bold]>$badge #[default,reverse,bold]#{qh:window_name} #[default]" >/dev/null
-}
-
-configure_hub() {
-  local hub="$1"
-  local agents_command projects_command stop_command key_table
-  agents_command="$(printf '%q menu' "$script_path")"
-  projects_command="$(printf '%q projects-menu' "$script_path")"
-  stop_command="$(printf '%q stop-menu' "$script_path")"
-  key_table="mbx-$hub"
-  tmux set-option -t "$hub" mouse on >/dev/null
-  tmux set-option -t "$hub" key-table "$key_table" >/dev/null
-  tmux set-option -t "$hub" status on >/dev/null
-  tmux set-option -t "$hub" status-position bottom >/dev/null
-  tmux set-option -t "$hub" status-interval 2 >/dev/null
-  tmux set-option -t "$hub" status-left-length 10 >/dev/null
-  if tmux_supports_control_ranges; then
-    tmux set-option -t "$hub" status-left '#[bold]#[range=control|0] AGENTS #[norange]#[default]' >/dev/null
-    tmux set-option -t "$hub" status-right '#[range=control|1] +NEW #[norange]#[range=control|2] STOP #[norange]' >/dev/null
-    tmux set-option -t "$hub" status-right-length 13 >/dev/null
-    tmux bind-key -T "$key_table" MouseDown1Control0 run-shell "$agents_command"
-    tmux bind-key -T "$key_table" MouseDown1Control1 run-shell "$projects_command"
-    tmux bind-key -T "$key_table" MouseDown1Control2 run-shell "$stop_command"
-  else
-    tmux set-option -t "$hub" status-left '#[bold]#[range=left] AGENTS #[norange]#[default]' >/dev/null
-    if tmux_menus_work; then
-      tmux set-option -t "$hub" status-right 'tap AGENTS' >/dev/null
-    else
-      tmux set-option -t "$hub" status-right 'type: mbx' >/dev/null
-    fi
-    tmux set-option -t "$hub" status-right-length 11 >/dev/null
-    tmux bind-key -T "$key_table" MouseDown1StatusLeft run-shell "$agents_command"
-  fi
-  tmux bind-key -T "$key_table" MouseDown1Status switch-client -t =
-  tmux bind-key -T "$key_table" MouseDown1Pane 'select-pane -t = ; send-keys -M'
-  tmux bind-key -T "$key_table" MouseDown1Border select-pane -M
-  tmux bind-key -T "$key_table" WheelDownStatus next-window
-  tmux bind-key -T "$key_table" WheelUpStatus previous-window
-  tmux set-option -t "$hub" window-status-separator '' >/dev/null
-  tmux set-option -t "$hub" window-status-format ' #{qh:window_name} ' >/dev/null
-  tmux set-option -t "$hub" window-status-current-format '#[reverse,bold] #{qh:window_name} #[default]' >/dev/null
-  tmux set-option -t "$hub" renumber-windows off >/dev/null
-}
-
-ensure_hub() {
-  local hub root welcome_line marker home existing_zero
-  hub="$(hub_session_name)"
-  if ! tmux has-session -t "$hub" 2>/dev/null; then
-    root="$(projects_root)"
-    [[ -d "$root" ]] || root="$HOME"
-    tmux new-session -d -s "$hub" -n home -c "$root"
-    tmux set-option -t "$hub" @mbx_hub 1 >/dev/null
-    tmux set-option -t "$hub" base-index 0 >/dev/null
-    tmux move-window -r -t "$hub:" >/dev/null
-    tmux set-option -t "$hub" base-index 11 >/dev/null
-    tmux set-option -w -t "$hub:0" @mbx_home 1 >/dev/null
-    tmux set-option -w -t "$hub:0" automatic-rename off >/dev/null
-    tmux rename-window -t "$hub:0" home >/dev/null
-    welcome_line="$(printf '%q welcome' "$script_path")"
-    tmux send-keys -t "$hub:0" "clear; $welcome_line" C-m
-  else
-    marker="$(tmux show-options -v -t "$hub" @mbx_hub 2>/dev/null || true)"
-    home="$(hub_index_value 0 '#{@mbx_home}' 2>/dev/null || true)"
-    if [[ "$marker" != "1" ]]; then
-      if [[ "$home" == "1" ]]; then
-        tmux set-option -t "$hub" @mbx_hub 1 >/dev/null
-      else
-        die "tmux session '$hub' already exists and is not a Mobailmux hub; set MBX_HUB_SESSION to another name"
-      fi
-    fi
-    if [[ "$home" != "1" ]]; then
-      root="$(projects_root)"
-      [[ -d "$root" ]] || root="$HOME"
-      existing_zero="$(hub_index_value 0 '#{window_id}' 2>/dev/null || true)"
-      [[ -z "$existing_zero" ]] || tmux move-window -s "$hub:0" -t "$hub:" >/dev/null
-      tmux new-window -d -t "$hub:0" -n home -c "$root"
-      tmux set-option -w -t "$hub:0" @mbx_home 1 >/dev/null
-      tmux set-option -w -t "$hub:0" automatic-rename off >/dev/null
-      welcome_line="$(printf '%q welcome' "$script_path")"
-      tmux send-keys -t "$hub:0" "clear; $welcome_line" C-m
-    fi
-  fi
-  configure_hub "$hub"
-}
-
-sync_hub_slot() {
-  local slot="$1"
-  local hub target existing_target session source_id destination_id destination_slot
-  hub="$(hub_session_name)"
-  target="$(hub_target_for_slot "$slot")"
-
-  existing_target="$(hub_slot_target "$slot" 2>/dev/null || true)"
-  if [[ -n "$existing_target" ]]; then
-    configure_slot_window "$slot" "$existing_target"
-    return 0
-  fi
-
-  session="$(session_for_slot "$slot")"
-  tmux has-session -t "$session" 2>/dev/null || return 0
-  configure_slot_window "$slot" "$session"
-  source_id="$(tmux display-message -p -t "$session" '#{window_id}' 2>/dev/null || true)"
-  [[ -n "$source_id" ]] || return 0
-
-  destination_id="$(hub_window_value "$slot" '#{window_id}' 2>/dev/null || true)"
-  if [[ "$destination_id" == "$source_id" ]]; then
-    return 0
-  fi
-  if [[ -n "$destination_id" ]]; then
-    destination_slot="$(hub_window_value "$slot" '#{@mbx_slot}' 2>/dev/null || true)"
-    if [[ "$destination_slot" == "$(slot_label "$slot")" ]]; then
-      return 0
-    fi
-    tmux move-window -s "$target" -t "$hub:" >/dev/null
-  fi
-  tmux link-window -s "$source_id" -t "$target" >/dev/null
-}
-
-sync_hub() {
-  local slot
-  ensure_hub
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    sync_hub_slot "$slot"
-  done
-}
-
-attach_hub() {
-  local slot="${1:-}"
-  local hub current_session
-  sync_hub
-  hub="$(hub_session_name)"
-
-  if [[ -n "$slot" ]]; then
-    tmux select-window -t "$(hub_target_for_slot "$slot")"
-  fi
+attach_session() {
+  local session="$1"
   if [[ -n "${TMUX:-}" ]]; then
-    current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
-    if [[ -n "$slot" ]]; then
-      tmux switch-client -t "$(hub_target_for_slot "$slot")"
-    elif [[ "$current_session" == "$hub" ]]; then
-      # Already inside the hub: bare `mbx` used to no-op switch-client and look
-      # like an instant exit. Open the clickable overview instead.
-      show_agents_menu
-    else
-      tmux switch-client -t "$hub"
-    fi
+    tmux switch-client -t "$session"
   else
-    if [[ ! -t 0 || ! -t 1 ]]; then
-      die "mbx needs an interactive terminal. From Termius/SSH run: mbx"
-    fi
-    exec tmux attach-session -t "$hub"
+    exec tmux attach-session -t "$session"
   fi
 }
 
-next_available_slot() {
-  local slot
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    if ! slot_target "$slot" >/dev/null 2>&1; then
-      printf '%s\n' "$slot"
-      return 0
-    fi
-  done
-  die "all ten project tabs are in use; stop one with 'mbx q <slot>'"
-}
-
-check_harnesses() {
-  local failed=0 item binary version
-  for item in pi opencode; do
-    binary="$(harness_binary "$item")"
-    if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
-      printf '%-10s missing (%s)\n' "$item" "$binary"
-      failed=1
-      continue
-    fi
-    version="$("$binary" --version 2>/dev/null | head -1)"
-    printf '%-10s %s\n' "$item" "${version:-installed}"
-  done
-  (( failed == 0 ))
-}
-
-default_harness() {
-  local binary
-  if [[ -n "${MOBAILMUX_DEFAULT_HARNESS:-}" ]]; then
-    printf '%s\n' "$MOBAILMUX_DEFAULT_HARNESS"
-  else
-    binary="$(harness_binary pi)"
-    if command -v "$binary" >/dev/null 2>&1 || [[ -x "$binary" ]]; then
-      printf 'pi\n'
-      return
-    fi
-    binary="$(harness_binary opencode)"
-    if command -v "$binary" >/dev/null 2>&1 || [[ -x "$binary" ]]; then
-      printf 'opencode\n'
-      return
-    fi
-    printf 'pi\n'
-  fi
-}
-
-normalize_harness() {
-  local value="${1:-$(default_harness)}"
-  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-  case "$value" in
-    pi|opencode) printf '%s\n' "$value" ;;
-    *) die "unknown harness: $value (expected pi or opencode)" ;;
-  esac
-}
-
-harness_binary() {
-  case "$1" in
-    pi) printf '%s\n' "${MOBAILMUX_PI_BIN:-pi}" ;;
-    opencode) printf '%s\n' "${MOBAILMUX_OPENCODE_BIN:-opencode}" ;;
-    *) return 1 ;;
-  esac
-}
-
-harness_command_line() {
-  local harness="$1" workdir="$2" unsafe="$3"
-  shift 3
-  local binary parts plugin config_content
-  binary="$(harness_binary "$harness")"
-  parts=("$binary")
-  case "$harness" in
-    pi)
-      [[ "$unsafe" == "1" ]] && parts+=(--approve)
-      if [[ -n "$resource_dir" && -f "$resource_dir/pi-state.ts" ]]; then
-        parts+=(-e "$resource_dir/pi-state.ts")
-      fi
-      [[ $# -gt 0 ]] && parts+=("$*")
-      ;;
-    opencode)
-      if [[ -n "$resource_dir" && -f "$resource_dir/opencode-state.js" ]]; then
-        plugin="file://$resource_dir/opencode-state.js"
-        if [[ -n "${OPENCODE_CONFIG:-}" && -n "${OPENCODE_CONFIG_CONTENT:-}" ]]; then
-          die "cannot add lifecycle tracking when both OPENCODE_CONFIG and OPENCODE_CONFIG_CONTENT are set"
-        fi
-        if [[ -z "${OPENCODE_CONFIG_CONTENT:-}" ]]; then
-          config_content="{\"plugin\":[\"$(json_escape "$plugin")\"]}"
-          parts=(env "OPENCODE_CONFIG_CONTENT=$config_content" "$binary")
-        elif [[ -z "${OPENCODE_CONFIG:-}" && -f "$resource_dir/opencode.json" ]]; then
-          parts=(env "OPENCODE_CONFIG=$resource_dir/opencode.json" "$binary")
-        fi
-      fi
-      [[ "$unsafe" == "1" ]] && parts+=(--auto)
-      parts+=("$workdir")
-      [[ $# -gt 0 ]] && parts+=(--prompt "$*")
-      ;;
-  esac
-  printf '%q ' "${parts[@]}"
-}
-
-managed_launch_line() {
-  local workdir="$1" command_line="$2"
-  local state_start state_finish
-  state_start="$(printf '%q _state RUNNING' "$script_path")"
-  state_finish="$(printf '%q _state-exit' "$script_path")"
-  local managed
-  printf -v managed '%s; cd -- %q && %s; mbx_rc=$?; %s "$mbx_rc"' \
-    "$state_start" "$workdir" "$command_line" "$state_finish"
-  printf '/bin/bash -lc %q' "$managed"
-}
-
-resolve_workdir() {
-  local workdir="$1"
-  local root
-  if [[ -z "$workdir" ]]; then
-    pwd -P
-    return 0
-  fi
-
-  root="$(projects_root)"
-  if [[ ! -d "$workdir" && "$workdir" != */* && -d "$root/$workdir" ]]; then
-    workdir="$root/$workdir"
-  fi
-  [[ -d "$workdir" ]] || die "directory does not exist: $workdir"
-  cd "$workdir" && pwd -P
-}
-
-print_status_header() {
-  printf '%-5s %-10s %-10s %-20s %-12s %s\n' "slot" "agent" "client" "tab" "command" "path"
-}
-
-print_status_row() {
-  local label="$1"
-  local agent="$2"
-  local client="$3"
-  local session="$4"
-  local command="$5"
-  local path="$6"
-
-  printf '%-5s %-10s %-10s %-20s %-12s %s\n' "$label" "$agent" "$client" "$session" "$command" "$path"
-}
-
-slot_status() {
-  local slot="$1"
-  local target label attached command path agent client tab
-  target="$(slot_target "$slot" 2>/dev/null || true)"
-  [[ -n "$target" ]] || return 1
-
-  label="$(slot_label "$slot")"
-  attached="$(tmux display-message -p -t "$target" '#{session_attached}' 2>/dev/null || true)"
-  command="$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)"
-  path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-  tab="$(tmux display-message -p -t "$target" '#W' 2>/dev/null || true)"
-  [[ -n "$tab" ]] || tab="$label:$(basename "${path:-project}")"
-  agent="$(agent_state "$target")"
-  client="detached"
-  if [[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )); then
-    client="attached"
-  fi
-  print_status_row "$label" "$agent" "$client" "$tab" "${command:-unknown}" "${path:-unknown}"
-}
-
-list_slots() {
-  need_tmux
-
-  local found=0
-  local slot
-
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    if slot_target "$slot" >/dev/null 2>&1; then
-      if (( ! found )); then
-        print_status_header
-      fi
-      slot_status "$slot"
-      found=1
-    fi
-  done
-
-  (( found )) || echo "No project tabs are running. Use 'mbx p' to pick one."
-}
-
-status_slots() {
-  local requested="${1:-all}"
-  local slots=()
-  local slot
-
-  need_tmux
-
-  if [[ "$requested" == "all" || -z "$requested" ]]; then
-    slots=(1 2 3 4 5 6 7 8 9 10)
-  else
-    slot="$(slot_number "$requested")" || die "unknown slot: $requested"
-    slots=("$slot")
-  fi
-
-  print_status_header
-
-  local label session
-  for slot in "${slots[@]}"; do
-    label="$(slot_label "$slot")"
-    if slot_target "$slot" >/dev/null 2>&1; then
-      slot_status "$slot"
-    else
-      session="$(session_name "$slot")"
-      print_status_row "$label" "AVAILABLE" "-" "$label:-" "-" "- ($session)"
-    fi
-  done
-}
-
-destroy_slot() {
-  local slot="$1"
-  local target source hub_target
-  target="$(slot_target "$slot" 2>/dev/null || true)"
-  [[ -n "$target" ]] || return 1
-  source="$(session_for_slot "$slot")"
-  hub_target="$(hub_slot_target "$slot" 2>/dev/null || true)"
-  if [[ "$source" != "$(hub_session_name)" ]] && tmux has-session -t "$source" 2>/dev/null; then
-    tmux kill-session -t "$source"
-  fi
-  if [[ -n "$hub_target" ]]; then
-    tmux kill-window -t "$hub_target"
-  elif tmux has-session -t "${target%%:*}" 2>/dev/null; then
-    tmux kill-window -t "$target"
-  fi
-}
-
-stop_slot() {
-  local slot="$1"
-  local label
-  label="$(slot_label "$slot")"
-
-  need_tmux
-  if destroy_slot "$slot"; then
-    echo "Stopped tab $label"
-  else
-    echo "$label is not running."
-  fi
-}
-
-stop_all_slots() {
-  need_tmux
-
-  local found=0
-  local slot
-
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    if destroy_slot "$slot"; then
-      echo "Stopped tab $(slot_label "$slot")"
-      found=1
-    fi
-  done
-
-  (( found )) || echo "No project tabs are running."
+enable_mouse() {
+  local session="$1"
+  tmux set-option -t "$session" mouse on
 }
 
 resume_slot() {
-  local slot="$1"
-  shift
-
-  local workdir_arg=""
-  local attach=1
-  local dry_run=0
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -C|--cd|--dir)
-        [[ $# -ge 2 ]] || die "$1 requires a directory"
-        workdir_arg="$2"
-        shift 2
-        ;;
-      --no-attach)
-        attach=0
-        shift
-        ;;
-      --dry-run)
-        dry_run=1
-        shift
-        ;;
-      --)
-        shift
-        [[ $# -eq 0 ]] || die "resume does not accept a command or prompt"
-        ;;
-      -*)
-        die "unknown option: $1"
-        ;;
-      *)
-        [[ -z "$workdir_arg" ]] || die "resume accepts only one directory"
-        workdir_arg="$1"
-        shift
-        ;;
-    esac
-  done
-
+  local slot="$1" session start_dir
   need_tmux
+  session="$(session_name "$slot")"
 
-  local label session target workdir
-  label="$(slot_label "$slot")"
-  workdir="$(resolve_workdir "$workdir_arg")"
-  session="$(session_for_slot "$slot")"
-  target="$(slot_target "$slot" 2>/dev/null || true)"
-
-  if (( dry_run )); then
-    echo "slot:    $label"
-    echo "tab:     $label:$(basename "$workdir")"
-    echo "workdir: $workdir"
-    if [[ -n "$target" ]]; then
-      printf 'state:   existing\ncommand: open Mobailmux tab %q\n' "$label"
-    else
-      printf 'state:   new shell\ncommand: tmux new-session -d -s %q -n %q -c %q\n' \
-        "$session" "$session" "$workdir"
-    fi
-    return 0
+  if tmux has-session -t "$session" 2>/dev/null; then
+    printf 'Returning to terminal %s.\n' "$slot"
+  else
+    start_dir="${HOME:?HOME is not set}"
+    [[ -d "$start_dir" ]] || die "starting directory does not exist: $start_dir"
+    tmux new-session -d -s "$session" -n "$slot" -c "$start_dir"
+    printf 'Created terminal %s.\n' "$slot"
   fi
 
-  if [[ -n "$target" ]]; then
-    if (( attach )); then
-      echo "Opening project tab $label"
-      attach_hub "$slot"
-    else
-      echo "Project tab $label is running"
-    fi
-    return 0
-  fi
+  enable_mouse "$session"
+  attach_session "$session"
+}
 
-  tmux new-session -d -s "$session" -n "$session" -c "$workdir"
-  tmux set-option -t "$session" remain-on-exit off >/dev/null 2>&1 || true
-  configure_slot_window "$slot" "$session" "$workdir"
-  set_agent_state "$session" READY
-  sync_hub
-  echo "Started shell tab $label:$(basename "$workdir") in $workdir"
+slot_state() {
+  local session="$1" command dead
+  command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+  dead="$(tmux display-message -p -t "$session" '#{pane_dead}' 2>/dev/null || true)"
 
-  if (( attach )); then
-    attach_hub "$slot"
+  if [[ "$dead" == "1" ]]; then
+    printf 'EXITED\n'
+  elif is_shell "$command"; then
+    printf 'IDLE\n'
+  else
+    printf 'ACTIVE\n'
   fi
 }
 
-run_slot() {
-  local action="$1"
-  local slot="$2"
-  shift 2
-
-  local workdir_arg=""
-  local unsafe=1
-  local harness
-  local restart=0
-  local attach=1
-  local dry_run=0
-  local prompt_parts=()
-  harness="$(default_harness)"
-
-  [[ "$action" == "new" ]] && restart=1
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -C|--cd|--dir)
-        [[ $# -ge 2 ]] || die "$1 requires a directory"
-        workdir_arg="$2"
-        shift 2
-        ;;
-      --safe)
-        unsafe=0
-        shift
-        ;;
-      --unsafe)
-        unsafe=1
-        shift
-        ;;
-      --harness)
-        [[ $# -ge 2 ]] || die "$1 requires pi or opencode"
-        harness="$2"
-        shift 2
-        ;;
-      --restart)
-        restart=1
-        shift
-        ;;
-      --no-attach)
-        attach=0
-        shift
-        ;;
-      --dry-run)
-        dry_run=1
-        shift
-        ;;
-      --)
-        shift
-        while [[ $# -gt 0 ]]; do
-          prompt_parts+=("$1")
-          shift
-        done
-        ;;
-      -*)
-        die "unknown option: $1"
-        ;;
-      *)
-        if [[ -z "$workdir_arg" ]] && is_workdir_arg "$1"; then
-          workdir_arg="$1"
-        else
-          prompt_parts+=("$1")
-        fi
-        shift
-        ;;
-    esac
-  done
+print_status() {
+  local requested="${1:-}" slot session state attached command path
+  local slots=(a b c d e f g h i j)
+  [[ -z "$requested" ]] || slots=("$requested")
 
   need_tmux
+  printf '%-5s %-8s %-9s %-14s %s\n' SLOT STATE ATTACHED COMMAND DIRECTORY
+  for slot in "${slots[@]}"; do
+    session="$(session_name "$slot")"
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      printf '%-5s %-8s %-9s %-14s %s\n' "$slot" EMPTY - - -
+      continue
+    fi
 
-  local session target label workdir cmdline launch_line
-  local current
-  harness="$(normalize_harness "$harness")"
-  label="$(slot_label "$slot")"
-  workdir="$(resolve_workdir "$workdir_arg")"
-  session="$(session_for_slot "$slot")"
-  target="$(slot_target "$slot" 2>/dev/null || true)"
-  cmdline="$(harness_command_line "$harness" "$workdir" "$unsafe" "${prompt_parts[@]+"${prompt_parts[@]}"}")"
-  launch_line="$(managed_launch_line "$workdir" "$cmdline")"
-
-  if (( dry_run )); then
-    echo "slot:    $label"
-    echo "tab:     $label:$(basename "$workdir")"
-    echo "workdir: $workdir"
-    echo "command: $cmdline"
-    return 0
-  fi
-
-  if [[ -n "$target" ]]; then
-    if (( restart )); then
-      destroy_slot "$slot"
-      target=""
-      session="$(session_name "$slot")"
+    state="$(slot_state "$session")"
+    attached="$(tmux display-message -p -t "$session" '#{session_attached}' 2>/dev/null || true)"
+    command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+    path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
+    if [[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )); then
+      attached=yes
     else
-      current="$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)"
-      case "$current" in
-        bash|zsh|fish|sh)
-          configure_slot_window "$slot" "$target" "$workdir"
-          set_agent_state "$target" RUNNING
-          tmux send-keys -t "$target" "$launch_line" C-m
-          sync_hub
-          if (( attach )); then
-            attach_hub "$slot"
-          else
-            echo "Started $harness in tab $label:$(basename "$workdir") from $workdir"
-          fi
-          return 0
-          ;;
-      esac
+      attached=no
+    fi
+    printf '%-5s %-8s %-9s %-14s %s\n' \
+      "$slot" "$state" "$attached" "${command:-unknown}" "${path:-unknown}"
+  done
+}
 
-      echo "Tab $label is already running. Opening it; use 'mbx new $label' to restart it."
-      if (( attach )); then
-        attach_hub "$slot"
+quiet_seconds() {
+  local seconds="${MBX_QUIET_SECONDS:-5}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || die "MBX_QUIET_SECONDS must be a positive integer"
+  printf '%s\n' "$seconds"
+}
+
+check_activity() {
+  local requested="${1:-}" slot session signal silent command path dead activity elapsed
+  local threshold now
+  local slots=(a b c d e f g h i j)
+  [[ -z "$requested" ]] || slots=("$requested")
+
+  need_tmux
+  threshold="$(quiet_seconds)"
+  now="$(date +%s)"
+  printf '%-5s %-8s %-9s %-14s %s\n' SLOT SIGNAL SILENT COMMAND DIRECTORY
+  for slot in "${slots[@]}"; do
+    session="$(session_name "$slot")"
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      printf '%-5s %-8s %-9s %-14s %s\n' "$slot" EMPTY - - -
+      continue
+    fi
+
+    command="$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+    path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
+    dead="$(tmux display-message -p -t "$session" '#{pane_dead}' 2>/dev/null || true)"
+    activity="$(tmux display-message -p -t "$session" '#{window_activity}' 2>/dev/null || true)"
+    signal=UNKNOWN
+    silent=-
+
+    if [[ "$dead" == "1" ]]; then
+      signal=EXITED
+    elif is_shell "$command"; then
+      signal=DONE
+    elif [[ "$activity" =~ ^[0-9]+$ ]]; then
+      elapsed=$((now - activity))
+      (( elapsed >= 0 )) || elapsed=0
+      silent="${elapsed}s"
+      if (( elapsed >= threshold )); then
+        signal=QUIET
+      else
+        signal=WORKING
       fi
-      return 0
     fi
-  fi
 
-  tmux new-session -d -s "$session" -n "$session" -c "$workdir"
-  tmux set-option -t "$session" remain-on-exit off >/dev/null
-  configure_slot_window "$slot" "$session" "$workdir"
-  set_agent_state "$session" RUNNING
-  tmux send-keys -t "$session" "$launch_line" C-m
-  sync_hub
-  echo "Started $harness in tab $label:$(basename "$workdir") from $workdir"
-
-  if (( attach )); then
-    attach_hub "$slot"
-  fi
-}
-
-current_slot() {
-  local label
-  [[ -n "${TMUX:-}" ]] || return 1
-  label="$(tmux display-message -p '#{@mbx_slot}' 2>/dev/null || true)"
-  [[ -n "$label" ]] || return 1
-  slot_number "$label"
-}
-
-slot_for_workdir() {
-  local requested="$1"
-  local slot target saved path
-  requested="$(canonical_dir "$requested" 2>/dev/null || printf '%s\n' "$requested")"
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    target="$(slot_target "$slot" 2>/dev/null || true)"
-    [[ -n "$target" ]] || continue
-    saved="$(tmux display-message -p -t "$target" '#{@mbx_workdir}' 2>/dev/null || true)"
-    path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-    [[ -z "$saved" ]] || saved="$(canonical_dir "$saved" 2>/dev/null || printf '%s\n' "$saved")"
-    [[ -z "$path" ]] || path="$(canonical_dir "$path" 2>/dev/null || printf '%s\n' "$path")"
-    if [[ "$saved" == "$requested" || ( -z "$saved" && "$path" == "$requested" ) ]]; then
-      printf '%s\n' "$slot"
-      return 0
-    fi
+    printf '%-5s %-8s %-9s %-14s %s\n' \
+      "$slot" "$signal" "$silent" "${command:-unknown}" "${path:-unknown}"
   done
+}
+
+stop_one() {
+  local slot="$1" quiet="${2:-0}" session
+  session="$(session_name "$slot")"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux kill-session -t "$session"
+    printf 'Stopped terminal %s.\n' "$slot"
+    return 0
+  fi
+  (( quiet )) || printf 'Terminal %s is already empty.\n' "$slot"
   return 1
 }
 
-pick_project() {
-  local root path name selected choice existing_slot slot index
-  local projects=()
-  root="$(projects_root)"
-  [[ -d "$root" ]] || die "projects directory does not exist: $root (set MBX_PROJECTS_DIR)"
-
+stop_slots() {
+  local requested="$1" slot found=0
   need_tmux
-  printf 'Projects in %s\n\n' "$root"
-  index=0
-  while IFS= read -r path; do
-    projects+=("$path")
-    index=$((index + 1))
-    name="$(basename "$path")"
-    existing_slot="$(slot_for_workdir "$path" 2>/dev/null || true)"
-    if [[ -n "$existing_slot" ]]; then
-      printf '  %2d. [tab %s] %s\n' "$index" "$(slot_label "$existing_slot")" "$name"
-    else
-      printf '  %2d.         %s\n' "$index" "$name"
-    fi
-  done < <(project_paths)
-
-  (( index > 0 )) || die "no project directories found in $root"
-  printf '\nProject number (q to cancel): '
-  IFS= read -r choice
-  [[ "$choice" != "q" && "$choice" != "Q" && -n "$choice" ]] || return 0
-  [[ "$choice" =~ ^[0-9]+$ ]] || die "choose a project number from the list"
-  choice=$((10#$choice))
-  (( choice >= 1 && choice <= index )) || die "project number is out of range"
-  selected="${projects[$((choice - 1))]}"
-
-  existing_slot="$(slot_for_workdir "$selected" 2>/dev/null || true)"
-  if [[ -n "$existing_slot" ]]; then
-    echo "Opening tab $(slot_label "$existing_slot"):$(basename "$selected")"
-    attach_hub "$existing_slot"
-    return 0
-  fi
-
-  slot="$(next_available_slot)"
-  run_slot start "$slot" -C "$selected" "$@"
-}
-
-menu_run_action() {
-  local arguments="$*"
-  local executable
-  executable="$(printf '%q' "$script_path")"
-  printf 'run-shell "%s %s"\n' "$executable" "$arguments"
-}
-
-menu_state_label() {
-  case "$1" in
-    RUNNING) printf '#[fg=yellow,bold]RUNNING#[default]\n' ;;
-    WAITING) printf '#[fg=cyan,bold]WAITING#[default]\n' ;;
-    DONE) printf '#[fg=green,bold]DONE#[default]\n' ;;
-    ERROR) printf '#[fg=red,bold]ERROR#[default]\n' ;;
-    READY) printf '#[fg=blue,bold]READY#[default]\n' ;;
-    *) printf '#[dim]%s#[default]\n' "$1" ;;
-  esac
-}
-
-tmux_menu_text() {
-  printf '%s' "${1//#/##}"
-}
-
-json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-project_menu_page_size() {
-  local height size
-  if [[ "${MBX_MENU_PAGE_SIZE:-}" =~ ^[0-9]+$ ]] && (( MBX_MENU_PAGE_SIZE > 0 )); then
-    printf '%s\n' "$MBX_MENU_PAGE_SIZE"
-    return
-  fi
-  height="$(tmux display-message -p '#{client_height}' 2>/dev/null || true)"
-  [[ "$height" =~ ^[0-9]+$ ]] || height=18
-  size=$((height - 7))
-  (( size < 4 )) && size=4
-  (( size > 12 )) && size=12
-  printf '%s\n' "$size"
-}
-
-show_agents_text_ui() {
-  local slot label target state path name reply
-  sync_hub
-  printf '\nAI AGENTS\n'
-  printf '%s\n' '------------------------------'
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    label="$(slot_label "$slot")"
-    target="$(slot_target "$slot" 2>/dev/null || true)"
-    if [[ -n "$target" ]]; then
-      state="$(agent_state "$target")"
-      path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-      name="$(basename "${path:-project}")"
-      printf '  %s) %-8s %s\n' "$label" "$state" "$name"
-    else
-      printf '  %s) AVAILABLE\n' "$label"
-    fi
-  done
-  printf '%s\n' '------------------------------'
-  printf '  n) start a project\n'
-  printf '  x) stop current agent\n'
-  printf '  q) cancel\n\n'
-  printf 'Select: '
-  read -r reply || return 0
-  case "$reply" in
-    q|Q|'') return 0 ;;
-    n|N) show_projects_text_ui 1 ;;
-    x|X) show_stop_text_ui ;;
-    *)
-      slot="$(slot_number "$reply" 2>/dev/null || true)"
-      if [[ -z "$slot" ]]; then
-        printf 'unknown option: %s\n' "$reply"
-        return 0
+  if [[ "$requested" == all ]]; then
+    for slot in a b c d e f g h i j; do
+      if stop_one "$slot" 1; then
+        found=1
       fi
-      target="$(slot_target "$slot" 2>/dev/null || true)"
-      if [[ -n "$target" ]]; then
-        tmux select-window -t "$(hub_target_for_slot "$slot")"
-      else
-        printf 'slot %s is empty; choose n to start a project\n' "$reply"
-      fi
-      ;;
-  esac
-}
-
-show_projects_text_ui() {
-  local page="${1:-1}"
-  local root path name existing_slot target state index harness
-  local page_size first last has_next=0
-  local -a paths=()
-  local reply
-  [[ "$page" =~ ^[0-9]+$ ]] && (( page > 0 )) || die "project menu page must be a positive number"
-  root="$(projects_root)"
-  [[ -d "$root" ]] || die "projects directory does not exist: $root (set MBX_PROJECTS_DIR)"
-  sync_hub
-  page_size="$(project_menu_page_size)"
-  first=$(((page - 1) * page_size + 1))
-  last=$((first + page_size - 1))
-  index=0
-  while IFS= read -r path; do
-    paths+=("$path")
-  done < <(project_paths)
-  (( ${#paths[@]} > 0 )) || die "no project directories found in $root"
-  harness="$(normalize_harness "$(default_harness)" | tr '[:lower:]' '[:upper:]')"
-  printf '\nSTART WITH %s - PAGE %s\n' "$harness" "$page"
-  printf '%s\n' '------------------------------'
-  for path in "${paths[@]}"; do
-    index=$((index + 1))
-    if (( index > last )); then
-      has_next=1
-      break
-    fi
-    (( index >= first )) || continue
-    name="$(basename "$path")"
-    existing_slot="$(slot_for_workdir "$path" 2>/dev/null || true)"
-    if [[ -n "$existing_slot" ]]; then
-      target="$(slot_target "$existing_slot")"
-      state="$(agent_state "$target")"
-      printf '  %2d) %-8s %s\n' "$index" "$state" "$name"
-    else
-      printf '  %2d) +        %s\n' "$index" "$name"
-    fi
-  done
-  printf '%s\n' '------------------------------'
-  (( page > 1 )) && printf '  p) previous page\n'
-  (( has_next )) && printf '  n) next page\n'
-  printf '  q) cancel\n\n'
-  printf 'Project number: '
-  read -r reply || return 0
-  case "$reply" in
-    q|Q|'') return 0 ;;
-    p|P)
-      (( page > 1 )) || { printf 'already on first page\n'; return 0; }
-      show_projects_text_ui "$((page - 1))"
-      ;;
-    n|N)
-      (( has_next )) || { printf 'already on last page\n'; return 0; }
-      show_projects_text_ui "$((page + 1))"
-      ;;
-    *)
-      [[ "$reply" =~ ^[0-9]+$ ]] || { printf 'unknown option: %s\n' "$reply"; return 0; }
-      menu_project "$reply"
-      ;;
-  esac
-}
-
-show_stop_text_ui() {
-  local slot target state path name reply
-  slot="$(current_slot 2>/dev/null || true)"
-  if [[ -z "$slot" ]]; then
-    printf '\nSelect an agent tab first, then run stop again.\n'
-    return 0
+    done
+    (( found )) || printf 'No Mobailmux terminals are running.\n'
+  else
+    stop_one "$requested" || true
   fi
-  target="$(slot_target "$slot")"
-  state="$(agent_state "$target")"
-  path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-  name="$(basename "${path:-project}")"
-  printf '\nStop %s (%s) — %s?\n' "$(slot_label "$slot")" "$state" "$name"
-  printf '  y) stop\n  q) cancel\n\nConfirm: '
-  read -r reply || return 0
-  case "$reply" in
-    y|Y|x|X) menu_stop "$slot" ;;
-    *) printf 'cancelled\n' ;;
-  esac
-}
-
-show_agents_menu() {
-  local slot target label path name state state_label action
-  local items=()
-  if [[ -z "${TMUX:-}" ]]; then
-    status_slots all
-    return 0
-  fi
-
-  sync_hub
-  if ! tmux_menus_work; then
-    # Termius/VTE: use a plain text UI in the pane. Status-bar run-shell has no
-    # tty, so re-dispatch into the home pane instead.
-    if [[ -t 1 ]]; then
-      show_agents_text_ui
-    else
-      run_menu_in_home_pane menu
-    fi
-    return 0
-  fi
-
-  for slot in 1 2 3 4 5 6 7 8 9 10; do
-    label="$(slot_label "$slot")"
-    target="$(slot_target "$slot" 2>/dev/null || true)"
-    if [[ -n "$target" ]]; then
-      state="$(agent_state "$target")"
-      state_label="$(menu_state_label "$state")"
-      path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-      name="$(basename "${path:-project}")"
-      name="$(tmux_menu_text "$name")"
-      action="select-window -t $target"
-      items+=("$label  $state_label  $name" "$label" "$action")
-    else
-      items+=("- $label  AVAILABLE" "" "")
-    fi
-  done
-  items+=("+ START PROJECT" "n" "$(menu_run_action projects-menu)")
-  items+=("STOP CURRENT" "x" "$(menu_run_action stop-menu)")
-  items+=("REFRESH" "r" "$(menu_run_action menu)")
-  tmux display-menu -T "AI AGENTS" -x C -y S -- "${items[@]}"
-}
-
-show_projects_menu() {
-  local page="${1:-1}"
-  local root path name existing_slot target state state_label action index harness
-  local page_size first last has_next=0
-  local items=()
-  [[ -n "${TMUX:-}" ]] || die "the project menu requires an attached tmux client"
-  [[ "$page" =~ ^[0-9]+$ ]] && (( page > 0 )) || die "project menu page must be a positive number"
-  if ! tmux_menus_work; then
-    if [[ -t 1 ]]; then
-      show_projects_text_ui "$page"
-    else
-      run_menu_in_home_pane projects-menu "$page"
-    fi
-    return 0
-  fi
-  root="$(projects_root)"
-  [[ -d "$root" ]] || die "projects directory does not exist: $root (set MBX_PROJECTS_DIR)"
-  sync_hub
-  page_size="$(project_menu_page_size)"
-  first=$(((page - 1) * page_size + 1))
-  last=$((first + page_size - 1))
-  index=0
-  while IFS= read -r path; do
-    index=$((index + 1))
-    if (( index > last )); then
-      has_next=1
-      continue
-    fi
-    (( index >= first )) || continue
-    name="$(basename "$path")"
-    name="$(tmux_menu_text "$name")"
-    existing_slot="$(slot_for_workdir "$path" 2>/dev/null || true)"
-    if [[ -n "$existing_slot" ]]; then
-      target="$(slot_target "$existing_slot")"
-      state="$(agent_state "$target")"
-      state_label="$(menu_state_label "$state")"
-      action="select-window -t $(hub_target_for_slot "$existing_slot")"
-      items+=("$state_label  $name" "" "$action")
-    else
-      items+=("+  $name" "" "$(menu_run_action _menu-project "$index")")
-    fi
-  done < <(project_paths)
-  (( index > 0 )) || die "no project directories found in $root"
-  (( page == 1 || first <= index )) || die "project menu page is out of range"
-  if (( page > 1 )); then
-    items+=("< PREVIOUS PAGE" "p" "$(menu_run_action projects-menu "$((page - 1))")")
-  fi
-  if (( has_next )); then
-    items+=("NEXT PAGE >" "n" "$(menu_run_action projects-menu "$((page + 1))")")
-  fi
-  harness="$(normalize_harness "$(default_harness)" | tr '[:lower:]' '[:upper:]')"
-  tmux display-menu -T "START WITH $harness - PAGE $page" -x C -y S -- "${items[@]}"
-}
-
-menu_project() {
-  local requested="$1"
-  local root path selected="" index existing_slot slot
-  [[ "$requested" =~ ^[0-9]+$ ]] || die "project index must be numeric"
-  root="$(projects_root)"
-  index=0
-  while IFS= read -r path; do
-    index=$((index + 1))
-    if (( index == requested )); then
-      selected="$path"
-      break
-    fi
-  done < <(project_paths)
-  [[ -n "$selected" ]] || die "project is no longer available"
-
-  existing_slot="$(slot_for_workdir "$selected" 2>/dev/null || true)"
-  if [[ -n "$existing_slot" ]]; then
-    tmux select-window -t "$(hub_target_for_slot "$existing_slot")"
-    return 0
-  fi
-  slot="$(next_available_slot)"
-  run_slot start "$slot" --no-attach -C "$selected"
-  tmux select-window -t "$(hub_target_for_slot "$slot")"
-}
-
-show_stop_menu() {
-  local slot target state state_label path name
-  local items=()
-  [[ -n "${TMUX:-}" ]] || die "the stop menu requires an attached tmux client"
-  if ! tmux_menus_work; then
-    if [[ -t 1 ]]; then
-      show_stop_text_ui
-    else
-      run_menu_in_home_pane stop-menu
-    fi
-    return 0
-  fi
-  slot="$(current_slot 2>/dev/null || true)"
-  if [[ -z "$slot" ]]; then
-    items+=("- Select an agent tab first" "" "")
-    tmux display-menu -T "STOP AGENT" -x C -y S -- "${items[@]}"
-    return 0
-  fi
-  target="$(slot_target "$slot")"
-  state="$(agent_state "$target")"
-  state_label="$(menu_state_label "$state")"
-  path="$(tmux display-message -p -t "$target" '#{pane_current_path}' 2>/dev/null || true)"
-  name="$(basename "${path:-project}")"
-  name="$(tmux_menu_text "$name")"
-  items+=("- $state_label  $name" "" "")
-  items+=("STOP THIS AGENT" "x" "$(menu_run_action _menu-stop "$slot")")
-  tmux display-menu -T "CONFIRM STOP" -x C -y S -- "${items[@]}"
-}
-
-menu_stop() {
-  local slot
-  slot="$(slot_number "$1")" || die "unknown slot: $1"
-  stop_slot "$slot"
-}
-
-welcome() {
-  cat <<'EOF'
-Mobailmux AI agent hub
-
-  Type:  mbx          open agent menu (Termius-friendly)
-  Type:  mbx p        pick and start a project
-  Type:  mbx overview show all agent states
-
-  Tap AGENTS / +NEW / STOP when your terminal supports tmux menus.
-  Tap a tab to switch projects.
-
-States: READY, RUNNING, WAITING, DONE, ERROR
-
-Ctrl-b d leaves without stopping anything.
-EOF
 }
 
 main() {
-  local command="${1:-}"
+  local command="${1:-help}" slot
   case "$command" in
-    "")
-      need_tmux
-      attach_hub
+    r|resume)
+      [[ $# -eq 2 ]] || die "resume needs exactly one slot"
+      slot="$(require_slot "$2")"
+      resume_slot "$slot"
       ;;
-    -h|--help)
-      usage
-      ;;
-    open|o)
-      [[ $# -eq 1 ]] || die "$command does not accept arguments"
-      need_tmux
-      attach_hub
-      ;;
-    overview)
-      shift
-      [[ $# -le 1 ]] || die "overview accepts at most one slot or all"
-      status_slots "${1:-all}"
-      ;;
-    menu)
-      [[ $# -eq 1 ]] || die "menu does not accept arguments"
-      show_agents_menu
-      ;;
-    projects-menu)
-      [[ $# -le 2 ]] || die "projects-menu accepts at most one page number"
-      show_projects_menu "${2:-1}"
-      ;;
-    stop-menu)
-      [[ $# -eq 1 ]] || die "stop-menu does not accept arguments"
-      show_stop_menu
-      ;;
-    _menu-project)
-      [[ $# -eq 2 ]] || die "_menu-project needs one project index"
-      menu_project "$2"
-      ;;
-    _menu-stop)
-      [[ $# -eq 2 ]] || die "_menu-stop needs one slot"
-      menu_stop "$2"
-      ;;
-    _state)
-      [[ $# -eq 2 ]] || die "_state needs one state"
-      set_current_agent_state "$2"
-      ;;
-    _state-exit)
-      [[ $# -eq 2 ]] || die "_state-exit needs one exit status"
-      finish_current_agent_state "$2"
-      ;;
-    project|projects|pick|p)
-      case "${2:-}" in
-        -h|--help|help)
-          usage
-          exit 0
-          ;;
-      esac
-      shift
-      pick_project "$@"
-      ;;
-    welcome)
-      [[ $# -eq 1 ]] || die "welcome does not accept arguments"
-      welcome
-      ;;
-    list|ls)
-      [[ $# -eq 1 ]] || die "$command does not accept arguments. Use 'mbx status <slot>' for one session."
-      list_slots
-      ;;
-    status|sessions|slots)
-      shift
-      case "${1:-}" in
-        -h|--help|help)
-          commands
-          exit 0
-          ;;
-      esac
-      [[ $# -le 1 ]] || die "$command accepts at most one slot or all"
-      status_slots "${1:-all}"
-      ;;
-    help|command|commands|cmd|cmds)
-      [[ $# -eq 1 ]] || die "$command does not accept arguments"
-      commands
+    status|st)
+      (( $# <= 2 )) || die "status accepts at most one slot"
+      if [[ -n "${2:-}" ]]; then
+        slot="$(require_slot "$2")"
+        print_status "$slot"
+      else
+        print_status
+      fi
       ;;
     check)
-      [[ $# -eq 1 ]] || die "check does not accept arguments"
-      check_harnesses
+      (( $# <= 2 )) || die "check accepts at most one slot"
+      if [[ -n "${2:-}" ]]; then
+        slot="$(require_slot "$2")"
+        check_activity "$slot"
+      else
+        check_activity
+      fi
       ;;
     stop|q)
-      case "${2:-}" in
-        -h|--help|help)
-          commands
-          exit 0
-          ;;
-      esac
-      [[ $# -le 2 ]] || die "$command accepts one slot or all"
-      if [[ "${2:-}" == "all" ]]; then
-        stop_all_slots
-      elif [[ -z "${2:-}" ]]; then
-        local current
-        current="$(current_slot)" || die "no current project tab; use 'mbx q <slot>'"
-        stop_slot "$current"
+      [[ $# -eq 2 ]] || die "stop needs one slot or all"
+      if [[ "$2" == all ]]; then
+        stop_slots all
       else
-        local slot
-        slot="$(slot_number "$2")" || die "unknown slot: $2"
-        stop_slot "$slot"
+        slot="$(require_slot "$2")"
+        stop_slots "$slot"
       fi
       ;;
-    start|s|new|n)
-      case "${2:-}" in
-        -h|--help|help)
-          usage
-          exit 0
-          ;;
-      esac
-      local action="$command"
-      case "$action" in
-        s) action="start" ;;
-        n) action="new" ;;
-      esac
-      shift
-      local slot=""
-      if [[ $# -gt 0 ]]; then
-        slot="$(slot_number "$1" 2>/dev/null || true)"
-        if [[ -n "$slot" ]]; then
-          shift
-        fi
-      fi
-      if [[ -z "$slot" ]]; then
-        need_tmux
-        slot="$(next_available_slot)"
-      fi
-      run_slot "$action" "$slot" "$@"
-      ;;
-    resume|r)
-      case "${2:-}" in
-        -h|--help|help)
-          usage
-          exit 0
-          ;;
-      esac
-      if [[ $# -eq 1 ]]; then
-        need_tmux
-        attach_hub
-        exit 0
-      fi
-      local slot
-      slot="$(slot_number "$2")" || die "unknown slot: $2"
-      shift 2
-      resume_slot "$slot" "$@"
+    help|-h|--help)
+      (( $# <= 1 )) || die "help does not accept arguments"
+      usage
       ;;
     *)
-      die "unknown command: $command. Run 'mbx help' for commands."
+      die "unknown command: $command (try 'mbx help')"
       ;;
   esac
 }
