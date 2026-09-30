@@ -8,6 +8,7 @@ usage() {
 Mobailmux: ten plain tmux terminals, a through j.
 
 Usage:
+  mbx ui
   mbx r <a-j>
   mbx status [a-j]
   mbx check [a-j]
@@ -15,12 +16,14 @@ Usage:
   mbx help
 
 Commands:
+  ui          Open a sidebar of all terminals; tap one to switch to it.
   r, resume   Create or return to a terminal.
   status      Show whether each terminal is IDLE, ACTIVE, EXITED, or EMPTY.
   check       Guess whether work is ongoing from tmux's last activity time.
   stop        Stop one terminal, or all Mobailmux terminals.
 
 Examples:
+  mbx ui
   mbx r a
   mbx check a
   mbx status
@@ -72,17 +75,23 @@ enable_mouse() {
   tmux set-option -t "$session" mouse on
 }
 
-resume_slot() {
+create_slot() {
   local slot="$1" session start_dir
+  session="$(session_name "$slot")"
+  start_dir="${HOME:?HOME is not set}"
+  [[ -d "$start_dir" ]] || die "starting directory does not exist: $start_dir"
+  tmux new-session -d -s "$session" -n "$slot" -c "$start_dir"
+}
+
+resume_slot() {
+  local slot="$1" session
   need_tmux
   session="$(session_name "$slot")"
 
   if tmux has-session -t "$session" 2>/dev/null; then
     printf 'Returning to terminal %s.\n' "$slot"
   else
-    start_dir="${HOME:?HOME is not set}"
-    [[ -d "$start_dir" ]] || die "starting directory does not exist: $start_dir"
-    tmux new-session -d -s "$session" -n "$slot" -c "$start_dir"
+    create_slot "$slot"
     printf 'Created terminal %s.\n' "$slot"
   fi
 
@@ -209,9 +218,259 @@ stop_slots() {
   fi
 }
 
+# --- Sidebar UI -------------------------------------------------------------
+# `mbx ui` opens a throwaway tmux session: a sidebar pane on the left, and on
+# the right a nested tmux client attached to the selected slot. Slots stay
+# plain sessions; the UI session only views them and dies when you detach.
+
+self_path() {
+  local dir
+  dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  printf '%s/%s\n' "$dir" "$(basename "${BASH_SOURCE[0]}")"
+}
+
+ui_prefix() {
+  printf '%s-ui-\n' "${MBX_SESSION_PREFIX:-mbx}"
+}
+
+ui_width() {
+  local width="${MBX_UI_WIDTH:-16}"
+  [[ "$width" =~ ^[0-9]+$ ]] && (( width >= 8 )) \
+    || die "MBX_UI_WIDTH must be a number of columns, at least 8"
+  printf '%s\n' "$width"
+}
+
+ui_get() {
+  tmux show-options -qv -t "=$1:" "$2" 2>/dev/null || true
+}
+
+first_slot() {
+  local want="$1" slot
+  for slot in a b c d e f g h i j; do
+    if tmux has-session -t "=$(session_name "$slot")" 2>/dev/null; then
+      [[ "$want" == existing ]] && { printf '%s\n' "$slot"; return 0; }
+    else
+      [[ "$want" == empty ]] && { printf '%s\n' "$slot"; return 0; }
+    fi
+  done
+  return 1
+}
+
+# The tty and session of the nested client in a UI's view pane, if attached.
+ui_view_client() {
+  local ui="$1" pane tty client_tty client_session
+  pane="$(ui_get "$ui" @mbx_view_pane)"
+  [[ -n "$pane" ]] || return 1
+  tty="$(tmux display-message -p -t "$pane" '#{pane_tty}' 2>/dev/null)" || return 1
+  while read -r client_tty client_session; do
+    if [[ "$client_tty" == "$tty" ]]; then
+      printf '%s %s\n' "$tty" "$client_session"
+      return 0
+    fi
+  done < <(tmux list-clients -F '#{client_tty} #{client_session}' 2>/dev/null)
+  return 1
+}
+
+# True when this shell runs inside a slot that is being shown by a UI.
+inside_ui_view() {
+  local tty pane
+  tty="$(tmux display-message -p '#{client_tty}' 2>/dev/null)" || return 1
+  while IFS= read -r pane; do
+    [[ -n "$pane" && "$pane" == "$tty" ]] && return 0
+  done < <(tmux list-panes -a -F '#{?#{==:#{@mbx_role},view},#{pane_tty},}' 2>/dev/null)
+  return 1
+}
+
+open_ui() {
+  local width self ui initial view sidebar click event size=()
+  need_tmux
+  width="$(ui_width)"
+  self="$(self_path)"
+  if [[ -n "${TMUX:-}" ]] && inside_ui_view; then
+    die "already inside the Mobailmux UI"
+  fi
+
+  initial="$(first_slot existing || true)"
+  if [[ -z "$initial" ]]; then
+    initial=a
+    create_slot "$initial"
+  fi
+  enable_mouse "$(session_name "$initial")" >/dev/null
+
+  if [[ -t 1 ]]; then
+    size=(-x "$(tput cols)" -y "$(tput lines)")
+  fi
+  ui="$(ui_prefix)$$"
+  view="$(tmux new-session -d -P -F '#{pane_id}' -s "$ui" -n ui ${size[@]+"${size[@]}"} \
+    "$(printf '%q __ui-view %q' "$self" "$ui")")"
+  sidebar="$(tmux split-window -h -b -d -P -F '#{pane_id}' -l "$width" -t "$view" \
+    "$(printf '%q __ui-sidebar %q' "$self" "$ui")")"
+
+  tmux set-option -p -t "$view" @mbx_role view
+  tmux set-option -p -t "$sidebar" @mbx_role sidebar
+  tmux set-option -t "=$ui:" @mbx_view "$(session_name "$initial")"
+  tmux set-option -t "=$ui:" @mbx_view_pane "$view"
+  tmux set-option -t "=$ui:" @mbx_sidebar_pane "$sidebar"
+  tmux set-option -t "=$ui:" @mbx_width "$width"
+  # Every key goes to the slot's own tmux client, so Ctrl-b works as usual.
+  tmux set-option -t "=$ui:" prefix None
+  tmux set-option -t "=$ui:" prefix2 None
+  tmux set-option -t "=$ui:" key-table mbx-ui
+  tmux set-option -t "=$ui:" status off
+  tmux set-option -t "=$ui:" mouse on
+  tmux set-option -t "=$ui:" pane-border-lines single
+  tmux set-option -t "=$ui:" pane-border-style fg=colour238
+  tmux set-option -t "=$ui:" pane-active-border-style fg=colour238
+  tmux set-hook -t "=$ui:" client-attached "set-option destroy-unattached on"
+  tmux set-hook -t "=$ui:" client-session-changed "set-option destroy-unattached on"
+  tmux set-hook -t "=$ui:" window-resized "resize-pane -t $sidebar -x $width"
+  # Taps on the sidebar pick a slot; everything else reaches the slot client.
+  click="run-shell -b \"$(printf '%q' "$self") __ui-click '#{session_name}' '#{mouse_y}'\""
+  tmux bind-key -T mbx-ui MouseDown1Pane \
+    if-shell -F '#{==:#{@mbx_role},sidebar}' "$click" 'select-pane -t = ; send-keys -M'
+  # Quick repeated taps arrive as double/triple clicks; treat them as taps too.
+  for event in DoubleClick1Pane TripleClick1Pane; do
+    tmux bind-key -T mbx-ui "$event" \
+      if-shell -F '#{==:#{@mbx_role},sidebar}' "$click" 'send-keys -M'
+  done
+  tmux select-pane -t "$view"
+
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "=$ui"
+  else
+    exec tmux attach-session -t "=$ui"
+  fi
+}
+
+ui_show() {
+  local ui="$1" session="$2" client pid
+  enable_mouse "$session" >/dev/null
+  tmux set-option -t "=$ui:" @mbx_view "$session"
+  if client="$(ui_view_client "$ui")"; then
+    tmux switch-client -c "${client%% *}" -t "=$session"
+  fi
+  pid="$(tmux show-options -pqv -t "$(ui_get "$ui" @mbx_sidebar_pane)" @mbx_pid 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -USR1 "$pid" 2>/dev/null || true
+}
+
+ui_click() {
+  local ui="$1" row="$2" rows key slot
+  [[ "$row" =~ ^[0-9]+$ ]] || return 0
+  rows="$(ui_get "$ui" @mbx_rows)"
+  key="${rows:row:1}"
+  case "$key" in
+    [a-j])
+      tmux has-session -t "=$(session_name "$key")" 2>/dev/null || return 0
+      ui_show "$ui" "$(session_name "$key")"
+      ;;
+    +)
+      slot="$(first_slot empty)" || return 0
+      create_slot "$slot"
+      ui_show "$ui" "$(session_name "$slot")"
+      ;;
+  esac
+}
+
+ui_view() {
+  local ui="$1" socket="${TMUX%%,*}" target next
+  while tmux has-session -t "=$ui" 2>/dev/null; do
+    target="$(ui_get "$ui" @mbx_view)"
+    if [[ -n "$target" ]] && tmux has-session -t "=$target" 2>/dev/null; then
+      env -u TMUX tmux -S "$socket" attach-session -t "=$target" >/dev/null 2>&1 || true
+      target="$(ui_get "$ui" @mbx_view)"
+      if [[ -n "$target" ]] && tmux has-session -t "=$target" 2>/dev/null; then
+        # The slot still exists, so the user detached: close the whole UI.
+        tmux detach-client -s "=$ui" 2>/dev/null || true
+        tmux kill-session -t "=$ui" 2>/dev/null || true
+        return 0
+      fi
+      # The slot was stopped; show another one.
+      next="$(first_slot existing || true)"
+      tmux set-option -t "=$ui:" @mbx_view "${next:+$(session_name "$next")}"
+    else
+      printf '\033[H\033[2J\n  No terminals.\n  Tap + new.\n'
+      sleep 1
+    fi
+  done
+}
+
+ui_render() {
+  local ui="$1" width view_session client line rows="" out="" now threshold
+  local name command path dead activity slot dot label dir selected
+  local panes=""
+  width="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null || echo 16)"
+  now="$(date +%s)"
+  threshold="$(quiet_seconds)"
+
+  view_session="$(ui_get "$ui" @mbx_view)"
+  if client="$(ui_view_client "$ui")"; then
+    name="${client#* }"
+    if [[ -n "$name" && "$name" != "$view_session" ]]; then
+      view_session="$name"
+      tmux set-option -t "=$ui:" @mbx_view "$name"
+    fi
+  fi
+
+  panes="$(tmux list-panes -a -F \
+    '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}	#{window_activity}' \
+    2>/dev/null || true)"
+
+  out+=$'\033[1m'"$(printf ' %-*.*s' "$((width - 1))" "$((width - 1))" MOBAILMUX)"$'\033[0m\033[K\n\033[K\n'
+  rows+=".."
+  for slot in a b c d e f g h i j; do
+    name="$(session_name "$slot")"
+    line="$(grep -m 1 "^$name"$'\t' <<<"$panes" || true)"
+    [[ -n "$line" ]] || continue
+    IFS=$'\t' read -r _ command path dead activity <<<"$line"
+    if [[ "$dead" == 1 ]]; then
+      dot=$'\033[31m✕'
+    elif is_shell "$command"; then
+      dot=$'\033[2m○'
+    elif [[ "$activity" =~ ^[0-9]+$ ]] && (( now - activity < threshold )); then
+      dot=$'\033[33m●'
+    else
+      dot=$'\033[32m●'
+    fi
+    label="$(printf '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}")"
+    dir="${path%/}"; dir="${dir##*/}"; [[ "$path" == "$HOME" ]] && dir="~"
+    dir="$(printf '%-*.*s' "$((width - 3))" "$((width - 3))" "${dir:-/}")"
+    selected=""
+    [[ "$name" == "$view_session" ]] && selected=$'\033[7m'
+    out+="$selected $slot $dot"$'\033[0m'"$selected $label"$'\033[0m\033[K\n'
+    out+="$selected   "$'\033[2m'"$dir"$'\033[0m\033[K\n'
+    rows+="$slot$slot"
+  done
+  if first_slot empty >/dev/null; then
+    out+=$'\033[K\n'" "$'\033[36m'"+ new"$'\033[0m\033[K\n'
+    rows+=".+"
+  fi
+  tmux set-option -t "=$ui:" @mbx_rows "$rows"
+  printf '\033[H%s\033[J' "$out"
+}
+
+ui_sidebar() {
+  local ui="$1"
+  tmux set-option -p -t "${TMUX_PANE:-}" @mbx_pid "$$" 2>/dev/null || true
+  printf '\033[?25l'
+  trap 'printf "\033[?25h"' EXIT
+  trap ':' USR1
+  while tmux has-session -t "=$ui" 2>/dev/null; do
+    ui_render "$ui"
+    sleep "${MBX_UI_REFRESH:-1}" &
+    wait $! 2>/dev/null || kill $! 2>/dev/null || true
+  done
+}
+
 main() {
   local command="${1:-help}" slot
   case "$command" in
+    ui)
+      [[ $# -eq 1 ]] || die "ui does not accept arguments"
+      open_ui
+      ;;
+    __ui-view) ui_view "$2" ;;
+    __ui-sidebar) ui_sidebar "$2" ;;
+    __ui-click) ui_click "$2" "$3" ;;
     r|resume)
       [[ $# -eq 2 ]] || die "resume needs exactly one slot"
       slot="$(require_slot "$2")"

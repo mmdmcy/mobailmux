@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -119,6 +120,7 @@ class MbxCliTest(unittest.TestCase):
             fake_tmux.chmod(fake_tmux.stat().st_mode | stat.S_IXUSR)
 
             env = os.environ.copy()
+            env.pop("TMUX", None)
             env.update(
                 {
                     "PATH": f"{root}{os.pathsep}{env['PATH']}",
@@ -256,6 +258,7 @@ class MbxCliTest(unittest.TestCase):
         self.assertIn("never runs, clears, or restarts", result.stdout)
         self.assertIn("Mouse-wheel scrolling is enabled", result.stdout)
         self.assertIn("mbx check", result.stdout)
+        self.assertIn("mbx ui", result.stdout)
         self.assertNotIn("Pi", result.stdout)
         self.assertNotIn("harness", result.stdout)
 
@@ -266,6 +269,16 @@ class MbxCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mbx r <a-j>", result.stdout)
+
+    def test_ui_rejects_arguments_and_bad_width(self) -> None:
+        result, _ = self.run_mbx("ui", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ui does not accept arguments", result.stderr)
+
+        result, log = self.run_mbx("ui", env_overrides={"MBX_UI_WIDTH": "3"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MBX_UI_WIDTH", result.stderr)
+        self.assertEqual(log, "")
 
     def test_copy_install_contains_only_the_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -279,6 +292,82 @@ class MbxCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((Path(temp_dir) / "bin" / "mbx").is_file())
             self.assertFalse((Path(temp_dir) / "libexec").exists())
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+class MbxUiTmuxTest(unittest.TestCase):
+    """Drives `mbx ui` inside a real, isolated tmux server."""
+
+    def setUp(self) -> None:
+        # Short paths: tmux socket paths are limited to about 100 bytes.
+        self.outer = tempfile.mkdtemp(prefix="mbxo", dir="/tmp")
+        self.inner = tempfile.mkdtemp(prefix="mbxi", dir="/tmp")
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self) -> None:
+        for directory in (self.outer, self.inner):
+            self.tmux(directory, "kill-server", check=False)
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def tmux(
+        self, directory: str, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env["TMUX_TMPDIR"] = directory
+        return subprocess.run(
+            ["tmux", *args], check=check, capture_output=True, text=True, env=env
+        )
+
+    def wait_for(self, predicate, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail("timed out waiting for the UI")
+
+    def screen(self) -> str:
+        return self.tmux(self.outer, "capture-pane", "-p", "-t", "harness").stdout
+
+    def viewed_sessions(self) -> list[str]:
+        clients = self.tmux(
+            self.inner, "list-clients", "-F", "#{client_session}", check=False
+        ).stdout.split()
+        return [name for name in clients if not name.startswith("mbx-ui-")]
+
+    def tap(self, row: int) -> None:
+        self.tmux(
+            self.outer, "send-keys", "-t", "harness", "-l",
+            f"\x1b[<0;3;{row}M\x1b[<0;3;{row}m",
+        )
+
+    def test_sidebar_lists_slots_and_taps_switch_the_view(self) -> None:
+        home = os.environ["HOME"]
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "-c", home)
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-c", "sleep 600")
+        command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
+        self.tmux(
+            self.outer, "new-session", "-d", "-s", "harness",
+            "-x", "60", "-y", "20", command,
+        )
+
+        self.wait_for(lambda: "+ new" in self.screen())
+        self.assertIn(" a ", self.screen())
+        self.assertIn(" c ", self.screen())
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-a"])
+
+        self.tap(5)  # rows 1-2 are the header; slot c is on rows 5-6
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-c"])
+
+        self.tap(8)  # "+ new" creates the first empty slot, b
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-b"])
+
+        self.tmux(self.outer, "send-keys", "-t", "harness", "C-b", "d")
+        # Detaching closes only the UI; every slot keeps running.
+        self.wait_for(
+            lambda: sorted(self.tmux(self.inner, "ls", "-F", "#S").stdout.split())
+            == ["mbx-a", "mbx-b", "mbx-c"]
+        )
 
 
 if __name__ == "__main__":

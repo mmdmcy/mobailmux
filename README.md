@@ -22,6 +22,7 @@ checkout. Use `commands/install.sh --copy` for a standalone copy.
 ## Use
 
 ```bash
+mbx ui         # sidebar of all terminals; tap one to switch
 mbx r a        # create terminal a, or return to it
 mbx r b        # create terminal b, or return to it
 mbx check      # estimate which commands are working or quiet
@@ -43,6 +44,33 @@ returns to exactly the terminal you left.
 Mouse support is enabled for each Mobailmux slot, including existing slots when
 you resume them. Use the mouse wheel or a touchpad to scroll through tmux
 history; press `q` or `Esc` to leave scrollback mode.
+
+## Sidebar UI
+
+`mbx ui` shows every running slot in a narrow sidebar, with the selected slot
+beside it, all inside your current terminal. It needs nothing beyond tmux, so it
+works the same over SSH from a phone as on the desktop.
+
+```text
+ MOBAILMUX      │mac@Mac ~/projects/site %
+                │
+ a ○ zsh        │
+   ~            │
+ b ● pi         │
+   site         │
+                │
+ + new          │
+```
+
+- Tap or click a slot to show it. `+ new` creates the next empty slot.
+- `○` shell prompt, `●` yellow working, `●` green quiet, `✕` exited — the same
+  signals as `mbx check`.
+- Keys, `Ctrl-b`, scrolling, and `mbx r <slot>` all work normally inside the
+  shown slot.
+- `Ctrl-b d` closes the UI. Your slots keep running.
+
+The UI is a throwaway tmux session that only views your slots, so each device
+can open its own. Set `MBX_UI_WIDTH` to change the sidebar width (default 16).
 
 ## Status
 
