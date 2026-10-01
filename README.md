@@ -31,6 +31,8 @@ mbx status     # inspect all ten terminals from outside tmux
 mbx status b   # inspect terminal b
 mbx stop a     # stop terminal a
 mbx stop all   # stop every Mobailmux terminal
+mbx save       # save now (it also saves every 30s in the background)
+mbx restore    # bring them back after a reboot (mbx ui does this itself)
 ```
 
 A new slot starts as an untouched shell in your home directory. From there,
@@ -71,6 +73,28 @@ works the same over SSH from a phone as on the desktop.
 
 The UI is a throwaway tmux session that only views your slots, so each device
 can open its own. Set `MBX_UI_WIDTH` to change the sidebar width (default 16).
+
+## Surviving a Reboot
+
+tmux sessions cannot survive a shutdown, so Mobailmux remembers them instead.
+A small background job inside the tmux server saves a snapshot every 30
+seconds while any slot exists, whether or not you are attached; `mbx save`
+saves immediately. The job starts with `mbx r`, `mbx ui`, `mbx save`, or
+`mbx restore`, and ends with the tmux server. Set `MBX_SAVE_SECONDS` to change
+the interval. After a reboot, the first `mbx ui` (or `mbx restore`) recreates every
+saved slot in its directory and types the command that resumes its agent:
+
+- Claude Code: `claude --resume <session id>`, read from the running CLI's
+  `~/.claude/sessions/<pid>.json`.
+- Codex: `codex resume <thread id>` in the thread's own directory, from the
+  command line or the thread lock no other slot claimed; otherwise the
+  `codex resume` picker.
+- Anything else: a plain shell in the same directory.
+
+Permission and model flags such as `--dangerously-skip-permissions` or
+`--model` carry over; prompts are never replayed. The snapshot is a plain
+tab-separated file at `~/.local/state/mobailmux/slots.tsv` that you can edit.
+`mbx stop` removes stopped slots from it, so they do not come back.
 
 ## Status
 

@@ -75,7 +75,7 @@ case "${1:-}" in
     directory="$(session_dir "$target")"
     rm -rf -- "$directory"
     ;;
-  set-option|attach-session|switch-client)
+  set-option|attach-session|switch-client|show-options|run-shell)
     ;;
   *)
     printf 'unexpected tmux command: %s\n' "$*" >&2
@@ -280,6 +280,23 @@ class MbxCliTest(unittest.TestCase):
         self.assertIn("MBX_UI_WIDTH", result.stderr)
         self.assertEqual(log, "")
 
+    def test_stop_forgets_slots_in_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            snapshot = Path(state) / "mobailmux" / "slots.tsv"
+            snapshot.parent.mkdir()
+            snapshot.write_text("a\t/tmp\t\nb\t/tmp\tclaude --continue\n")
+            env = {"XDG_STATE_HOME": state}
+
+            result, _ = self.run_mbx(
+                "stop", "a", sessions={"mbx-a": {}}, env_overrides=env
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(snapshot.read_text(), "b\t/tmp\tclaude --continue\n")
+
+            result, _ = self.run_mbx("stop", "all", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(snapshot.exists())
+
     def test_copy_install_contains_only_the_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             result = subprocess.run(
@@ -368,6 +385,108 @@ class MbxUiTmuxTest(unittest.TestCase):
             lambda: sorted(self.tmux(self.inner, "ls", "-F", "#S").stdout.split())
             == ["mbx-a", "mbx-b", "mbx-c"]
         )
+
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+class MbxSnapshotTmuxTest(unittest.TestCase):
+    """Saves and restores slots against a real, isolated tmux server."""
+
+    def setUp(self) -> None:
+        self.server = tempfile.mkdtemp(prefix="mbxs", dir="/tmp")
+        self.home = Path(tempfile.mkdtemp(prefix="mbxh"))
+        self.state = self.home / "state"
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self) -> None:
+        self.run_cmd(["tmux", "kill-server"], check=False)
+        shutil.rmtree(self.server, ignore_errors=True)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def run_cmd(
+        self, argv: list[str], check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env.update(
+            TMUX_TMPDIR=self.server, HOME=str(self.home),
+            XDG_STATE_HOME=str(self.state), MBX_SAVE_SECONDS="1",
+        )
+        return subprocess.run(
+            argv, check=check, capture_output=True, text=True, env=env
+        )
+
+    def wait_for(self, predicate, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail("timed out")
+
+    def test_save_records_claude_session_and_restore_types_it(self) -> None:
+        project = (self.home / "project").resolve()
+        project.mkdir()
+        sessions = self.home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        session_id = "11111111-2222-3333-4444-555555555555"
+        # A stand-in for Claude Code: registers its pid like the real CLI does.
+        fake_claude = self.home / "fake-claude"
+        fake_claude.write_text(
+            f"cd {project}\n"
+            f"printf '{{\"pid\":%s,\"sessionId\":\"{session_id}\",\"cwd\":\"{project}\"}}'"
+            f" $$ > {sessions}/$$.json\n"
+            "exec -a claude tail -f /dev/null\n"
+        )
+        self.run_cmd(["tmux", "new-session", "-d", "-s", "mbx-a", "-c", str(self.home)])
+        self.run_cmd(["tmux", "new-session", "-d", "-s", "mbx-c", "-c", str(project)])
+        self.run_cmd(["tmux", "send-keys", "-t", "mbx-a", f"bash {fake_claude}", "Enter"])
+        self.wait_for(lambda: any(sessions.glob("*.json")))
+        time.sleep(0.3)
+
+        result = self.run_cmd([str(MBX), "save"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = (self.state / "mobailmux" / "slots.tsv").read_text()
+        self.assertEqual(
+            snapshot,
+            f"a\t{project}\tclaude --resume {session_id}\n"
+            f"c\t{project}\t\n",
+        )
+
+        # Simulate a reboot, with a harmless command in place of Claude.
+        self.run_cmd(["tmux", "kill-server"])
+        (self.state / "mobailmux" / "slots.tsv").write_text(
+            f"a\t{project}\techo restored-a\nc\t/missing/dir\t\n"
+        )
+        result = self.run_cmd([str(MBX), "restore"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Restored terminal a", result.stdout)
+
+        def pane(target: str, fmt: str) -> str:
+            return self.run_cmd(
+                ["tmux", "display-message", "-p", "-t", target, fmt]
+            ).stdout.strip()
+
+        self.assertEqual(Path(pane("mbx-a", "#{pane_current_path}")).resolve(), project)
+        self.assertEqual(Path(pane("mbx-c", "#{pane_current_path}")).resolve(), self.home.resolve())
+        self.wait_for(
+            lambda: "restored-a\n" in self.run_cmd(
+                ["tmux", "capture-pane", "-p", "-t", "mbx-a"]
+            ).stdout
+        )
+
+        # The background saver follows the slot to a new folder.
+        elsewhere = (self.home / "elsewhere").resolve()
+        elsewhere.mkdir()
+        self.run_cmd(["tmux", "send-keys", "-t", "mbx-a", f"cd {elsewhere}", "Enter"])
+        snapshot_file = self.state / "mobailmux" / "slots.tsv"
+        self.wait_for(
+            lambda: snapshot_file.read_text().startswith(f"a\t{elsewhere}\t"),
+            timeout=8,
+        )
+
+        # Restoring again leaves running slots alone.
+        result = self.run_cmd([str(MBX), "restore"])
+        self.assertIn("already running", result.stdout)
 
 
 if __name__ == "__main__":
