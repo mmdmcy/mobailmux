@@ -13,6 +13,8 @@ Usage:
   mbx status [a-j]
   mbx check [a-j]
   mbx stop <a-j|all>
+  mbx save
+  mbx restore
   mbx help
 
 Commands:
@@ -21,6 +23,8 @@ Commands:
   status      Show whether each terminal is IDLE, ACTIVE, EXITED, or EMPTY.
   check       Guess whether work is ongoing from tmux's last activity time.
   stop        Stop one terminal, or all Mobailmux terminals.
+  save        Save now. Mobailmux also saves every 30s in the background.
+  restore     After a reboot, bring saved terminals back (mbx ui does this too).
 
 Examples:
   mbx ui
@@ -31,7 +35,8 @@ Examples:
 
 New terminals start in your home directory. Detach with Ctrl-b d.
 Mouse-wheel scrolling is enabled in every Mobailmux terminal.
-Mobailmux never runs, clears, or restarts commands inside a terminal.
+Mobailmux never runs, clears, or restarts commands inside a terminal, except
+typing the saved resume command when it restores terminals after a reboot.
 EOF
 }
 
@@ -96,6 +101,7 @@ resume_slot() {
   fi
 
   enable_mouse "$session"
+  ensure_saver
   attach_session "$session"
 }
 
@@ -196,6 +202,7 @@ stop_one() {
   session="$(session_name "$slot")"
   if tmux has-session -t "$session" 2>/dev/null; then
     tmux kill-session -t "$session"
+    forget_slot "$slot"
     printf 'Stopped terminal %s.\n' "$slot"
     return 0
   fi
@@ -212,10 +219,242 @@ stop_slots() {
         found=1
       fi
     done
+    forget_slot all
     (( found )) || printf 'No Mobailmux terminals are running.\n'
   else
     stop_one "$requested" || true
   fi
+}
+
+# --- Reboot persistence -----------------------------------------------------
+# tmux cannot survive a reboot, so mbx keeps a small snapshot of each slot: its
+# directory and, when it runs Claude Code or Codex, the command that resumes that
+# exact conversation. After a reboot, `mbx ui` or `mbx restore` rebuilds the
+# slots from it. The snapshot is plain text: slot, directory, command.
+
+snapshot_file() {
+  printf '%s/mobailmux/slots.tsv\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
+}
+
+uuid_in() {
+  grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' <<<"$1" | tail -n 1 || true
+}
+
+# The agent's own command name: "claude" or "codex", else nothing.
+agent_name() {
+  local first rest
+  read -r first rest <<<"$1"
+  case "${first##*/}" in
+    claude|codex) printf '%s\n' "${first##*/}" ;;
+    node|bun)
+      read -r first _ <<<"$rest"
+      case "$first" in
+        *claude*) printf 'claude\n' ;;
+        *codex*) printf 'codex\n' ;;
+      esac
+      ;;
+  esac
+}
+
+# Flags worth carrying over to the resumed agent. Prompts are never replayed.
+agent_flags() {
+  local agent="$1" args="$2" word take_next="" out=()
+  for word in $args; do
+    if [[ -n "$take_next" ]]; then
+      out+=("$word")
+      take_next=""
+      continue
+    fi
+    case "$agent:$word" in
+      claude:--dangerously-skip-permissions|codex:--dangerously-bypass-approvals-and-sandbox|\
+      codex:--yolo|codex:--full-auto|codex:--no-alt-screen|codex:--search)
+        out+=("$word") ;;
+      claude:--model|claude:--permission-mode|codex:--model|codex:-m|codex:--profile|codex:-p)
+        out+=("$word")
+        take_next=1 ;;
+    esac
+  done
+  [[ -n "$take_next" ]] && unset 'out[${#out[@]}-1]'
+  (( ${#out[@]} )) && printf ' %q' "${out[@]}"
+  return 0
+}
+
+# Print "pid<TAB>args" for the first claude/codex process under a pane.
+pane_agent() {
+  local parent="$1" table="$2" depth pid ppid args next
+  for depth in 1 2 3; do
+    next=""
+    while read -r pid ppid args; do
+      [[ "$ppid" == "$parent" ]] || continue
+      if [[ -n "$(agent_name "$args")" ]]; then
+        printf '%s\t%s\n' "$pid" "$args"
+        return 0
+      fi
+      [[ -n "$next" ]] || next="$pid"
+    done <<<"$table"
+    [[ -n "$next" ]] || return 1
+    parent="$next"
+  done
+  return 1
+}
+
+# The directory a Codex thread works in, from its rollout file.
+codex_thread_dir() {
+  local id="$1" file
+  for file in "$HOME"/.codex/sessions/*/*/*/rollout-*-"$id".jsonl; do
+    [[ -f "$file" ]] || continue
+    head -n 1 "$file" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p'
+    return 0
+  done
+}
+
+# Codex threads whose writer lock is currently held by a running Codex.
+held_codex_threads() {
+  local dir="$HOME/.codex/thread-writer-locks"
+  [[ -d "$dir" ]] && command -v lsof >/dev/null 2>&1 || return 0
+  lsof -Fn +d "$dir" 2>/dev/null | sed -n 's|^n.*/\([0-9a-f-]*\)\.lock$|\1|p' | sort -u
+}
+
+save_snapshot() {
+  local table line slot session pane_pid path agent pid args id cmd file tmp
+  local rows="" claimed="" open_codex="" held leftover
+  file="$(snapshot_file)"
+  table="$(ps -A -o pid= -o ppid= -o command= 2>/dev/null || true)"
+
+  while IFS=$'\t' read -r session pane_pid path; do
+    [[ "$session" =~ ^${MBX_SESSION_PREFIX:-mbx}-([a-j])$ ]] || continue
+    slot="${BASH_REMATCH[1]}"
+    cmd=""
+    if line="$(pane_agent "$pane_pid" "$table")"; then
+      pid="${line%%$'\t'*}"
+      args="${line#*$'\t'}"
+      agent="$(agent_name "$args")"
+      if [[ "$agent" == claude ]]; then
+        id=""
+        if [[ -f "$HOME/.claude/sessions/$pid.json" ]]; then
+          line="$(cat "$HOME/.claude/sessions/$pid.json")"
+          id="$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' <<<"$line")"
+          [[ "$line" =~ \"cwd\":\"([^\"]*)\" ]] && path="${BASH_REMATCH[1]}"
+        fi
+        [[ -n "$id" ]] || id="$(uuid_in "$args")"
+        if [[ -n "$id" ]]; then
+          cmd="claude$(agent_flags claude "$args") --resume $id"
+        else
+          cmd="claude$(agent_flags claude "$args") --continue"
+        fi
+      else
+        id="$(uuid_in "$args")"
+        if [[ -n "$id" ]]; then
+          claimed+="$id "
+          cmd="codex$(agent_flags codex "$args") resume $id"
+        else
+          open_codex+="$slot "
+          cmd="codex$(agent_flags codex "$args") resume"
+        fi
+      fi
+    fi
+    rows+="$slot"$'\t'"$path"$'\t'"$cmd"$'\n'
+  done < <(tmux list-panes -a -F \
+    '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_pid}	#{pane_current_path}' \
+    2>/dev/null || true)
+
+  # One Codex slot without an id: give it the one held thread nobody claimed.
+  if [[ "$open_codex" =~ ^[a-j]\ $ ]]; then
+    leftover=""
+    while read -r held; do
+      [[ -n "$held" && " $claimed" != *" $held "* ]] || continue
+      [[ -z "$leftover" ]] && leftover="$held" || leftover="many"
+    done < <(held_codex_threads)
+    if [[ -n "$leftover" && "$leftover" != many ]]; then
+      rows="$(awk -F '\t' -v OFS='\t' -v s="${open_codex% }" -v id="$leftover" \
+        '$1 == s && $3 ~ / resume$/ { $3 = $3 " " id } { print }' <<<"$rows")"$'\n'
+    fi
+  fi
+
+  # Resume each Codex thread in its own directory.
+  local fixed="" dir
+  while IFS=$'\t' read -r slot path cmd; do
+    [[ -n "$slot" ]] || continue
+    if [[ "$cmd" == codex* ]] && id="$(uuid_in "$cmd")" && [[ -n "$id" ]]; then
+      dir="$(codex_thread_dir "$id")"
+      [[ -n "$dir" && -d "$dir" ]] && path="$dir"
+    fi
+    fixed+="$slot"$'\t'"$path"$'\t'"$cmd"$'\n'
+  done <<<"$rows"
+  rows="$fixed"
+
+  # Never overwrite a snapshot with nothing, e.g. right after a reboot.
+  [[ -n "$rows" ]] || return 0
+  mkdir -p "${file%/*}"
+  tmp="$file.$$"
+  printf '%s' "$rows" > "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+forget_slot() {
+  local slot="$1" file tmp
+  file="$(snapshot_file)"
+  [[ -f "$file" ]] || return 0
+  if [[ "$slot" == all ]]; then
+    rm -f "$file"
+    return 0
+  fi
+  tmp="$file.$$"
+  awk -F '\t' -v s="$slot" '$1 != s' "$file" > "$tmp" && mv -f "$tmp" "$file"
+  [[ -s "$file" ]] || rm -f "$file"
+}
+
+any_slot_running() {
+  first_slot existing >/dev/null
+}
+
+restore_snapshot() {
+  local file slot path cmd session count=0
+  file="$(snapshot_file)"
+  [[ -s "$file" ]] || { printf 'Nothing to restore.\n'; return 0; }
+  while IFS=$'\t' read -r slot path cmd; do
+    [[ "$slot" =~ ^[a-j]$ ]] || continue
+    session="$(session_name "$slot")"
+    tmux has-session -t "=$session" 2>/dev/null && continue
+    [[ -d "$path" ]] || path="$HOME"
+    tmux new-session -d -s "$session" -n "$slot" -c "$path"
+    enable_mouse "$session"
+    if [[ -n "$cmd" ]]; then
+      tmux send-keys -t "=$session:" -l "$cmd"
+      tmux send-keys -t "=$session:" Enter
+    fi
+    count=$((count + 1))
+    printf 'Restored terminal %s in %s%s\n' "$slot" "$path" "${cmd:+: $cmd}"
+  done < "$file"
+  (( count )) || printf 'All saved terminals are already running.\n'
+  ensure_saver
+}
+
+# A background job inside the tmux server keeps the snapshot current, attached
+# or not. It stops on its own once no slot is left (or with the server).
+ensure_saver() {
+  local pid env_args=() name
+  pid="$(tmux show-options -gqv @mbx_saver_pid 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && ps -o command= -p "$pid" 2>/dev/null | grep -q -- '__saver'; then
+    return 0
+  fi
+  for name in XDG_STATE_HOME MBX_SAVE_SECONDS MBX_SESSION_PREFIX; do
+    [[ -n "${!name:-}" ]] && env_args+=("$name=${!name}")
+  done
+  tmux run-shell -b "$(printf '%q ' env ${env_args[@]+"${env_args[@]}"} "$(self_path)" __saver) >/dev/null 2>&1"
+}
+
+saver_loop() {
+  local seconds="${MBX_SAVE_SECONDS:-30}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || seconds=30
+  tmux set-option -g @mbx_saver_pid "$$"
+  while any_slot_running; do
+    save_snapshot 2>/dev/null || true
+    sleep "$seconds"
+  done
+  [[ "$(tmux show-options -gqv @mbx_saver_pid 2>/dev/null)" == "$$" ]] \
+    && tmux set-option -gu @mbx_saver_pid 2>/dev/null
+  return 0
 }
 
 # --- Sidebar UI -------------------------------------------------------------
@@ -290,12 +529,16 @@ open_ui() {
     die "already inside the Mobailmux UI"
   fi
 
+  if ! any_slot_running && [[ -s "$(snapshot_file)" ]]; then
+    restore_snapshot
+  fi
   initial="$(first_slot existing || true)"
   if [[ -z "$initial" ]]; then
     initial=a
     create_slot "$initial"
   fi
   enable_mouse "$(session_name "$initial")" >/dev/null
+  ensure_saver
 
   if [[ -t 1 ]]; then
     size=(-x "$(tput cols)" -y "$(tput lines)")
@@ -468,6 +711,19 @@ main() {
       [[ $# -eq 1 ]] || die "ui does not accept arguments"
       open_ui
       ;;
+    save)
+      [[ $# -eq 1 ]] || die "save does not accept arguments"
+      need_tmux
+      save_snapshot
+      ensure_saver
+      printf 'Saved %s\n' "$(snapshot_file)"
+      ;;
+    restore)
+      [[ $# -eq 1 ]] || die "restore does not accept arguments"
+      need_tmux
+      restore_snapshot
+      ;;
+    __saver) saver_loop ;;
     __ui-view) ui_view "$2" ;;
     __ui-sidebar) ui_sidebar "$2" ;;
     __ui-click) ui_click "$2" "$3" ;;
