@@ -34,6 +34,7 @@ Examples:
   mbx stop a
 
 New terminals start in your home directory. Detach with Ctrl-b d.
+Close a terminal by quitting its program and typing exit, or with mbx stop.
 Mouse-wheel scrolling is enabled in every Mobailmux terminal.
 Mobailmux never runs, clears, or restarts commands inside a terminal, except
 typing the saved resume command when it restores terminals after a reboot.
