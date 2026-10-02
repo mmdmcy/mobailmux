@@ -40,7 +40,8 @@ A new slot starts as an untouched shell in your home directory. From there,
 command, launch a harness, clear the screen, change an existing slot's working
 directory, or restart a process.
 
-Detach without stopping your work with `Ctrl-b d`. Running `mbx r a` later
+To close a terminal, quit what runs in it and type `exit` at its shell, or use
+`mbx stop a`. Detach without stopping your work with `Ctrl-b d`. Running `mbx r a` later
 returns to exactly the terminal you left.
 
 Mouse support is enabled for each Mobailmux slot, including existing slots when
@@ -70,6 +71,9 @@ works the same over SSH from a phone as on the desktop.
 - Keys, `Ctrl-b`, scrolling, and `mbx r <slot>` all work normally inside the
   shown slot.
 - `Ctrl-b d` closes the UI. Your slots keep running.
+- To close a slot for good, quit what runs in it (for example `/exit` in
+  Claude Code or Codex), then type `exit` at the shell. The UI moves on to
+  another slot, and the slot will not come back after a reboot.
 
 The UI is a throwaway tmux session that only views your slots, so each device
 can open its own. Set `MBX_UI_WIDTH` to change the sidebar width (default 16).
