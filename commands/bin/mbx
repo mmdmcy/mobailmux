@@ -79,6 +79,32 @@ attach_session() {
 enable_mouse() {
   local session="$1"
   tmux set-option -t "$session" mouse on
+  enable_clipboard
+}
+
+# The command that writes this device's system clipboard, if it has one.
+clipboard_command() {
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf 'pbcopy'
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+    printf 'wl-copy'
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xclip >/dev/null 2>&1; then
+    printf 'xclip -selection clipboard'
+  fi
+}
+
+# With mouse mode on, a highlight is copied into tmux, not the system
+# clipboard, and apps that copy with OSC 52 (Claude Code, Codex) only reach
+# terminals that support it (Apple's Terminal does not). Send both to the
+# system clipboard directly; without one, still pass OSC 52 outward.
+enable_clipboard() {
+  local copy
+  tmux set-option -s set-clipboard on
+  copy="$(clipboard_command)"
+  [[ -n "$copy" ]] || return 0
+  tmux set-option -s copy-command "$copy"
+  tmux set-hook -g pane-set-clipboard \
+    "run-shell -b \"tmux -S '#{socket_path}' save-buffer - | $copy\""
 }
 
 create_slot() {

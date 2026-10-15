@@ -75,7 +75,7 @@ case "${1:-}" in
     directory="$(session_dir "$target")"
     rm -rf -- "$directory"
     ;;
-  set-option|attach-session|switch-client|show-options|run-shell)
+  set-option|set-hook|attach-session|switch-client|show-options|run-shell)
     ;;
   *)
     printf 'unexpected tmux command: %s\n' "$*" >&2
@@ -213,6 +213,15 @@ class MbxCliTest(unittest.TestCase):
         self.assertNotIn("new-session", log)
         self.assertIn("set-option -t mbx-a mouse on", log)
         self.assertIn("attach-session -t mbx-a", log)
+
+    def test_copies_reach_the_system_clipboard(self) -> None:
+        result, log = self.run_mbx("r", "a", sessions={"mbx-a": {}})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("set-option -s set-clipboard on", log)
+        if shutil.which("pbcopy"):
+            self.assertIn("set-option -s copy-command pbcopy", log)
+            self.assertIn("set-hook -g pane-set-clipboard", log)
 
     def test_resume_inside_tmux_switches_client(self) -> None:
         result, log = self.run_mbx(

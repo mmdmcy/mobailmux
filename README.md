@@ -75,6 +75,14 @@ works the same over SSH from a phone as on the desktop.
   Claude Code or Codex), then type `exit` at the shell. The UI moves on to
   another slot, and the slot will not come back after a reboot.
 
+Copying works with the mouse: highlight text and it lands in the system
+clipboard (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux), and so do copies
+made by apps inside a slot, such as Claude Code's. mbx sets tmux's
+`copy-command` and a `pane-set-clipboard` hook for this, because Apple's
+Terminal ignores the OSC 52 copy sequence those apps send. With no clipboard
+tool on the device (for example over SSH), copies are passed outward as OSC 52
+for terminals that support it.
+
 The UI is a throwaway tmux session that only views your slots, so each device
 can open its own. Set `MBX_UI_WIDTH` to change the sidebar width (default 16).
 
