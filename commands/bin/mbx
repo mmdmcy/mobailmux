@@ -102,9 +102,12 @@ enable_clipboard() {
   tmux set-option -s set-clipboard on
   copy="$(clipboard_command)"
   [[ -n "$copy" ]] || return 0
-  tmux set-option -s copy-command "$copy"
+  # Best effort: the host clipboard is a bonus (a client over SSH gets the
+  # OSC 52 copy anyway). A failure must never pop up as a tmux message that
+  # the person has to dismiss, so output is dropped and the exit code ignored.
+  tmux set-option -s copy-command "$copy >/dev/null 2>&1 || true"
   tmux set-hook -g pane-set-clipboard \
-    "run-shell -b \"tmux -S '#{socket_path}' save-buffer - | $copy\""
+    "run-shell -b \"tmux -S '#{socket_path}' save-buffer - 2>/dev/null | $copy >/dev/null 2>&1 || true\""
 }
 
 create_slot() {
