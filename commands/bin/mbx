@@ -554,6 +554,7 @@ open_ui() {
   local width self ui initial view sidebar click event size=()
   need_tmux
   width="$(ui_width)"
+  quiet_seconds >/dev/null
   self="$(self_path)"
   if [[ -n "${TMUX:-}" ]] && inside_ui_view; then
     die "already inside the Mobailmux UI"
@@ -653,7 +654,9 @@ ui_view() {
       target="$(ui_get "$ui" @mbx_view)"
       if [[ -n "$target" ]] && tmux has-session -t "=$target" 2>/dev/null; then
         # The slot still exists, so the user detached: close the whole UI.
-        tmux detach-client -s "=$ui" 2>/dev/null || true
+        # Only kill-session: detach-client here makes tmux 3.4 segfault now
+        # and then (destroy-unattached frees the session under the leaving
+        # client), taking every slot down with the server.
         tmux kill-session -t "=$ui" 2>/dev/null || true
         return 0
       fi
@@ -723,10 +726,20 @@ ui_render() {
 
 ui_sidebar() {
   local ui="$1"
-  tmux set-option -p -t "${TMUX_PANE:-}" @mbx_pid "$$" 2>/dev/null || true
   printf '\033[?25l'
   trap 'printf "\033[?25h"' EXIT
+  # Drawing runs in a child: if it ever stops (a failed command, a signal),
+  # it starts again instead of leaving the slot alone on screen.
+  while tmux has-session -t "=$ui" 2>/dev/null; do
+    ( ui_draw "$ui" ) || true
+    sleep 1
+  done
+}
+
+ui_draw() {
+  local ui="$1"
   trap ':' USR1
+  tmux set-option -p -t "${TMUX_PANE:-}" @mbx_pid "$BASHPID" 2>/dev/null || true
   while tmux has-session -t "=$ui" 2>/dev/null; do
     ui_render "$ui"
     sleep "${MBX_UI_REFRESH:-1}" &

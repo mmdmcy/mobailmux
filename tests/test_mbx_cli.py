@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -126,6 +127,8 @@ class MbxCliTest(unittest.TestCase):
                     "PATH": f"{root}{os.pathsep}{env['PATH']}",
                     "MBX_TMUX_STATE": str(state),
                     "MBX_TMUX_LOG": str(log),
+                    # `mbx stop` edits the snapshot; never the real one.
+                    "XDG_STATE_HOME": str(root / "xdg-state"),
                 }
             )
             if env_overrides:
@@ -289,6 +292,12 @@ class MbxCliTest(unittest.TestCase):
         self.assertIn("MBX_UI_WIDTH", result.stderr)
         self.assertEqual(log, "")
 
+        # Refused up front, not by a sidebar that keeps failing to draw.
+        result, log = self.run_mbx("ui", env_overrides={"MBX_QUIET_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MBX_QUIET_SECONDS", result.stderr)
+        self.assertEqual(log, "")
+
     def test_stop_forgets_slots_in_the_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as state:
             snapshot = Path(state) / "mobailmux" / "slots.tsv"
@@ -340,6 +349,8 @@ class MbxUiTmuxTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
         env["TMUX_TMPDIR"] = directory
+        # The UI's saver must never write the real ~/.local/state snapshot.
+        env["XDG_STATE_HOME"] = self.outer
         return subprocess.run(
             ["tmux", *args], check=check, capture_output=True, text=True, env=env
         )
@@ -377,9 +388,11 @@ class MbxUiTmuxTest(unittest.TestCase):
             "-x", "60", "-y", "20", command,
         )
 
-        self.wait_for(lambda: "+ new" in self.screen())
+        # Not "+ new" alone: the view's "Tap + new." can show before the
+        # sidebar draws. The sidebar draws all its rows in one go.
+        self.wait_for(lambda: " c " in self.screen())
         self.assertIn(" a ", self.screen())
-        self.assertIn(" c ", self.screen())
+        self.assertIn("+ new", self.screen())
         self.wait_for(lambda: self.viewed_sessions() == ["mbx-a"])
 
         self.tap(5)  # rows 1-2 are the header; slot c is on rows 5-6
@@ -394,6 +407,37 @@ class MbxUiTmuxTest(unittest.TestCase):
             lambda: sorted(self.tmux(self.inner, "ls", "-F", "#S").stdout.split())
             == ["mbx-a", "mbx-b", "mbx-c"]
         )
+
+    def test_sidebar_comes_back_after_it_exits(self) -> None:
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "sleep 600")
+        command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
+        self.tmux(
+            self.outer, "new-session", "-d", "-s", "harness",
+            "-x", "60", "-y", "20", command,
+        )
+        # The UI client attaches last, once every option and hook is set.
+        self.wait_for(
+            lambda: any(
+                name.startswith("mbx-ui-")
+                for name in self.tmux(
+                    self.inner, "list-clients", "-F", "#{client_session}"
+                ).stdout.split()
+            )
+        )
+
+        def sidebar_pid() -> str:
+            panes = self.tmux(
+                self.inner, "list-panes", "-a", "-F",
+                "#{@mbx_role} #{pane_dead} #{@mbx_pid}",
+            ).stdout.splitlines()
+            alive = [p.split()[2] for p in panes if p.startswith("sidebar 0 ")]
+            return alive[0] if alive else ""
+
+        self.wait_for(lambda: sidebar_pid() != "")
+        first = sidebar_pid()
+        os.kill(int(first), signal.SIGKILL)
+        self.wait_for(lambda: sidebar_pid() not in ("", first))
+        self.wait_for(lambda: "+ new" in self.screen())
 
 
 
