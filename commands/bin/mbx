@@ -15,6 +15,9 @@ Usage:
   mbx stop <a-j|all>
   mbx save
   mbx restore
+  mbx who [a-j] [--format json]
+  mbx log <a-j> [-n N] [--format json]
+  mbx peek <a-j> [-n N] [--format json]
   mbx help
 
 Commands:
@@ -26,12 +29,25 @@ Commands:
   save        Save now. Mobailmux also saves every 30s in the background.
   restore     After a reboot, bring saved terminals back (mbx ui does this too).
 
+For AI agents (read-only; who and log need jq):
+  who         What runs in each terminal: program, state, the Claude Code
+              session name, and what it works on. * marks your own terminal.
+  log         The recent conversation of the Claude Code or Codex session in a
+              terminal, read from its own transcript (last 20 entries; -n N).
+  peek        What a terminal shows right now, as plain text, for any program
+              (-n N for the last N lines including scrollback).
+  Claude Code sessions message each other with Claude Code's own SendMessage
+  tool, addressed to the NAME that mbx who shows. mbx never types into a
+  terminal to pass a message on.
+
 Examples:
   mbx ui
   mbx r a
   mbx check a
   mbx status
   mbx stop a
+  mbx who --format json
+  mbx log b -n 5
 
 New terminals start in your home directory. Detach with Ctrl-b d.
 Close a terminal by quitting its program and typing exit, or with mbx stop.
@@ -183,6 +199,27 @@ quiet_seconds() {
   printf '%s\n' "$seconds"
 }
 
+# mbx check's signal for one pane, and its seconds of silence (or -):
+# EXITED, DONE (back at the shell), WORKING, or QUIET past the threshold.
+activity_signal() {
+  local command="$1" dead="$2" activity="$3" now="$4" threshold="$5" elapsed
+  if [[ "$dead" == 1 ]]; then
+    printf 'EXITED -\n'
+  elif is_shell "$command"; then
+    printf 'DONE -\n'
+  elif [[ "$activity" =~ ^[0-9]+$ ]]; then
+    elapsed=$((now - activity))
+    (( elapsed >= 0 )) || elapsed=0
+    if (( elapsed >= threshold )); then
+      printf 'QUIET %s\n' "$elapsed"
+    else
+      printf 'WORKING %s\n' "$elapsed"
+    fi
+  else
+    printf 'UNKNOWN -\n'
+  fi
+}
+
 check_activity() {
   local requested="${1:-}" slot session signal silent command path dead activity elapsed
   local threshold now
@@ -204,23 +241,9 @@ check_activity() {
     path="$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)"
     dead="$(tmux display-message -p -t "$session" '#{pane_dead}' 2>/dev/null || true)"
     activity="$(tmux display-message -p -t "$session" '#{window_activity}' 2>/dev/null || true)"
-    signal=UNKNOWN
+    read -r signal elapsed <<<"$(activity_signal "$command" "$dead" "$activity" "$now" "$threshold")"
     silent=-
-
-    if [[ "$dead" == "1" ]]; then
-      signal=EXITED
-    elif is_shell "$command"; then
-      signal=DONE
-    elif [[ "$activity" =~ ^[0-9]+$ ]]; then
-      elapsed=$((now - activity))
-      (( elapsed >= 0 )) || elapsed=0
-      silent="${elapsed}s"
-      if (( elapsed >= threshold )); then
-        signal=QUIET
-      else
-        signal=WORKING
-      fi
-    fi
+    [[ "$elapsed" == - ]] || silent="${elapsed}s"
 
     printf '%-5s %-8s %-9s %-14s %s\n' \
       "$slot" "$signal" "$silent" "${command:-unknown}" "${path:-unknown}"
@@ -311,107 +334,135 @@ agent_flags() {
 
 # Print "pid<TAB>args" for the first claude/codex process under a pane.
 pane_agent() {
-  local parent="$1" table="$2" depth pid ppid args next
+  local parent="$1" table="$2" depth pid args next
   for depth in 1 2 3; do
     next=""
-    while read -r pid ppid args; do
-      [[ "$ppid" == "$parent" ]] || continue
+    # awk picks the children: a bash loop over every process is slow.
+    while read -r pid _ args; do
       if [[ -n "$(agent_name "$args")" ]]; then
         printf '%s\t%s\n' "$pid" "$args"
         return 0
       fi
       [[ -n "$next" ]] || next="$pid"
-    done <<<"$table"
+    done < <(awk -v parent="$parent" '$2 == parent' <<<"$table")
     [[ -n "$next" ]] || return 1
     parent="$next"
   done
   return 1
 }
 
-# The directory a Codex thread works in, from its rollout file.
-codex_thread_dir() {
+claude_home() {
+  printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+codex_home() {
+  printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
+}
+
+# A Codex thread's rollout file, its transcript.
+codex_rollout() {
   local id="$1" file
-  for file in "$HOME"/.codex/sessions/*/*/*/rollout-*-"$id".jsonl; do
+  for file in "$(codex_home)"/sessions/*/*/*/rollout-*-"$id".jsonl; do
     [[ -f "$file" ]] || continue
-    head -n 1 "$file" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p'
+    printf '%s\n' "$file"
     return 0
   done
+  return 1
+}
+
+# The directory a Codex thread works in, from its rollout file.
+codex_thread_dir() {
+  local file
+  file="$(codex_rollout "$1")" || return 0
+  head -n 1 "$file" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p'
 }
 
 # Codex threads whose writer lock is currently held by a running Codex.
 held_codex_threads() {
-  local dir="$HOME/.codex/thread-writer-locks"
+  local dir
+  dir="$(codex_home)/thread-writer-locks"
   [[ -d "$dir" ]] && command -v lsof >/dev/null 2>&1 || return 0
   lsof -Fn +d "$dir" 2>/dev/null | sed -n 's|^n.*/\([0-9a-f-]*\)\.lock$|\1|p' | sort -u
 }
 
-save_snapshot() {
-  local table line slot session pane_pid path agent pid args id cmd file tmp
-  local rows="" claimed="" open_codex="" held leftover
-  file="$(snapshot_file)"
+# One tab-separated line per running slot: slot, directory, agent (claude,
+# codex or -), the agent's pid, its session or thread id (or -), and its
+# command line. Claude Code's id and directory come from the CLI's own
+# sessions/<pid>.json; a Codex thread's from its command line, or else the one
+# held thread no other slot claimed, and it works in the thread's directory.
+scan_slots() {
+  local table line slot session pane_pid path agent pid args id json
+  local rows="" claimed="" open_codex="" held leftover dir
   table="$(ps -A -o pid= -o ppid= -o command= 2>/dev/null || true)"
 
   while IFS=$'\t' read -r session pane_pid path; do
     [[ "$session" =~ ^${MBX_SESSION_PREFIX:-mbx}-([a-j])$ ]] || continue
     slot="${BASH_REMATCH[1]}"
-    cmd=""
+    agent=- pid=- id=- args=""
     if line="$(pane_agent "$pane_pid" "$table")"; then
       pid="${line%%$'\t'*}"
       args="${line#*$'\t'}"
       agent="$(agent_name "$args")"
+      id="$(uuid_in "$args")"
       if [[ "$agent" == claude ]]; then
-        id=""
-        if [[ -f "$HOME/.claude/sessions/$pid.json" ]]; then
-          line="$(cat "$HOME/.claude/sessions/$pid.json")"
-          id="$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' <<<"$line")"
+        json="$(claude_home)/sessions/$pid.json"
+        if [[ -f "$json" ]]; then
+          line="$(cat "$json")"
+          [[ "$line" =~ \"sessionId\":\"([^\"]*)\" ]] && id="${BASH_REMATCH[1]}"
           [[ "$line" =~ \"cwd\":\"([^\"]*)\" ]] && path="${BASH_REMATCH[1]}"
         fi
-        [[ -n "$id" ]] || id="$(uuid_in "$args")"
-        if [[ -n "$id" ]]; then
-          cmd="claude$(agent_flags claude "$args") --resume $id"
-        else
-          cmd="claude$(agent_flags claude "$args") --continue"
-        fi
+      elif [[ -n "$id" ]]; then
+        claimed+="$id "
       else
-        id="$(uuid_in "$args")"
-        if [[ -n "$id" ]]; then
-          claimed+="$id "
-          cmd="codex$(agent_flags codex "$args") resume $id"
-        else
-          open_codex+="$slot "
-          cmd="codex$(agent_flags codex "$args") resume"
-        fi
+        open_codex+="$slot "
       fi
+      [[ -n "$id" ]] || id=-
     fi
-    rows+="$slot"$'\t'"$path"$'\t'"$cmd"$'\n'
+    rows+="$slot"$'\t'"$path"$'\t'"$agent"$'\t'"$pid"$'\t'"$id"$'\t'"$args"$'\n'
   done < <(tmux list-panes -a -F \
     '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_pid}	#{pane_current_path}' \
     2>/dev/null || true)
 
   # One Codex slot without an id: give it the one held thread nobody claimed.
+  leftover=""
   if [[ "$open_codex" =~ ^[a-j]\ $ ]]; then
-    leftover=""
     while read -r held; do
       [[ -n "$held" && " $claimed" != *" $held "* ]] || continue
       [[ -z "$leftover" ]] && leftover="$held" || leftover="many"
     done < <(held_codex_threads)
-    if [[ -n "$leftover" && "$leftover" != many ]]; then
-      rows="$(awk -F '\t' -v OFS='\t' -v s="${open_codex% }" -v id="$leftover" \
-        '$1 == s && $3 ~ / resume$/ { $3 = $3 " " id } { print }' <<<"$rows")"$'\n'
-    fi
+    [[ "$leftover" != many ]] || leftover=""
   fi
 
-  # Resume each Codex thread in its own directory.
-  local fixed="" dir
-  while IFS=$'\t' read -r slot path cmd; do
+  while IFS=$'\t' read -r slot path agent pid id args; do
     [[ -n "$slot" ]] || continue
-    if [[ "$cmd" == codex* ]] && id="$(uuid_in "$cmd")" && [[ -n "$id" ]]; then
-      dir="$(codex_thread_dir "$id")"
-      [[ -n "$dir" && -d "$dir" ]] && path="$dir"
+    if [[ "$agent" == codex ]]; then
+      [[ "$id" == - && -n "$leftover" && "$slot " == "$open_codex" ]] && id="$leftover"
+      if [[ "$id" != - ]]; then
+        dir="$(codex_thread_dir "$id")"
+        [[ -n "$dir" && -d "$dir" ]] && path="$dir"
+      fi
     fi
-    fixed+="$slot"$'\t'"$path"$'\t'"$cmd"$'\n'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "$path" "$agent" "$pid" "$id" "$args"
   done <<<"$rows"
-  rows="$fixed"
+}
+
+save_snapshot() {
+  local slot path agent pid id args cmd file tmp rows=""
+  file="$(snapshot_file)"
+  while IFS=$'\t' read -r slot path agent pid id args; do
+    case "$agent" in
+      claude)
+        cmd="claude$(agent_flags claude "$args")"
+        if [[ "$id" == - ]]; then cmd+=" --continue"; else cmd+=" --resume $id"; fi
+        ;;
+      codex)
+        cmd="codex$(agent_flags codex "$args") resume"
+        [[ "$id" == - ]] || cmd+=" $id"
+        ;;
+      *) cmd="" ;;
+    esac
+    rows+="$slot"$'\t'"$path"$'\t'"$cmd"$'\n'
+  done < <(scan_slots)
 
   # Never overwrite a snapshot with nothing, e.g. right after a reboot.
   [[ -n "$rows" ]] || return 0
@@ -747,6 +798,306 @@ ui_draw() {
   done
 }
 
+# --- For agents -------------------------------------------------------------
+# Read-only views so an agent (or a person) in one slot can see the others:
+# who runs where (mbx who), what an agent said and did, from its own
+# transcript (mbx log), and what a terminal shows (mbx peek). Claude Code
+# sessions message each other with Claude Code's own SendMessage, addressed to
+# the name mbx who shows; mbx never types into a terminal to pass one on.
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 \
+    || die "$1 needs jq; install it with your package manager (apt install jq, brew install jq)"
+}
+
+positive_number() {
+  [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || die "$1 needs a positive number, got: ${2:-<missing>}"
+  printf '%s\n' "$2"
+}
+
+output_format() {
+  case "${1:-}" in
+    json|text) printf '%s\n' "$1" ;;
+    *) die "--format must be json or text, got: ${1:-<missing>}" ;;
+  esac
+}
+
+# Options of who, log and peek: one slot, -n N, --format json|text.
+parse_view_args() {
+  local command="$1"
+  shift
+  view_slot="" view_lines="" view_format=text
+  while (( $# )); do
+    case "$1" in
+      -n|--lines) view_lines="$(positive_number "$1" "${2:-}")"; shift 2 ;;
+      --format) view_format="$(output_format "${2:-}")"; shift 2 ;;
+      --format=*) view_format="$(output_format "${1#*=}")"; shift ;;
+      -*) die "$command: unknown option: $1 (see mbx help)" ;;
+      *)
+        [[ -z "$view_slot" ]] || die "$command accepts one slot"
+        view_slot="$(require_slot "$1")"
+        shift
+        ;;
+    esac
+  done
+}
+
+# The slot this command runs in, if any.
+self_slot() {
+  local name
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  name="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
+  [[ "$name" =~ ^${MBX_SESSION_PREFIX:-mbx}-([a-j])$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+  return 0
+}
+
+claude_transcript() {
+  local file
+  for file in "$(claude_home)"/projects/*/"$1".jsonl; do
+    [[ -f "$file" ]] || continue
+    printf '%s\n' "$file"
+    return 0
+  done
+  return 1
+}
+
+# The last line of a file containing a fixed text: near the end first (agent
+# transcripts can be hundreds of megabytes), then the whole file.
+last_line_with() {
+  local file="$1" text="$2" line
+  [[ -f "$file" ]] || return 0
+  line="$(tail -n 400 "$file" | grep -F -- "$text" | tail -n 1 || true)"
+  [[ -n "$line" ]] || line="$(grep -F -- "$text" "$file" | tail -n 1 || true)"
+  printf '%s\n' "$line"
+}
+
+# jq turning one transcript line into conversation entries:
+# {time, from, kind: prompt|message|notice|text|tool, tool?, text}.
+# shellcheck disable=SC2016
+claude_entries='
+def tooltext:
+  .input as $i
+  | if .name == "Bash" then $i.command
+    elif .name == "SendMessage" then "to \($i.to // "?"): \($i.message // "")"
+    else ($i.file_path // $i.path // $i.pattern // $i.url // $i.query
+          // $i.description // $i.skill // $i.prompt // ($i | tostring)) end
+  | tostring;
+def entries:
+  select(.type == "user" or .type == "assistant")
+  | select((.isSidechain // false) == false and (.isCompactSummary // false) == false)
+  # Injected text (skills, reminders) is meta; a message from another session
+  # is meta too, but belongs in the conversation.
+  | select((.isMeta // false) == false or .origin.kind == "peer")
+  | .timestamp as $t
+  | if .type == "user" then
+      (.origin.kind // "human") as $k
+      | (.message.content | if type == "string" then .
+         else ([.[]? | select(.type == "text") | .text] | join("\n")) end) as $text
+      | select($text != "")
+      | if $k == "peer" then
+          {time: $t, from: (.origin.name // "peer"), kind: "message", text: (.origin.body // $text)}
+        elif $k == "human" then {time: $t, from: "user", kind: "prompt", text: $text}
+        else {time: $t, from: $k, kind: "notice", text: $text} end
+    else
+      .message.content[]?
+      | if .type == "text" then {time: $t, from: "claude", kind: "text", text: .text}
+        elif .type == "tool_use" then
+          {time: $t, from: "claude", kind: "tool", tool: .name, text: tooltext}
+        else empty end
+    end;'
+
+# shellcheck disable=SC2016
+codex_entries='
+def entries:
+  select(.type == "event_msg" and .payload.type == "item_completed")
+  | .timestamp as $t
+  | .payload.item
+  | if .type == "UserMessage" then
+      {time: $t, from: "user", kind: "prompt",
+       text: ([.content[]? | select(.type == "text") | .text] | join("\n"))}
+    elif .type == "AgentMessage" then
+      {time: $t, from: "codex", kind: "text",
+       text: ([.content[]? | select(.type == "Text" or .type == "text") | .text] | join("\n"))}
+    elif .type == "CommandExecution" then
+      {time: $t, from: "codex", kind: "tool", tool: "shell",
+       text: (.command | if type == "array" then .[-1] else tostring end)}
+    elif .type == "FileChange" then
+      {time: $t, from: "codex", kind: "tool", tool: "edit",
+       text: (.changes | if type == "object" then keys | join(", ") else tostring end)}
+    else empty end
+  | select(.text != "");'
+
+# The last N conversation entries of a transcript, one JSON object per line,
+# optionally only one kind. It reads from the end and widens the window until
+# it has N entries or has read the whole file.
+transcript_entries() {
+  local agent="$1" file="$2" want="$3" only="${4:-}" program window=400 total items count
+  case "$agent" in
+    claude) program="$claude_entries" ;;
+    codex) program="$codex_entries" ;;
+    *) return 0 ;;
+  esac
+  # shellcheck disable=SC2016
+  program+=' fromjson? | entries | select($only == "" or .kind == $only)'
+  total="$(wc -l < "$file")"
+  while :; do
+    items="$(tail -n "$window" "$file" | jq -R -c --arg only "$only" "$program")"
+    count="$(printf '%s' "$items" | awk 'END { print NR }')"
+    (( count >= want || window >= total )) && break
+    window=$((window * 4))
+  done
+  [[ -z "$items" ]] || tail -n "$want" <<<"$items"
+}
+
+# What the agent in a slot says about itself, as four lines: its own session
+# record (JSON or empty), the transcript line with its title, the one with its
+# last prompt, and the transcript's path. agents_who reads them in one jq.
+agent_info() {
+  local agent="$1" pid="$2" id="$3" session="" file="" title="" prompt=""
+  case "$agent" in
+    claude)
+      session="$(cat "$(claude_home)/sessions/$pid.json" 2>/dev/null || true)"
+      if [[ "$id" != - ]] && file="$(claude_transcript "$id")"; then
+        title="$(last_line_with "$file" '"type":"ai-title"')"
+        prompt="$(last_line_with "$file" '"type":"last-prompt"')"
+      fi
+      ;;
+    codex)
+      if [[ "$id" != - ]] && file="$(codex_rollout "$id")"; then
+        title="$(last_line_with "$(codex_home)/session_index.jsonl" "\"id\":\"$id\"")"
+        prompt="$(transcript_entries codex "$file" 1 prompt)"
+      fi
+      ;;
+  esac
+  printf '%s\n' "${session//$'\n'/ }" "$title" "$prompt" "$file"
+}
+
+agents_who() {
+  local requested="$1" format="$2" me now threshold panes line found=0 objects=""
+  local slot path agent pid id args command dead activity attached signal silent
+  local session title prompt file
+  need_tmux
+  need_jq who
+  threshold="$(quiet_seconds)"
+  me="$(self_slot)"
+  now="$(date +%s)"
+  panes="$(tmux list-panes -a -F \
+    '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_current_command}	#{pane_dead}	#{window_activity}	#{session_attached}' \
+    2>/dev/null || true)"
+
+  while IFS=$'\t' read -r slot path agent pid id args; do
+    [[ -n "$slot" ]] || continue
+    [[ -z "$requested" || "$slot" == "$requested" ]] || continue
+    found=1
+    line="$(grep -m 1 "^$(session_name "$slot")"$'\t' <<<"$panes" || true)"
+    IFS=$'\t' read -r _ command dead activity attached <<<"$line"
+    read -r signal silent <<<"$(activity_signal "$command" "$dead" "$activity" "$now" "$threshold")"
+    { read -r session; read -r title; read -r prompt; read -r file; } \
+      < <(agent_info "$agent" "$pid" "$id")
+    objects+="$(jq -c -n --arg slot "$slot" --arg me "$me" --arg program "$command" \
+      --arg signal "$signal" --arg silent "$silent" --arg attached "$attached" \
+      --arg folder "$path" --arg agent "$agent" --arg pid "$pid" --arg id "$id" \
+      --arg session "$session" --arg title "$title" --arg prompt "$prompt" --arg file "$file" '
+      def maybe: if . == "-" or . == "" then null else . end;
+      (($session | fromjson?) // {}) as $s
+      | {slot: $slot, you: ($slot == $me), program: ($program | maybe),
+         state: ($s.status // ($signal | ascii_downcase)),
+         signal: $signal, silent_seconds: ($silent | tonumber? // null),
+         attached: (($attached | tonumber? // 0) > 0), folder: $folder,
+         agent: ($agent | maybe), pid: ($pid | tonumber? // null),
+         name: $s.name, session_id: ($id | maybe), agent_status: $s.status,
+         title: (($title | fromjson? | .aiTitle // .thread_name) // null),
+         last_prompt: (($prompt | fromjson? | .lastPrompt // .text) // null),
+         transcript: ($file | maybe)}'
+    )"$'\n'
+  done < <(scan_slots)
+
+  if [[ -n "$requested" ]] && (( ! found )); then
+    objects="$(jq -c -n --arg slot "$requested" '{slot: $slot, you: false, state: "empty"}')"
+  fi
+  if [[ "$format" == json ]]; then
+    printf '%s' "$objects" | jq -s .
+    return 0
+  fi
+  if [[ -z "$objects" ]]; then
+    printf 'No Mobailmux terminals are running. Start one with mbx r a or mbx ui.\n'
+    return 0
+  fi
+  printf '%s' "$objects" | jq -s -r --arg home "$HOME" '
+    def cell: if . == null or . == "" then "-" else tostring end;
+    def home: if $home != "" and . == $home then "~"
+      elif $home != "" and startswith($home + "/") then "~" + .[($home | length):]
+      else . end;
+    def pad($n): . + (" " * ([$n - length, 0] | max));
+    [["SLOT", "STATE", "PROGRAM", "NAME", "FOLDER", "DOING"]]
+    + map([.slot + (if .you then "*" else "" end), (.state | cell), (.program | cell),
+           (.name | cell), (.folder // "-" | home),
+           ((.title // .last_prompt // "-") | split("\n")[0])])
+    | (transpose | map(map(length) | max)) as $w
+    | .[]
+    | [range(0; length) as $i | if $i == length - 1 then .[$i] else (.[$i] | pad($w[$i])) end]
+    | join("  ")'
+}
+
+agent_log() {
+  local slot="$1" want="$2" format="$3" row agent pid id file entries
+  need_tmux
+  need_jq log
+  row="$(scan_slots | grep -m 1 "^$slot"$'\t' || true)"
+  [[ -n "$row" ]] || die "terminal $slot is empty (see mbx who)"
+  IFS=$'\t' read -r _ _ agent pid id _ <<<"$row"
+  [[ "$agent" != - ]] \
+    || die "terminal $slot runs no Claude Code or Codex session; mbx peek $slot shows its screen"
+  [[ "$id" != - ]] \
+    || die "cannot tell which $agent session runs in terminal $slot; mbx peek $slot shows its screen"
+  case "$agent" in
+    claude) file="$(claude_transcript "$id")" \
+      || die "no transcript found for Claude Code session $id; mbx peek $slot shows its screen" ;;
+    codex) file="$(codex_rollout "$id")" \
+      || die "no rollout file found for Codex thread $id; mbx peek $slot shows its screen" ;;
+  esac
+  entries="$(transcript_entries "$agent" "$file" "$want")"
+  if [[ "$format" == json ]]; then
+    printf '%s' "$entries" | jq -s --arg slot "$slot" --arg agent "$agent" --arg pid "$pid" \
+      --arg id "$id" --arg file "$file" \
+      '{slot: $slot, agent: $agent, pid: ($pid | tonumber? // null), session_id: $id,
+        transcript: $file, entries: .}'
+    return 0
+  fi
+  printf '# terminal %s: %s session %s\n# %s\n' "$slot" "$agent" "$id" "$file"
+  printf '%s' "$entries" | jq -r '
+    def stamp: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | strflocaltime("%m-%d %H:%M")) catch "?";
+    (.time | stamp) as $s
+    | if .kind == "tool" then
+        (.text | split("\n")) as $lines
+        | "\($s)  \(.from): → \(.tool): \($lines[0])\(if ($lines | length) > 1 then " …" else "" end)"
+      else "\($s)  \(.from): \(.text | gsub("\n"; "\n    "))" end'
+}
+
+# What a terminal shows, without trailing blanks.
+trim_screen() {
+  awk '{ sub(/[ \t]+$/, ""); line[NR] = $0 } length($0) { last = NR }
+    END { for (i = 1; i <= last; i++) print line[i] }'
+}
+
+peek_slot() {
+  local slot="$1" lines="$2" format="$3" session screen
+  need_tmux
+  session="$(session_name "$slot")"
+  tmux has-session -t "=$session" 2>/dev/null || die "terminal $slot is empty (see mbx who)"
+  if [[ -n "$lines" ]]; then
+    screen="$(tmux capture-pane -p -J -t "=$session:" -S "-$lines" | trim_screen | tail -n "$lines")"
+  else
+    screen="$(tmux capture-pane -p -J -t "=$session:" | trim_screen)"
+  fi
+  if [[ "$format" == json ]]; then
+    need_jq peek
+    jq -n --arg slot "$slot" --arg screen "$screen" '{slot: $slot, screen: $screen}'
+  else
+    printf '%s\n' "$screen"
+  fi
+}
+
 main() {
   local command="${1:-help}" slot
   case "$command" in
@@ -801,6 +1152,24 @@ main() {
         slot="$(require_slot "$2")"
         stop_slots "$slot"
       fi
+      ;;
+    who)
+      shift
+      parse_view_args who "$@"
+      [[ -z "$view_lines" ]] || die "who does not take -n"
+      agents_who "$view_slot" "$view_format"
+      ;;
+    log)
+      shift
+      parse_view_args log "$@"
+      [[ -n "$view_slot" ]] || die "log needs a slot, for example: mbx log b"
+      agent_log "$view_slot" "${view_lines:-20}" "$view_format"
+      ;;
+    peek)
+      shift
+      parse_view_args peek "$@"
+      [[ -n "$view_slot" ]] || die "peek needs a slot, for example: mbx peek b"
+      peek_slot "$view_slot" "$view_lines" "$view_format"
       ;;
     help|-h|--help)
       (( $# <= 1 )) || die "help does not accept arguments"
