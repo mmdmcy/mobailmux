@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -540,6 +541,242 @@ class MbxSnapshotTmuxTest(unittest.TestCase):
         # Restoring again leaves running slots alone.
         result = self.run_cmd([str(MBX), "restore"])
         self.assertIn("already running", result.stdout)
+
+
+@unittest.skipUnless(
+    shutil.which("tmux") and shutil.which("jq"), "tmux or jq is not installed"
+)
+class MbxAgentsTmuxTest(unittest.TestCase):
+    """mbx who, log and peek against a real, isolated tmux server."""
+
+    claude_id = "11111111-2222-3333-4444-555555555555"
+    codex_id = "01a0aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
+
+    def setUp(self) -> None:
+        self.server = tempfile.mkdtemp(prefix="mbxw", dir="/tmp")
+        self.home = Path(tempfile.mkdtemp(prefix="mbxh")).resolve()
+        self.addCleanup(self.cleanup)
+        self.project = self.home / "project"
+        self.project.mkdir()
+
+    def cleanup(self) -> None:
+        self.run_cmd(["tmux", "kill-server"], check=False)
+        shutil.rmtree(self.server, ignore_errors=True)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def run_cmd(
+        self, argv: list[str], check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        drop = {"TMUX", "TMUX_PANE", "CLAUDE_CONFIG_DIR", "CODEX_HOME"}
+        env = {k: v for k, v in os.environ.items() if k not in drop}
+        env.update(
+            TMUX_TMPDIR=self.server, HOME=str(self.home),
+            XDG_STATE_HOME=str(self.home / "state"), TZ="UTC",
+        )
+        return subprocess.run(
+            argv, check=check, capture_output=True, text=True, env=env
+        )
+
+    def mbx(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run_cmd([str(MBX), *args], check=False)
+
+    def wait_for(self, predicate, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail("timed out")
+
+    def write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Compact, like the real CLIs write their transcripts.
+        path.write_text(
+            "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+        )
+
+    def start_agents(self) -> None:
+        sessions = self.home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        t = "2026-11-03T09:00:00.000Z"
+        self.write_jsonl(
+            self.home / ".claude" / "projects" / "-project" / f"{self.claude_id}.jsonl",
+            [
+                {"type": "user", "timestamp": t, "origin": {"kind": "human"},
+                 "message": {"role": "user", "content": "fix the login page"}},
+                {"type": "user", "timestamp": t, "isMeta": True,
+                 "message": {"role": "user", "content": [
+                     {"type": "text", "text": "injected skill text"}]}},
+                {"type": "user", "timestamp": t, "isMeta": True,
+                 "origin": {"kind": "peer", "name": "other-session",
+                            "body": "please check slot b"},
+                 "message": {"role": "user", "content": "wrapped peer text"}},
+                {"type": "assistant", "timestamp": t, "message": {
+                    "role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "hidden"},
+                        {"type": "text", "text": "Looking at it.\nSecond line."}]}},
+                {"type": "assistant", "timestamp": t, "message": {
+                    "role": "assistant", "content": [
+                        {"type": "tool_use", "name": "Bash",
+                         "input": {"command": "git status\ngit diff"}}]}},
+                {"type": "user", "timestamp": t, "message": {
+                    "role": "user", "content": [
+                        {"type": "tool_result", "content": "clean"}]}},
+                {"type": "ai-title", "aiTitle": "Login page fix"},
+                {"type": "last-prompt", "lastPrompt": "fix the login page"},
+            ],
+        )
+        # Stand-ins for Claude Code and Codex: they register like the real CLIs.
+        fake_claude = self.home / "fake-claude"
+        fake_claude.write_text(
+            f"cd {self.project}\n"
+            f"printf '{{\"pid\":%s,\"sessionId\":\"{self.claude_id}\","
+            f"\"cwd\":\"{self.project}\",\"name\":\"peer-a\",\"status\":\"idle\"}}'"
+            f" $$ > {sessions}/$$.json\n"
+            "exec -a claude tail -f /dev/null\n"
+        )
+        rollout = (
+            self.home / ".codex" / "sessions" / "2026" / "11" / "03"
+            / f"rollout-2026-11-03T09-00-00-{self.codex_id}.jsonl"
+        )
+        self.write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"cwd": str(self.project)}},
+                {"type": "event_msg", "timestamp": t, "payload": {
+                    "type": "item_completed", "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "update the docs"}]}}},
+                {"type": "event_msg", "timestamp": t, "payload": {
+                    "type": "item_completed", "item": {
+                        "type": "CommandExecution",
+                        "command": ["/bin/bash", "-lc", "ls docs"]}}},
+                {"type": "event_msg", "timestamp": t, "payload": {
+                    "type": "item_completed", "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "Docs updated."}]}}},
+            ],
+        )
+        self.write_jsonl(
+            self.home / ".codex" / "session_index.jsonl",
+            [{"id": self.codex_id, "thread_name": "Docs refresh"}],
+        )
+        self.run_cmd(["tmux", "new-session", "-d", "-s", "mbx-a", "-c", str(self.home)])
+        self.run_cmd(["tmux", "new-session", "-d", "-s", "mbx-b", "-c", str(self.home)])
+        self.run_cmd(["tmux", "new-session", "-d", "-s", "mbx-c", "-c", str(self.home)])
+        self.run_cmd(["tmux", "send-keys", "-t", "mbx-a", f"bash {fake_claude}", "Enter"])
+        # A child of the slot's shell, as a real Codex is.
+        self.run_cmd([
+            "tmux", "send-keys", "-t", "mbx-b",
+            f"bash -c \"exec -a codex bash -c 'sleep 600; :' x resume {self.codex_id}\"",
+            "Enter",
+        ])
+        self.run_cmd(["tmux", "send-keys", "-t", "mbx-c", "echo hello-from-c", "Enter"])
+        self.wait_for(lambda: any(sessions.glob("*.json")))
+        self.wait_for(lambda: f"resume {self.codex_id}" in self.run_cmd(
+            ["ps", "-A", "-o", "command="]
+        ).stdout)
+        time.sleep(0.3)
+
+    def test_who_names_each_agent_and_what_it_works_on(self) -> None:
+        self.start_agents()
+        result = self.mbx("who", "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        slots = {row["slot"]: row for row in json.loads(result.stdout)}
+        self.assertEqual(sorted(slots), ["a", "b", "c"])
+
+        a = slots["a"]
+        self.assertEqual(a["agent"], "claude")
+        self.assertEqual(a["name"], "peer-a")
+        self.assertEqual(a["state"], "idle")
+        self.assertEqual(a["session_id"], self.claude_id)
+        self.assertEqual(a["title"], "Login page fix")
+        self.assertEqual(a["last_prompt"], "fix the login page")
+        self.assertEqual(a["folder"], str(self.project))
+        self.assertFalse(a["you"])
+
+        b = slots["b"]
+        self.assertEqual(b["agent"], "codex")
+        self.assertIsNone(b["name"])
+        self.assertEqual(b["session_id"], self.codex_id)
+        self.assertEqual(b["title"], "Docs refresh")
+        self.assertEqual(b["last_prompt"], "update the docs")
+        self.assertEqual(b["folder"], str(self.project))
+
+        c = slots["c"]
+        self.assertIsNone(c["agent"])
+        self.assertEqual(c["state"], "done")
+
+        text = self.mbx("who")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertRegex(text.stdout, r"(?m)^SLOT\s+STATE\s+PROGRAM\s+NAME\s+FOLDER\s+DOING$")
+        self.assertRegex(text.stdout, r"(?m)^a\s+idle\s+claude\s+peer-a\s+~/project\s+Login page fix$")
+
+        empty = self.mbx("who", "h", "--format=json")
+        self.assertEqual(json.loads(empty.stdout), [{"slot": "h", "you": False, "state": "empty"}])
+
+    def test_log_reads_the_agents_own_transcript(self) -> None:
+        self.start_agents()
+        result = self.mbx("log", "a", "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = json.loads(result.stdout)
+        self.assertEqual(log["agent"], "claude")
+        self.assertEqual(
+            [(e["from"], e["kind"]) for e in log["entries"]],
+            [("user", "prompt"), ("other-session", "message"),
+             ("claude", "text"), ("claude", "tool")],
+        )
+        self.assertEqual(log["entries"][1]["text"], "please check slot b")
+        self.assertNotIn("injected skill text", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+        text = self.mbx("log", "a", "-n", "2")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("11-03 09:00  claude: Looking at it.\n    Second line.", text.stdout)
+        self.assertIn("claude: → Bash: git status …", text.stdout)
+        self.assertNotIn("fix the login page", text.stdout)
+
+        codex_result = self.mbx("log", "b", "--format", "json")
+        self.assertEqual(codex_result.returncode, 0, codex_result.stderr)
+        codex = json.loads(codex_result.stdout)
+        self.assertEqual(
+            [(e["from"], e["kind"], e["text"]) for e in codex["entries"]],
+            [("user", "prompt", "update the docs"), ("codex", "tool", "ls docs"),
+             ("codex", "text", "Docs updated.")],
+        )
+
+        shell = self.mbx("log", "c")
+        self.assertNotEqual(shell.returncode, 0)
+        self.assertIn("mbx peek c", shell.stderr)
+
+    def test_peek_prints_the_screen_as_text(self) -> None:
+        self.start_agents()
+        self.wait_for(lambda: "hello-from-c\n" in self.mbx("peek", "c").stdout)
+        last = self.mbx("peek", "c", "-n", "1")
+        self.assertEqual(last.returncode, 0, last.stderr)
+        self.assertEqual(len(last.stdout.splitlines()), 1)
+        screen = json.loads(self.mbx("peek", "c", "--format", "json").stdout)
+        self.assertEqual(screen["slot"], "c")
+        self.assertIn("hello-from-c", screen["screen"])
+
+        missing = self.mbx("peek", "h")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("terminal h is empty", missing.stderr)
+
+    def test_views_refuse_bad_arguments(self) -> None:
+        for args, message in [
+            (("log",), "log needs a slot"),
+            (("peek",), "peek needs a slot"),
+            (("who", "-n", "3"), "who does not take -n"),
+            (("who", "--format", "yaml"), "--format must be json or text"),
+            (("log", "a", "-n", "0"), "-n needs a positive number"),
+            (("log", "k"), "expected a through j"),
+            (("who", "a", "b"), "who accepts one slot"),
+            (("peek", "a", "--follow"), "unknown option: --follow"),
+        ]:
+            result = self.mbx(*args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn(message, result.stderr, args)
 
 
 if __name__ == "__main__":

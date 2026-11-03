@@ -3,10 +3,11 @@
 Mobailmux is an ultra-small wrapper around tmux. It gives you ten persistent,
 plain terminal slots named `a` through `j`.
 
-It has no agent integration, configuration service, database, browser UI,
-automatic commands, or terminal-output scraping. A slot is just a normal shell;
-use it for Pi, Codex, another harness, a development server, or ordinary command
-line work.
+It has no configuration service, database, browser UI, or automatic commands.
+A slot is just a normal shell; use it for Claude Code, Codex, Pi, another
+harness, a development server, or ordinary command line work. For AI agents,
+three read-only commands show what runs in the other slots (see
+[For AI Agents](#for-ai-agents)).
 
 ## Install
 
@@ -33,6 +34,9 @@ mbx stop a     # stop terminal a
 mbx stop all   # stop every Mobailmux terminal
 mbx save       # save now (it also saves every 30s in the background)
 mbx restore    # bring them back after a reboot (mbx ui does this itself)
+mbx who        # which agent runs in each terminal, and what it works on
+mbx log b      # the recent conversation of the agent in terminal b
+mbx peek b     # what terminal b shows right now, as text
 ```
 
 A new slot starts as an untouched shell in your home directory. From there,
@@ -158,6 +162,51 @@ Set `MBX_QUIET_SECONDS` to change the default 5-second threshold:
 ```bash
 MBX_QUIET_SECONDS=120 mbx check
 ```
+
+## For AI Agents
+
+An agent in one slot can see the others, and so can you. All three commands
+only read; `who` and `log` need `jq`.
+
+```text
+$ mbx who
+SLOT  STATE  PROGRAM  NAME     FOLDER           DOING
+a     busy   claude   api-a5   ~/projects/api   Rate limits for the API
+b     idle   claude   site-8e  ~/projects/site  Login page fix
+c*    busy   codex    -        ~/projects/docs  Agent guide
+d     done   bash     -        ~                -
+```
+
+- `mbx who [slot] [--format json]` lists every running slot. `*` marks the
+  slot you run it from. STATE is Claude Code's own status (`busy`, `idle`,
+  ...) when the slot runs Claude Code. Otherwise it is the `mbx check`
+  signal in lower case (`working`, `quiet`, `done`, `exited`). NAME is the
+  Claude Code session name. DOING is the session's own title (Claude Code's
+  title, or the Codex thread name), or else its last prompt. JSON adds the
+  session id, transcript path, full last prompt, pid, and `attached`.
+- `mbx log <slot> [-n N] [--format json]` shows the last N entries (default
+  20) of the conversation, read from the agent's own transcript: Claude
+  Code's `~/.claude/projects/*/<session>.jsonl` or Codex's rollout file.
+  It shows prompts, messages from other sessions, replies, and tool calls
+  (first line in text, in full in JSON). It reads from the end of the file,
+  so transcripts of hundreds of megabytes stay fast.
+- `mbx peek <slot> [-n N] [--format json]` prints the screen as plain text
+  (`tmux capture-pane`), for any program. With `-n N` it prints the last N
+  lines including scrollback.
+
+Claude Code sessions already message each other with Claude Code's own
+`SendMessage` tool. The address is the NAME that `mbx who` shows, which is
+the same name `ListAgents` lists. Mobailmux adds no second channel, and it
+never types into a slot to pass a message on.
+
+`skills/mobailmux/SKILL.md` teaches an agent all of this. Link it into your
+agents' skill folders (for example `~/.claude/skills/mobailmux`). After that,
+"use mobailmux to see what my other sessions are doing" works in any session.
+
+Measured on 2026-11-03, on a 4-core Linux machine at load average 12 with
+seven Claude Code slots: `mbx who` took 1.3 to 1.6 s (1.4 s of CPU, 5 MB of
+memory), and `mbx log` on a 59 MB transcript took 0.7 to 0.8 s. Nothing runs
+in the background for these commands.
 
 ## Check
 
