@@ -130,6 +130,7 @@ class MbxCliTest(unittest.TestCase):
                     "MBX_TMUX_LOG": str(log),
                     # `mbx stop` edits the snapshot; never the real one.
                     "XDG_STATE_HOME": str(root / "xdg-state"),
+                    "XDG_CONFIG_HOME": str(root / "xdg-config"),
                 }
             )
             if env_overrides:
@@ -194,7 +195,8 @@ class MbxCliTest(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be a positive integer", result.stderr)
+        self.assertIn("quiet must be a number of seconds, 1 or more", result.stderr)
+        self.assertIn("MBX_QUIET_SECONDS", result.stderr)
 
     def test_resume_creates_an_untouched_home_shell(self) -> None:
         result, log = self.run_mbx("r", "a")
@@ -295,7 +297,8 @@ class MbxCliTest(unittest.TestCase):
 
         result, log = self.run_mbx("ui", env_overrides={"MBX_UI_LAYOUT": "left"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("MBX_UI_LAYOUT must be auto, side or top", result.stderr)
+        self.assertIn("layout must be auto, side or top", result.stderr)
+        self.assertIn("MBX_UI_LAYOUT", result.stderr)
         self.assertEqual(log, "")
 
         # Refused up front, not by a sidebar that keeps failing to draw.
@@ -320,6 +323,73 @@ class MbxCliTest(unittest.TestCase):
             result, _ = self.run_mbx("stop", "all", env_overrides=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(snapshot.exists())
+
+    def test_config_lists_sets_and_resets_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as config_home:
+            env = {"XDG_CONFIG_HOME": config_home}
+            config = Path(config_home) / "mobailmux" / "config"
+
+            result, _ = self.run_mbx("config", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for key in ("layout", "tab-label", "tabs-below", "width", "quiet", "save"):
+                self.assertIn(key, result.stdout)
+            self.assertRegex(result.stdout, r"layout\s+auto\s+default")
+
+            result, _ = self.run_mbx("config", "layout", "top", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("layout: auto -> top", result.stdout)
+            self.assertIn("layout=top", config.read_text())
+
+            # A hand-written line survives a change to another setting.
+            config.write_text(config.read_text() + "# mine\n")
+            result, _ = self.run_mbx("config", "tab-label", "program", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            for args, message in (
+                (("layout", "sideways"), "layout must be auto, side or top"),
+                (("width", "5"), "width must be a number of columns, at least 8"),
+                (("colour", "red"), "unknown setting: colour"),
+                (("layout", "top", "--reset"), "not both"),
+            ):
+                before = config.read_text()
+                result, _ = self.run_mbx("config", *args, env_overrides=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(config.read_text(), before)
+
+            result, _ = self.run_mbx("config", "--format", "json", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["file"], str(config))
+            values = {row["setting"]: (row["value"], row["from"]) for row in data["settings"]}
+            self.assertEqual(values["layout"], ("top", "file"))
+            self.assertEqual(values["tab-label"], ("program", "file"))
+            self.assertEqual(values["width"], ("16", "default"))
+
+            # The variable wins over the file, and says so.
+            result, _ = self.run_mbx(
+                "config", "layout", env_overrides={**env, "MBX_UI_LAYOUT": "side"}
+            )
+            self.assertRegex(result.stdout, r"layout\s+side\s+MBX_UI_LAYOUT")
+
+            result, _ = self.run_mbx("config", "layout", "--reset", env_overrides=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("layout: top -> auto", result.stdout)
+            text = config.read_text()
+            self.assertNotIn("layout=", text)
+            self.assertIn("tab-label=program", text)
+            self.assertIn("# mine", text)
+
+    def test_ui_refuses_a_bad_setting_in_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as config_home:
+            config = Path(config_home) / "mobailmux" / "config"
+            config.parent.mkdir()
+            config.write_text("width=3\n")
+            result, log = self.run_mbx("ui", env_overrides={"XDG_CONFIG_HOME": config_home})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("width must be a number of columns, at least 8", result.stderr)
+            self.assertIn(str(config), result.stderr)
+            self.assertEqual(log, "")
 
     def test_copy_install_contains_only_the_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -357,6 +427,7 @@ class MbxUiTmuxTest(unittest.TestCase):
         env["TMUX_TMPDIR"] = directory
         # The UI's saver must never write the real ~/.local/state snapshot.
         env["XDG_STATE_HOME"] = self.outer
+        env["XDG_CONFIG_HOME"] = os.path.join(self.outer, "config")
         return subprocess.run(
             ["tmux", *args], check=check, capture_output=True, text=True, env=env
         )
@@ -486,6 +557,38 @@ class MbxUiTmuxTest(unittest.TestCase):
         self.wait_for(lambda: self.screen().startswith(" a"))
         self.assertNotIn("MOBAILMUX", self.screen())
 
+    def mbx_inner(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env.update(
+            TMUX_TMPDIR=self.inner, XDG_STATE_HOME=self.outer,
+            XDG_CONFIG_HOME=os.path.join(self.outer, "config"),
+        )
+        return subprocess.run(
+            [str(MBX), *args], check=False, capture_output=True, text=True, env=env
+        )
+
+    def test_config_changes_an_open_ui(self) -> None:
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "-c", self.inner)
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-c", "sleep 600")
+        command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
+        self.tmux(
+            self.outer, "new-session", "-d", "-s", "harness",
+            "-x", "100", "-y", "20", command,
+        )
+        self.wait_for(lambda: "+ new" in self.screen())
+
+        result = self.mbx_inner("config", "layout", "top")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("applied to 1 open mbx ui", result.stdout)
+        self.wait_for(lambda: self.screen().startswith(" a"))
+        self.assertNotIn("MOBAILMUX", self.screen())
+
+        self.mbx_inner("config", "tab-label", "program")
+        self.wait_for(lambda: "sleep" in self.screen().splitlines()[0])
+
+        self.mbx_inner("config", "layout", "--reset")  # 100 columns: the sidebar
+        self.wait_for(lambda: "MOBAILMUX" in self.screen())
+
     def test_layout_can_be_fixed(self) -> None:
         self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "sleep 600")
         command = (
@@ -523,6 +626,7 @@ class MbxSnapshotTmuxTest(unittest.TestCase):
         env.update(
             TMUX_TMPDIR=self.server, HOME=str(self.home),
             XDG_STATE_HOME=str(self.state), MBX_SAVE_SECONDS="1",
+            XDG_CONFIG_HOME=str(self.home / "config"),
         )
         return subprocess.run(
             argv, check=check, capture_output=True, text=True, env=env
@@ -631,6 +735,7 @@ class MbxAgentsTmuxTest(unittest.TestCase):
         env.update(
             TMUX_TMPDIR=self.server, HOME=str(self.home),
             XDG_STATE_HOME=str(self.home / "state"), TZ="UTC",
+            XDG_CONFIG_HOME=str(self.home / "config"),
         )
         return subprocess.run(
             argv, check=check, capture_output=True, text=True, env=env

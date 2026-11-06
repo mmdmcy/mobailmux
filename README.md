@@ -3,7 +3,8 @@
 Mobailmux is an ultra-small wrapper around tmux. It gives you ten persistent,
 plain terminal slots named `a` through `j`.
 
-It has no configuration service, database, browser UI, or automatic commands.
+It has no configuration service, database, browser UI, or automatic commands;
+its few settings are one plain text file (see [Settings](#settings)).
 A slot is just a normal shell; use it for Claude Code, Codex, Pi, another
 harness, a development server, or ordinary command line work. For AI agents,
 three read-only commands show what runs in the other slots (see
@@ -37,6 +38,7 @@ mbx restore    # bring them back after a reboot (mbx ui does this itself)
 mbx who        # which agent runs in each terminal, and what it works on
 mbx log b      # the recent conversation of the agent in terminal b
 mbx peek b     # what terminal b shows right now, as text
+mbx config     # show the settings; mbx config layout top changes one
 ```
 
 A new slot starts as an untouched shell in your home directory. From there,
@@ -80,9 +82,10 @@ shrink evenly until every tab fits.
 mac@Mac ~/projects/site %
 ```
 
-Turning the phone sideways switches to the sidebar and back. Set
-`MBX_UI_LAYOUT=side` or `MBX_UI_LAYOUT=top` to keep one layout (default
-`auto`).
+Turning the phone sideways switches to the sidebar and back. To keep one
+layout, run `mbx config layout side` or `mbx config layout top`; to show the
+program instead of the folder, `mbx config tab-label program` (see
+[Settings](#settings)).
 
 - Tap or click a slot to show it. `+ new` (or `+` on the tab row) creates the
   next empty slot.
@@ -104,7 +107,7 @@ tool on the device (for example over SSH), copies are passed outward as OSC 52
 for terminals that support it.
 
 The UI is a throwaway tmux session that only views your slots, so each device
-can open its own. Set `MBX_UI_WIDTH` to change the sidebar width (default 16).
+can open its own. `mbx config width 20` changes the sidebar width (default 16).
 
 ## Surviving a Reboot
 
@@ -112,7 +115,7 @@ tmux sessions cannot survive a shutdown, so Mobailmux remembers them instead.
 A small background job inside the tmux server saves a snapshot every 30
 seconds while any slot exists, whether or not you are attached; `mbx save`
 saves immediately. The job starts with `mbx r`, `mbx ui`, `mbx save`, or
-`mbx restore`, and ends with the tmux server. Set `MBX_SAVE_SECONDS` to change
+`mbx restore`, and ends with the tmux server. `mbx config save 60` changes
 the interval. After a reboot, the first `mbx ui` (or `mbx restore`) recreates every
 saved slot in its directory and types the command that resumes its agent:
 
@@ -173,11 +176,48 @@ The command never reads the terminal text; it only reads tmux's activity time.
 Full-screen TUI redraws count as activity, including counters such as Codex's
 `Thinking... 17s`, even when they repeatedly overwrite the same line.
 
-Set `MBX_QUIET_SECONDS` to change the default 5-second threshold:
+`mbx config quiet 120` changes the default 5-second threshold; for one run:
 
 ```bash
 MBX_QUIET_SECONDS=120 mbx check
 ```
+
+## Settings
+
+`mbx config` shows every setting, its value, and where the value comes from:
+
+```text
+SETTING     VALUE    FROM              MEANING
+layout      top      file              where mbx ui lists the slots; auto is tabs on top below tabs-below columns
+tab-label   folder   default           what a tab shows beside its slot letter
+tabs-below  80       default           auto layout: tabs on top when the window is narrower than this
+width       16       default           width of the sidebar
+quiet       5        default           silence before a slot counts as quiet (yellow dot turns green)
+save        30       default           how often the slots are saved for after a reboot
+```
+
+```bash
+mbx config layout top        # change one; refused unless the value is allowed
+mbx config layout            # one setting, with its allowed values
+mbx config layout --reset    # back to the default
+mbx config --format json     # all of them, for scripts
+```
+
+| Setting      | Allowed                    | Default  | Variable            |
+| ------------ | -------------------------- | -------- | ------------------- |
+| `layout`     | `auto`, `side`, `top`      | `auto`   | `MBX_UI_LAYOUT`     |
+| `tab-label`  | `folder`, `program`        | `folder` | `MBX_UI_TAB_LABEL`  |
+| `tabs-below` | columns, 1 or more         | `80`     | `MBX_UI_TABS_BELOW` |
+| `width`      | columns, at least 8        | `16`     | `MBX_UI_WIDTH`      |
+| `quiet`      | seconds, 1 or more         | `5`      | `MBX_QUIET_SECONDS` |
+| `save`       | seconds, 1 or more         | `30`     | `MBX_SAVE_SECONDS`  |
+
+They live in `~/.config/mobailmux/config` (or `$XDG_CONFIG_HOME/mobailmux/config`)
+as `setting=value` lines, which you can also edit by hand. mbx reads the file,
+never runs it, and refuses a value that is not allowed, naming the file. An
+open `mbx ui` follows a change at once, and the background saver uses the new
+`save` interval on its next round. A setting's variable wins over the file,
+for one shell or one run; `mbx config` then names the variable under FROM.
 
 ## For AI Agents
 
