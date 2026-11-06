@@ -22,6 +22,7 @@ Usage:
 
 Commands:
   ui          Open a sidebar of all terminals; tap one to switch to it.
+              Narrower than 80 columns (a phone), it is a row of tabs on top.
   r, resume   Create or return to a terminal.
   status      Show whether each terminal is IDLE, ACTIVE, EXITED, or EMPTY.
   check       Guess whether work is ongoing from tmux's last activity time.
@@ -560,8 +561,46 @@ ui_width() {
   printf '%s\n' "$width"
 }
 
+ui_layout_choice() {
+  local layout="${MBX_UI_LAYOUT:-auto}"
+  case "$layout" in
+    auto|side|top) printf '%s\n' "$layout" ;;
+    *) die "MBX_UI_LAYOUT must be auto, side or top, got: $layout" ;;
+  esac
+}
+
 ui_get() {
   tmux show-options -qv -t "=$1:" "$2" 2>/dev/null || true
+}
+
+# Side: the sidebar on the left. Top: one row of tabs above the slot, for
+# phones. Auto picks top when the window is narrower than 80 columns, and
+# runs again whenever the window is resized (a phone turned sideways).
+ui_layout() {
+  local ui="$1" sidebar layout cols
+  sidebar="$(ui_get "$ui" @mbx_sidebar_pane)"
+  [[ -n "$sidebar" ]] || return 0
+  layout="$(ui_get "$ui" @mbx_layout_choice)"
+  if [[ "$layout" != side && "$layout" != top ]]; then
+    cols="$(tmux display-message -p -t "$sidebar" '#{window_width}' 2>/dev/null)" || return 0
+    layout=side
+    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols < 80 )) && layout=top
+  fi
+  # The sidebar pane comes first, so even layouts put it left or on top.
+  if [[ "$layout" == top ]]; then
+    tmux select-layout -t "$sidebar" even-vertical \; resize-pane -t "$sidebar" -y 1
+  else
+    tmux select-layout -t "$sidebar" even-horizontal \; \
+      resize-pane -t "$sidebar" -x "$(ui_get "$ui" @mbx_width)"
+  fi
+  tmux set-option -t "=$ui:" @mbx_layout "$layout"
+  ui_redraw "$ui"
+}
+
+ui_redraw() {
+  local pid
+  pid="$(tmux show-options -pqv -t "$(ui_get "$1" @mbx_sidebar_pane)" @mbx_pid 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -USR1 "$pid" 2>/dev/null || true
 }
 
 first_slot() {
@@ -602,9 +641,10 @@ inside_ui_view() {
 }
 
 open_ui() {
-  local width self ui initial view sidebar click event size=()
+  local width layout self ui initial view sidebar click event size=()
   need_tmux
   width="$(ui_width)"
+  layout="$(ui_layout_choice)"
   quiet_seconds >/dev/null
   self="$(self_path)"
   if [[ -n "${TMUX:-}" ]] && inside_ui_view; then
@@ -637,6 +677,7 @@ open_ui() {
   tmux set-option -t "=$ui:" @mbx_view_pane "$view"
   tmux set-option -t "=$ui:" @mbx_sidebar_pane "$sidebar"
   tmux set-option -t "=$ui:" @mbx_width "$width"
+  tmux set-option -t "=$ui:" @mbx_layout_choice "$layout"
   # Every key goes to the slot's own tmux client, so Ctrl-b works as usual.
   tmux set-option -t "=$ui:" prefix None
   tmux set-option -t "=$ui:" prefix2 None
@@ -648,9 +689,11 @@ open_ui() {
   tmux set-option -t "=$ui:" pane-active-border-style fg=colour238
   tmux set-hook -t "=$ui:" client-attached "set-option destroy-unattached on"
   tmux set-hook -t "=$ui:" client-session-changed "set-option destroy-unattached on"
-  tmux set-hook -t "=$ui:" window-resized "resize-pane -t $sidebar -x $width"
+  tmux set-hook -t "=$ui:" window-resized \
+    "run-shell -b \"$(printf '%q' "$self") __ui-layout $ui\""
+  ui_layout "$ui"
   # Taps on the sidebar pick a slot; everything else reaches the slot client.
-  click="run-shell -b \"$(printf '%q' "$self") __ui-click '#{session_name}' '#{mouse_y}'\""
+  click="run-shell -b \"$(printf '%q' "$self") __ui-click '#{session_name}' '#{mouse_y}' '#{mouse_x}'\""
   tmux bind-key -T mbx-ui MouseDown1Pane \
     if-shell -F '#{==:#{@mbx_role},sidebar}' "$click" 'select-pane -t = ; send-keys -M'
   # Quick repeated taps arrive as double/triple clicks; treat them as taps too.
@@ -668,21 +711,25 @@ open_ui() {
 }
 
 ui_show() {
-  local ui="$1" session="$2" client pid
+  local ui="$1" session="$2" client
   enable_mouse "$session" >/dev/null
   tmux set-option -t "=$ui:" @mbx_view "$session"
   if client="$(ui_view_client "$ui")"; then
     tmux switch-client -c "${client%% *}" -t "=$session"
   fi
-  pid="$(tmux show-options -pqv -t "$(ui_get "$ui" @mbx_sidebar_pane)" @mbx_pid 2>/dev/null || true)"
-  [[ "$pid" =~ ^[0-9]+$ ]] && kill -USR1 "$pid" 2>/dev/null || true
+  ui_redraw "$ui"
 }
 
 ui_click() {
-  local ui="$1" row="$2" rows key slot
-  [[ "$row" =~ ^[0-9]+$ ]] || return 0
-  rows="$(ui_get "$ui" @mbx_rows)"
-  key="${rows:row:1}"
+  local ui="$1" row="$2" col="${3:-}" map at key slot
+  # The sidebar is read by row, the tab bar by column.
+  if [[ "$(ui_get "$ui" @mbx_layout)" == top ]]; then
+    map="$(ui_get "$ui" @mbx_cols)" at="$col"
+  else
+    map="$(ui_get "$ui" @mbx_rows)" at="$row"
+  fi
+  [[ "$at" =~ ^[0-9]+$ ]] || return 0
+  key="${map:at:1}"
   case "$key" in
     [a-j])
       tmux has-session -t "=$(session_name "$key")" 2>/dev/null || return 0
@@ -724,10 +771,13 @@ ui_view() {
 ui_render() {
   local ui="$1" width view_session client line rows="" out="" now threshold
   local name command path dead activity slot dot label dir selected
-  local panes=""
+  local panes="" layout plus=0
+  local tab_slots=() tab_dots=() tab_dirs=() tab_selected=()
   width="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null || echo 16)"
   now="$(date +%s)"
   threshold="$(quiet_seconds)"
+  layout="$(ui_get "$ui" @mbx_layout)"
+  first_slot empty >/dev/null && plus=1
 
   view_session="$(ui_get "$ui" @mbx_view)"
   if client="$(ui_view_client "$ui")"; then
@@ -742,7 +792,7 @@ ui_render() {
     '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}	#{window_activity}' \
     2>/dev/null || true)"
 
-  out+=$'\033[1m'"$(printf ' %-*.*s' "$((width - 1))" "$((width - 1))" MOBAILMUX)"$'\033[0m\033[K\n\033[K\n'
+  out+=$'\033[?7h\033[1m'"$(printf ' %-*.*s' "$((width - 1))" "$((width - 1))" MOBAILMUX)"$'\033[0m\033[K\n\033[K\n'
   rows+=".."
   for slot in a b c d e f g h i j; do
     name="$(session_name "$slot")"
@@ -758,21 +808,64 @@ ui_render() {
     else
       dot=$'\033[32m●'
     fi
-    label="$(printf '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}")"
     dir="${path%/}"; dir="${dir##*/}"; [[ "$path" == "$HOME" ]] && dir="~"
-    dir="$(printf '%-*.*s' "$((width - 3))" "$((width - 3))" "${dir:-/}")"
     selected=""
     [[ "$name" == "$view_session" ]] && selected=$'\033[7m'
+    if [[ "$layout" == top ]]; then
+      tab_slots+=("$slot") tab_dots+=("$dot") tab_dirs+=("${dir:-/}") tab_selected+=("$selected")
+      continue
+    fi
+    label="$(printf '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}")"
+    dir="$(printf '%-*.*s' "$((width - 3))" "$((width - 3))" "${dir:-/}")"
     out+="$selected $slot $dot"$'\033[0m'"$selected $label"$'\033[0m\033[K\n'
     out+="$selected   "$'\033[2m'"$dir"$'\033[0m\033[K\n'
     rows+="$slot$slot"
   done
-  if first_slot empty >/dev/null; then
+  if [[ "$layout" == top ]]; then
+    ui_tabs "$ui" "$width" "$plus"
+    return 0
+  fi
+  if (( plus )); then
     out+=$'\033[K\n'" "$'\033[36m'"+ new"$'\033[0m\033[K\n'
     rows+=".+"
   fi
   tmux set-option -t "=$ui:" @mbx_rows "$rows"
   printf '\033[H%s\033[J' "$out"
+}
+
+# One row of tabs, " a● folder ", from the tab_* arrays of ui_render. Folder
+# names shrink evenly until every tab fits, then go; the bar never wraps.
+ui_tabs() {
+  local ui="$1" width="$2" plus="$3" n="${#tab_slots[@]}" budget cap=0 used len
+  local i label tab_width fill bar=$'\033[?7l' cols=""
+  budget=$(( width - 1 - 4 * n - 3 * plus ))
+  for label in "${tab_dirs[@]}"; do
+    (( ${#label} > cap )) && cap=${#label}
+  done
+  while (( cap > 0 )); do
+    used=0
+    for label in "${tab_dirs[@]}"; do
+      len=${#label}
+      (( len > cap )) && len=$cap
+      used=$(( used + len + 1 ))
+    done
+    (( used <= budget )) && break
+    cap=$(( cap - 1 ))
+  done
+  for (( i = 0; i < n; i++ )); do
+    label=""
+    (( cap > 0 )) && label=" ${tab_dirs[i]:0:cap}"
+    bar+="${tab_selected[i]} ${tab_slots[i]}${tab_dots[i]}"$'\033[0m'"${tab_selected[i]}$label "$'\033[0m'
+    tab_width=$(( 4 + ${#label} ))
+    printf -v fill '%*s' "$tab_width" ''
+    cols+="${fill// /${tab_slots[i]}}"
+  done
+  if (( plus )); then
+    bar+=" "$'\033[36m'"+"$'\033[0m'" "
+    cols+="+++"
+  fi
+  tmux set-option -t "=$ui:" @mbx_cols "$cols"
+  printf '\033[H\033[J%s' "$bar"
 }
 
 ui_sidebar() {
@@ -1120,7 +1213,8 @@ main() {
     __saver) saver_loop ;;
     __ui-view) ui_view "$2" ;;
     __ui-sidebar) ui_sidebar "$2" ;;
-    __ui-click) ui_click "$2" "$3" ;;
+    __ui-click) ui_click "$2" "$3" "${4:-}" ;;
+    __ui-layout) ui_layout "$2" ;;
     r|resume)
       [[ $# -eq 2 ]] || die "resume needs exactly one slot"
       slot="$(require_slot "$2")"

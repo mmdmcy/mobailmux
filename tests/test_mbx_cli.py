@@ -293,6 +293,11 @@ class MbxCliTest(unittest.TestCase):
         self.assertIn("MBX_UI_WIDTH", result.stderr)
         self.assertEqual(log, "")
 
+        result, log = self.run_mbx("ui", env_overrides={"MBX_UI_LAYOUT": "left"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MBX_UI_LAYOUT must be auto, side or top", result.stderr)
+        self.assertEqual(log, "")
+
         # Refused up front, not by a sidebar that keeps failing to draw.
         result, log = self.run_mbx("ui", env_overrides={"MBX_QUIET_SECONDS": "0"})
         self.assertNotEqual(result.returncode, 0)
@@ -373,11 +378,20 @@ class MbxUiTmuxTest(unittest.TestCase):
         ).stdout.split()
         return [name for name in clients if not name.startswith("mbx-ui-")]
 
-    def tap(self, row: int) -> None:
+    def tap(self, row: int, col: int = 3) -> None:
         self.tmux(
             self.outer, "send-keys", "-t", "harness", "-l",
-            f"\x1b[<0;3;{row}M\x1b[<0;3;{row}m",
+            f"\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m",
         )
+
+    def ui_option(self, name: str) -> str:
+        sessions = self.tmux(self.inner, "ls", "-F", "#S", check=False).stdout.split()
+        ui = [s for s in sessions if s.startswith("mbx-ui-")]
+        if not ui:
+            return ""
+        return self.tmux(
+            self.inner, "show-options", "-qv", "-t", f"={ui[0]}:", name, check=False
+        ).stdout.strip()
 
     def test_sidebar_lists_slots_and_taps_switch_the_view(self) -> None:
         home = os.environ["HOME"]
@@ -386,7 +400,7 @@ class MbxUiTmuxTest(unittest.TestCase):
         command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
         self.tmux(
             self.outer, "new-session", "-d", "-s", "harness",
-            "-x", "60", "-y", "20", command,
+            "-x", "100", "-y", "20", command,
         )
 
         # Not "+ new" alone: the view's "Tap + new." can show before the
@@ -414,7 +428,7 @@ class MbxUiTmuxTest(unittest.TestCase):
         command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
         self.tmux(
             self.outer, "new-session", "-d", "-s", "harness",
-            "-x", "60", "-y", "20", command,
+            "-x", "100", "-y", "20", command,
         )
         # The UI client attaches last, once every option and hook is set.
         self.wait_for(
@@ -439,6 +453,51 @@ class MbxUiTmuxTest(unittest.TestCase):
         os.kill(int(first), signal.SIGKILL)
         self.wait_for(lambda: sidebar_pid() not in ("", first))
         self.wait_for(lambda: "+ new" in self.screen())
+
+    def test_narrow_window_shows_tabs_on_top(self) -> None:
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "-c", self.inner)
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-c", "sleep 600")
+        command = f"env -u TMUX TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
+        # A phone in portrait: narrower than 80 columns.
+        self.tmux(
+            self.outer, "new-session", "-d", "-s", "harness",
+            "-x", "50", "-y", "20", command,
+        )
+
+        self.wait_for(lambda: " c" in self.screen().splitlines()[0])
+        first, border = self.screen().splitlines()[:2]
+        self.assertTrue(first.startswith(" a○ "), first)
+        self.assertTrue(first.rstrip().endswith("+"), first)
+        self.assertNotIn("MOBAILMUX", self.screen())
+        self.assertEqual(set(border), {"─"})
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-a"])
+
+        # Taps pick a tab by column: c's tab, then "+" for the first empty slot.
+        cols = self.ui_option("@mbx_cols")
+        self.tap(1, cols.index("c") + 1)
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-c"])
+        self.tap(1, cols.index("+") + 1)
+        self.wait_for(lambda: self.viewed_sessions() == ["mbx-b"])
+
+        # Turned sideways, it becomes the sidebar; and back again.
+        self.tmux(self.outer, "resize-window", "-t", "harness", "-x", "120")
+        self.wait_for(lambda: "MOBAILMUX" in self.screen())
+        self.tmux(self.outer, "resize-window", "-t", "harness", "-x", "50")
+        self.wait_for(lambda: self.screen().startswith(" a"))
+        self.assertNotIn("MOBAILMUX", self.screen())
+
+    def test_layout_can_be_fixed(self) -> None:
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "sleep 600")
+        command = (
+            f"env -u TMUX TMUX_TMPDIR={self.inner} MBX_UI_LAYOUT=side {MBX} ui;"
+            " sleep 600"
+        )
+        self.tmux(
+            self.outer, "new-session", "-d", "-s", "harness",
+            "-x", "50", "-y", "20", command,
+        )
+        self.wait_for(lambda: "+ new" in self.screen())
+        self.assertEqual(self.ui_option("@mbx_layout"), "side")
 
 
 
