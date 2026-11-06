@@ -69,7 +69,23 @@ works the same over SSH from a phone as on the desktop.
  + new          │
 ```
 
-- Tap or click a slot to show it. `+ new` creates the next empty slot.
+On a window narrower than 80 columns, such as a phone in portrait over SSH,
+the sidebar becomes one row of tabs above the slot, so the slot keeps the full
+width. Each tab shows the slot, its signal, and its folder; folder names
+shrink evenly until every tab fits.
+
+```text
+ a○ ~  b● site  c● api  +
+──────────────────────────
+mac@Mac ~/projects/site %
+```
+
+Turning the phone sideways switches to the sidebar and back. Set
+`MBX_UI_LAYOUT=side` or `MBX_UI_LAYOUT=top` to keep one layout (default
+`auto`).
+
+- Tap or click a slot to show it. `+ new` (or `+` on the tab row) creates the
+  next empty slot.
 - `○` shell prompt, `●` yellow working, `●` green quiet, `✕` exited — the same
   signals as `mbx check`.
 - Keys, `Ctrl-b`, scrolling, and `mbx r <slot>` all work normally inside the
