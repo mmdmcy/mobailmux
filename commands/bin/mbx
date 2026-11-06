@@ -18,6 +18,7 @@ Usage:
   mbx who [a-j] [--format json]
   mbx log <a-j> [-n N] [--format json]
   mbx peek <a-j> [-n N] [--format json]
+  mbx config [setting [value | --reset]] [--format json]
   mbx help
 
 Commands:
@@ -29,6 +30,10 @@ Commands:
   stop        Stop one terminal, or all Mobailmux terminals.
   save        Save now. Mobailmux also saves every 30s in the background.
   restore     After a reboot, bring saved terminals back (mbx ui does this too).
+  config      Show the settings, or change one: layout (auto, side or top),
+              tab-label (folder or program), tabs-below, width, quiet, save.
+              They live in ~/.config/mobailmux/config; an open mbx ui
+              follows a change at once.
 
 For AI agents (read-only; who and log need jq):
   who         What runs in each terminal: program, state, the Claude Code
@@ -49,6 +54,7 @@ Examples:
   mbx stop a
   mbx who --format json
   mbx log b -n 5
+  mbx config layout top
 
 New terminals start in your home directory. Detach with Ctrl-b d.
 Close a terminal by quitting its program and typing exit, or with mbx stop.
@@ -194,10 +200,216 @@ print_status() {
   done
 }
 
+# --- Settings ---------------------------------------------------------------
+# `mbx config` shows and changes a plain key=value file, which is parsed,
+# never sourced. A setting's environment variable wins over the file, for one
+# shell or a test. An open `mbx ui` keeps its settings in its own tmux options,
+# set when it opens and again by `mbx config`.
+
+SETTINGS=(layout tab-label tabs-below width quiet save)
+
+# Fills setting_row: environment variable, default, allowed values, meaning.
+setting_info() {
+  case "$1" in
+    layout) setting_row=(MBX_UI_LAYOUT auto "auto, side or top"
+      "where mbx ui lists the slots; auto is tabs on top below tabs-below columns") ;;
+    tab-label) setting_row=(MBX_UI_TAB_LABEL folder "folder or program"
+      "what a tab shows beside its slot letter") ;;
+    tabs-below) setting_row=(MBX_UI_TABS_BELOW 80 "a number of columns, 1 or more"
+      "auto layout: tabs on top when the window is narrower than this") ;;
+    width) setting_row=(MBX_UI_WIDTH 16 "a number of columns, at least 8"
+      "width of the sidebar") ;;
+    quiet) setting_row=(MBX_QUIET_SECONDS 5 "a number of seconds, 1 or more"
+      "silence before a slot counts as quiet (yellow dot turns green)") ;;
+    save) setting_row=(MBX_SAVE_SECONDS 30 "a number of seconds, 1 or more"
+      "how often the slots are saved for after a reboot") ;;
+    *) return 1 ;;
+  esac
+}
+
+setting_valid() {
+  case "$1" in
+    layout) [[ "$2" =~ ^(auto|side|top)$ ]] ;;
+    tab-label) [[ "$2" =~ ^(folder|program)$ ]] ;;
+    width) [[ "$2" =~ ^[0-9]{1,4}$ ]] && (( 10#$2 >= 8 )) ;;
+    *) [[ "$2" =~ ^[1-9][0-9]{0,5}$ ]] ;;
+  esac
+}
+
+config_file() {
+  printf '%s/mobailmux/config\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# The file's value for a setting; the last line for it wins.
+config_value() {
+  local key="$1" file line value="" found=1
+  file="$(config_file)"
+  [[ -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*([a-z-]+)[[:space:]]*=[[:space:]]*([^[:space:]#]*) ]] \
+      && [[ "${BASH_REMATCH[1]}" == "$key" ]]; then
+      value="${BASH_REMATCH[2]}" found=0
+    fi
+  done < "$file"
+  (( found == 0 )) && printf '%s\n' "$value"
+}
+
+# A setting's value and where it comes from: its variable, file, or default.
+setting_lookup() {
+  local key="$1" setting_row variable value
+  setting_info "$key" || die "unknown setting: $key (mbx config lists them)"
+  variable="${setting_row[0]}"
+  if [[ -n "${!variable:-}" ]]; then
+    printf '%s\t%s\n' "${!variable}" "$variable"
+  elif value="$(config_value "$key")"; then
+    printf '%s\tfile\n' "$value"
+  else
+    printf '%s\tdefault\n' "${setting_row[1]}"
+  fi
+}
+
+# A setting's value, refused with where it came from when it is not allowed.
+setting() {
+  local key="$1" setting_row value from
+  IFS=$'\t' read -r value from < <(setting_lookup "$key")
+  setting_info "$key"
+  [[ "$from" == file ]] && from="$(config_file)"
+  setting_valid "$key" "$value" \
+    || die "$key must be ${setting_row[2]}, got: ${value:-<empty>} (from $from)"
+  printf '%s\n' "$value"
+}
+
+config_write() {
+  local key="$1" value="$2" file dir tmp line written=""
+  file="$(config_file)"
+  dir="$(dirname "$file")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/.config.XXXXXX")"
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*([a-z-]+)[[:space:]]*= ]] \
+        && [[ "${BASH_REMATCH[1]}" == "$key" ]]; then
+        [[ -n "$value" && -z "$written" ]] && printf '%s=%s\n' "$key" "$value" && written=1
+        continue
+      fi
+      printf '%s\n' "$line"
+    done < "$file" > "$tmp"
+  else
+    printf '# Mobailmux settings. mbx config lists them; change one with\n# mbx config SETTING VALUE, or edit this file.\n' > "$tmp"
+  fi
+  if [[ -n "$value" && -z "$written" ]]; then
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  mv -f "$tmp" "$file"
+}
+
+# Gives every open UI the new value at once. A UI opened by an mbx from
+# before settings existed is left alone; it would not draw tabs.
+config_apply() {
+  local key="$1" value="$2" option ui count=0
+  case "$key" in
+    layout) option=@mbx_layout_choice ;;
+    tab-label) option=@mbx_tab_label ;;
+    tabs-below) option=@mbx_tabs_below ;;
+    width) option=@mbx_width ;;
+    quiet) option=@mbx_quiet ;;
+    *) printf '0\n'; return 0 ;;
+  esac
+  command -v tmux >/dev/null 2>&1 || { printf '0\n'; return 0; }
+  while IFS= read -r ui; do
+    [[ "$ui" == "$(ui_prefix)"* && -n "$(ui_get "$ui" @mbx_layout_choice)" ]] || continue
+    tmux set-option -t "=$ui:" "$option" "$value"
+    ui_layout "$ui"
+    count=$(( count + 1 ))
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  printf '%s\n' "$count"
+}
+
+json_text() {
+  local text="${1//\\/\\\\}"
+  printf '"%s"' "${text//\"/\\\"}"
+}
+
+print_settings() {
+  local format="$1" key setting_row value from first=1
+  shift
+  if [[ "$format" == json ]]; then
+    printf '{"file":%s,"settings":[' "$(json_text "$(config_file)")"
+  else
+    printf '%-11s %-8s %-17s %s\n' SETTING VALUE FROM MEANING
+  fi
+  for key in "$@"; do
+    setting_info "$key"
+    IFS=$'\t' read -r value from < <(setting_lookup "$key")
+    if [[ "$format" == json ]]; then
+      (( first )) || printf ','
+      printf '{"setting":%s,"value":%s,"from":%s,"default":%s,"allowed":%s,"env":%s,"meaning":%s}' \
+        "$(json_text "$key")" "$(json_text "$value")" "$(json_text "$from")" \
+        "$(json_text "${setting_row[1]}")" "$(json_text "${setting_row[2]}")" \
+        "$(json_text "${setting_row[0]}")" "$(json_text "${setting_row[3]}")"
+    else
+      printf '%-11s %-8s %-17s %s\n' "$key" "$value" "$from" "${setting_row[3]}"
+    fi
+    first=0
+  done
+  if [[ "$format" == json ]]; then
+    printf ']}\n'
+  elif (( $# > 1 )); then
+    printf '\nFile: %s\nChange one with mbx config SETTING VALUE; --reset goes back to the default.\n' \
+      "$(config_file)"
+  else
+    printf '\nAllowed: %s (default %s). Variable: %s.\n' \
+      "${setting_row[2]}" "${setting_row[1]}" "${setting_row[0]}"
+  fi
+}
+
+config_command() {
+  local format=text reset=0 given=() key value old from setting_row applied
+  while (( $# )); do
+    case "$1" in
+      --format) format="$(output_format "${2:-}")"; shift 2 ;;
+      --format=*) format="$(output_format "${1#--format=}")"; shift ;;
+      --reset) reset=1; shift ;;
+      -*) die "config does not know $1" ;;
+      *) given+=("$1"); shift ;;
+    esac
+  done
+  if (( ${#given[@]} == 0 )); then
+    (( reset == 0 )) || die "--reset needs a setting: mbx config SETTING --reset"
+    print_settings "$format" "${SETTINGS[@]}"
+    return 0
+  fi
+  key="${given[0]}"
+  setting_info "$key" || die "unknown setting: $key (mbx config lists them)"
+  if (( ${#given[@]} == 1 && reset == 0 )); then
+    print_settings "$format" "$key"
+    return 0
+  fi
+  (( ${#given[@]} <= 2 )) || die "config takes one setting and one value"
+  (( ${#given[@]} == 1 || reset == 0 )) || die "give a value or --reset, not both"
+  value="${given[1]:-}"
+  if (( reset == 0 )) && ! setting_valid "$key" "$value"; then
+    die "$key must be ${setting_row[2]}, got: $value"
+  fi
+  IFS=$'\t' read -r old from < <(setting_lookup "$key")
+  config_write "$key" "$value"
+  value="$(setting "$key")"
+  applied="$(config_apply "$key" "$value")"
+  if [[ "$format" == json ]]; then
+    print_settings json "$key"
+  else
+    printf '%s: %s -> %s' "$key" "$old" "$value"
+    (( applied > 0 )) && printf ' (applied to %s open mbx ui)' "$applied"
+    printf '\n'
+  fi
+  if [[ -n "${!setting_row[0]:-}" ]]; then
+    printf '%s: note: %s is set in this shell and wins over the file\n' \
+      "$program" "${setting_row[0]}" >&2
+  fi
+}
+
 quiet_seconds() {
-  local seconds="${MBX_QUIET_SECONDS:-5}"
-  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || die "MBX_QUIET_SECONDS must be a positive integer"
-  printf '%s\n' "$seconds"
+  setting quiet
 }
 
 # mbx check's signal for one pane, and its seconds of silence (or -):
@@ -520,18 +732,18 @@ ensure_saver() {
   if [[ "$pid" =~ ^[0-9]+$ ]] && ps -o command= -p "$pid" 2>/dev/null | grep -q -- '__saver'; then
     return 0
   fi
-  for name in XDG_STATE_HOME MBX_SAVE_SECONDS MBX_SESSION_PREFIX; do
+  for name in XDG_STATE_HOME XDG_CONFIG_HOME MBX_SAVE_SECONDS MBX_SESSION_PREFIX; do
     [[ -n "${!name:-}" ]] && env_args+=("$name=${!name}")
   done
   tmux run-shell -b "$(printf '%q ' env ${env_args[@]+"${env_args[@]}"} "$(self_path)" __saver) >/dev/null 2>&1"
 }
 
 saver_loop() {
-  local seconds="${MBX_SAVE_SECONDS:-30}"
-  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || seconds=30
+  local seconds
   tmux set-option -g @mbx_saver_pid "$$"
   while any_slot_running; do
     save_snapshot 2>/dev/null || true
+    seconds="$(setting save 2>/dev/null)" || seconds=30
     sleep "$seconds"
   done
   [[ "$(tmux show-options -gqv @mbx_saver_pid 2>/dev/null)" == "$$" ]] \
@@ -554,37 +766,25 @@ ui_prefix() {
   printf '%s-ui-\n' "${MBX_SESSION_PREFIX:-mbx}"
 }
 
-ui_width() {
-  local width="${MBX_UI_WIDTH:-16}"
-  [[ "$width" =~ ^[0-9]+$ ]] && (( width >= 8 )) \
-    || die "MBX_UI_WIDTH must be a number of columns, at least 8"
-  printf '%s\n' "$width"
-}
-
-ui_layout_choice() {
-  local layout="${MBX_UI_LAYOUT:-auto}"
-  case "$layout" in
-    auto|side|top) printf '%s\n' "$layout" ;;
-    *) die "MBX_UI_LAYOUT must be auto, side or top, got: $layout" ;;
-  esac
-}
-
 ui_get() {
   tmux show-options -qv -t "=$1:" "$2" 2>/dev/null || true
 }
 
 # Side: the sidebar on the left. Top: one row of tabs above the slot, for
-# phones. Auto picks top when the window is narrower than 80 columns, and
-# runs again whenever the window is resized (a phone turned sideways).
+# phones. Auto picks top when the window is narrower than tabs-below columns
+# (80), and runs again whenever the window is resized (a phone turned
+# sideways) or a setting changes.
 ui_layout() {
-  local ui="$1" sidebar layout cols
+  local ui="$1" sidebar layout cols below
   sidebar="$(ui_get "$ui" @mbx_sidebar_pane)"
   [[ -n "$sidebar" ]] || return 0
   layout="$(ui_get "$ui" @mbx_layout_choice)"
   if [[ "$layout" != side && "$layout" != top ]]; then
     cols="$(tmux display-message -p -t "$sidebar" '#{window_width}' 2>/dev/null)" || return 0
+    below="$(ui_get "$ui" @mbx_tabs_below)"
+    [[ "$below" =~ ^[0-9]+$ ]] || below=80
     layout=side
-    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols < 80 )) && layout=top
+    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols < below )) && layout=top
   fi
   # The sidebar pane comes first, so even layouts put it left or on top.
   if [[ "$layout" == top ]]; then
@@ -641,11 +841,14 @@ inside_ui_view() {
 }
 
 open_ui() {
-  local width layout self ui initial view sidebar click event size=()
+  local width layout tabs_below tab_label quiet self ui initial view sidebar click event
+  local size=()
   need_tmux
-  width="$(ui_width)"
-  layout="$(ui_layout_choice)"
-  quiet_seconds >/dev/null
+  width="$(setting width)"
+  layout="$(setting layout)"
+  tabs_below="$(setting tabs-below)"
+  tab_label="$(setting tab-label)"
+  quiet="$(setting quiet)"
   self="$(self_path)"
   if [[ -n "${TMUX:-}" ]] && inside_ui_view; then
     die "already inside the Mobailmux UI"
@@ -678,6 +881,9 @@ open_ui() {
   tmux set-option -t "=$ui:" @mbx_sidebar_pane "$sidebar"
   tmux set-option -t "=$ui:" @mbx_width "$width"
   tmux set-option -t "=$ui:" @mbx_layout_choice "$layout"
+  tmux set-option -t "=$ui:" @mbx_tabs_below "$tabs_below"
+  tmux set-option -t "=$ui:" @mbx_tab_label "$tab_label"
+  tmux set-option -t "=$ui:" @mbx_quiet "$quiet"
   # Every key goes to the slot's own tmux client, so Ctrl-b works as usual.
   tmux set-option -t "=$ui:" prefix None
   tmux set-option -t "=$ui:" prefix2 None
@@ -771,12 +977,14 @@ ui_view() {
 ui_render() {
   local ui="$1" width view_session client line rows="" out="" now threshold
   local name command path dead activity slot dot label dir selected
-  local panes="" layout plus=0
-  local tab_slots=() tab_dots=() tab_dirs=() tab_selected=()
+  local panes="" layout tab_label plus=0
+  local tab_slots=() tab_dots=() tab_labels=() tab_selected=()
   width="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null || echo 16)"
   now="$(date +%s)"
-  threshold="$(quiet_seconds)"
+  threshold="$(ui_get "$ui" @mbx_quiet)"
+  [[ "$threshold" =~ ^[1-9][0-9]*$ ]] || threshold=5
   layout="$(ui_get "$ui" @mbx_layout)"
+  tab_label="$(ui_get "$ui" @mbx_tab_label)"
   first_slot empty >/dev/null && plus=1
 
   view_session="$(ui_get "$ui" @mbx_view)"
@@ -812,7 +1020,8 @@ ui_render() {
     selected=""
     [[ "$name" == "$view_session" ]] && selected=$'\033[7m'
     if [[ "$layout" == top ]]; then
-      tab_slots+=("$slot") tab_dots+=("$dot") tab_dirs+=("${dir:-/}") tab_selected+=("$selected")
+      [[ "$tab_label" == program ]] && dir="${command:-?}"
+      tab_slots+=("$slot") tab_dots+=("$dot") tab_labels+=("${dir:-/}") tab_selected+=("$selected")
       continue
     fi
     label="$(printf '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}")"
@@ -833,18 +1042,18 @@ ui_render() {
   printf '\033[H%s\033[J' "$out"
 }
 
-# One row of tabs, " a● folder ", from the tab_* arrays of ui_render. Folder
-# names shrink evenly until every tab fits, then go; the bar never wraps.
+# One row of tabs, " a● folder ", from the tab_* arrays of ui_render. Labels
+# shrink evenly until every tab fits, then go; the bar never wraps.
 ui_tabs() {
   local ui="$1" width="$2" plus="$3" n="${#tab_slots[@]}" budget cap=0 used len
   local i label tab_width fill bar=$'\033[?7l' cols=""
   budget=$(( width - 1 - 4 * n - 3 * plus ))
-  for label in "${tab_dirs[@]}"; do
+  for label in "${tab_labels[@]}"; do
     (( ${#label} > cap )) && cap=${#label}
   done
   while (( cap > 0 )); do
     used=0
-    for label in "${tab_dirs[@]}"; do
+    for label in "${tab_labels[@]}"; do
       len=${#label}
       (( len > cap )) && len=$cap
       used=$(( used + len + 1 ))
@@ -854,7 +1063,7 @@ ui_tabs() {
   done
   for (( i = 0; i < n; i++ )); do
     label=""
-    (( cap > 0 )) && label=" ${tab_dirs[i]:0:cap}"
+    (( cap > 0 )) && label=" ${tab_labels[i]:0:cap}"
     bar+="${tab_selected[i]} ${tab_slots[i]}${tab_dots[i]}"$'\033[0m'"${tab_selected[i]}$label "$'\033[0m'
     tab_width=$(( 4 + ${#label} ))
     printf -v fill '%*s' "$tab_width" ''
@@ -1210,6 +1419,7 @@ main() {
       need_tmux
       restore_snapshot
       ;;
+    config) shift; config_command "$@" ;;
     __saver) saver_loop ;;
     __ui-view) ui_view "$2" ;;
     __ui-sidebar) ui_sidebar "$2" ;;
