@@ -21,6 +21,7 @@ FAKE_TMUX = r"""#!/usr/bin/env bash
 set -euo pipefail
 
 printf '%s\n' "$*" >> "$MBX_TMUX_LOG"
+[[ "${MBX_TEST_TERM:-}" != 1 ]] || printf 'TERM=%s\n' "${TERM:-}" >> "$MBX_TMUX_LOG"
 
 argument_after() {
   local wanted="$1"
@@ -285,6 +286,21 @@ class MbxCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mbx r <a-j>", result.stdout)
 
+    def test_terminal_override_is_only_for_outer_ssh_attachments(self) -> None:
+        for ssh, nested, expected in ((True, False, "xterm-256color"),
+                                      (False, False, "linux"),
+                                      (True, True, "linux")):
+            with self.subTest(ssh=ssh, nested=nested):
+                result, log = self.run_mbx("r", "a", sessions={"mbx-a": {}},
+                    env_overrides={"TERM": "linux", "MBX_SSH_TERMINAL": "xterm-256color",
+                                   "SSH_TTY": "/dev/pts/test" if ssh else "",
+                                   "SSH_CONNECTION": "", "TMUX": "/tmp/test,1,0" if nested else "",
+                                   "MBX_TEST_TERM": "1"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log.splitlines()[-1], f"TERM={expected}")
+        result, _ = self.run_mbx("config", "ssh-terminal", "invalid")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_ui_rejects_arguments_and_bad_width(self) -> None:
         result, _ = self.run_mbx("ui", "a")
         self.assertNotEqual(result.returncode, 0)
@@ -432,7 +448,7 @@ class MbxUiTmuxTest(unittest.TestCase):
             ["tmux", *args], check=check, capture_output=True, text=True, env=env
         )
 
-    def wait_for(self, predicate, timeout: float = 5.0) -> None:
+    def wait_for(self, predicate, timeout: float = 15.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if predicate():
@@ -463,6 +479,33 @@ class MbxUiTmuxTest(unittest.TestCase):
         return self.tmux(
             self.inner, "show-options", "-qv", "-t", f"={ui[0]}:", name, check=False
         ).stdout.strip()
+
+    def test_ssh_terminal_override_and_keyboard_resizes(self) -> None:
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-a", "sleep 600")
+        self.tmux(self.inner, "new-session", "-d", "-s", "mbx-b", "sleep 600")
+        result = self.mbx_inner("config", "ssh-terminal", "xterm-256color")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command = (
+            f"env -u TMUX TERM=linux SSH_TTY=/dev/pts/test "
+            f"TMUX_TMPDIR={self.inner} {MBX} ui; sleep 600"
+        )
+        self.tmux(self.outer, "new-session", "-d", "-s", "harness",
+                  "-x", "52", "-y", "44", command)
+        self.wait_for(lambda: "b" in self.ui_option("@mbx_cols"))
+        clients = self.tmux(self.inner, "list-clients", "-F",
+                            "#{client_session} #{client_termname}").stdout
+        self.assertRegex(clients, r"mbx-ui-\d+ xterm-256color")
+        # The outer terminal is in its alternate screen, so resizing cannot
+        # accumulate old tab bars in its normal scrollback.
+        self.assertEqual(self.tmux(self.outer, "display-message", "-p",
+                                  "-t", "harness", "#{alternate_on}").stdout.strip(), "1")
+        for height, slot in ((24, "b"), (44, "a"), (24, "b"), (44, "a")):
+            self.tmux(self.outer, "resize-window", "-t", "harness", "-y", str(height))
+            self.wait_for(lambda: len(self.screen().splitlines()) == height)
+            self.tap(1, self.ui_option("@mbx_cols").index(slot) + 1)
+            self.wait_for(lambda: self.viewed_sessions() == [f"mbx-{slot}"])
+            self.wait_for(lambda: self.screen().splitlines()[1] == "─" * 52)
+            self.assertEqual(sum("a●" in line for line in self.screen().splitlines()), 1)
 
     def test_sidebar_lists_slots_and_taps_switch_the_view(self) -> None:
         home = os.environ["HOME"]

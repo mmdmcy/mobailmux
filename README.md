@@ -211,13 +211,31 @@ mbx config --format json     # all of them, for scripts
 | `width`      | columns, at least 8        | `16`     | `MBX_UI_WIDTH`      |
 | `quiet`      | seconds, 1 or more         | `5`      | `MBX_QUIET_SECONDS` |
 | `save`       | seconds, 1 or more         | `30`     | `MBX_SAVE_SECONDS`  |
+| `ssh-terminal` | `auto`, `xterm-256color` | `auto` | `MBX_SSH_TERMINAL` |
 
 They live in `~/.config/mobailmux/config` (or `$XDG_CONFIG_HOME/mobailmux/config`)
 as `setting=value` lines, which you can also edit by hand. mbx reads the file,
 never runs it, and refuses a value that is not allowed, naming the file. An
-open `mbx ui` follows a change at once, and the background saver uses the new
+open `mbx ui` follows layout changes at once, and the background saver uses the new
 `save` interval on its next round. A setting's variable wins over the file,
 for one shell or one run; `mbx config` then names the variable under FROM.
+
+### Phone terminal redraws
+
+If an SSH app reports `TERM=linux`, tmux treats it as a Linux virtual console,
+whose terminal description lacks an alternate screen. In an xterm-compatible
+phone app this can leave old tab bars in scrollback when the keyboard changes
+the terminal size. Set the app's terminal type to `xterm-256color`, or save an
+SSH-only override on the host:
+
+```bash
+mbx config ssh-terminal xterm-256color
+```
+
+Detach with `Ctrl-b d`, then run `mbx ui` again. The slots keep running.
+The setting applies to new outer SSH attachments (`mbx ui` and `mbx r`);
+it does not change an attached client, a local console, or nested tmux.
+`mbx config ssh-terminal --reset` restores the terminal type sent by the app.
 
 ## For AI Agents
 

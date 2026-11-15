@@ -31,9 +31,10 @@ Commands:
   save        Save now. Mobailmux also saves every 30s in the background.
   restore     After a reboot, bring saved terminals back (mbx ui does this too).
   config      Show the settings, or change one: layout (auto, side or top),
-              tab-label (folder or program), tabs-below, width, quiet, save.
+              tab-label (folder or program), tabs-below, width, quiet, save,
+              ssh-terminal (auto or xterm-256color; next SSH attachment).
               They live in ~/.config/mobailmux/config; an open mbx ui
-              follows a change at once.
+              follows layout changes at once.
 
 For AI agents (read-only; who and log need jq):
   who         What runs in each terminal: program, state, the Claude Code
@@ -90,8 +91,21 @@ is_shell() {
   esac
 }
 
+# A host may receive an inaccurate TERM from an SSH app. Only override it
+# when configured, and only for a new outer client, never a nested tmux.
+prepare_terminal() {
+  local terminal
+  [[ -z "${TMUX:-}" && -n "${SSH_TTY:-}${SSH_CONNECTION:-}" ]] || return 0
+  terminal="$(setting ssh-terminal)"
+  [[ "$terminal" != auto ]] || return 0
+  TERM="$terminal" tput longname >/dev/null 2>&1 \
+    || die "terminal description $terminal is not installed"
+  export TERM="$terminal"
+}
+
 attach_session() {
   local session="$1"
+  prepare_terminal
   if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$session"
   else
@@ -206,11 +220,13 @@ print_status() {
 # shell or a test. An open `mbx ui` keeps its settings in its own tmux options,
 # set when it opens and again by `mbx config`.
 
-SETTINGS=(layout tab-label tabs-below width quiet save)
+SETTINGS=(layout tab-label tabs-below width quiet save ssh-terminal)
 
 # Fills setting_row: environment variable, default, allowed values, meaning.
 setting_info() {
   case "$1" in
+    ssh-terminal) setting_row=(MBX_SSH_TERMINAL auto "auto or xterm-256color"
+      "terminal type for new SSH attachments; auto keeps the client TERM") ;;
     layout) setting_row=(MBX_UI_LAYOUT auto "auto, side or top"
       "where mbx ui lists the slots; auto is tabs on top below tabs-below columns") ;;
     tab-label) setting_row=(MBX_UI_TAB_LABEL folder "folder or program"
@@ -229,6 +245,7 @@ setting_info() {
 
 setting_valid() {
   case "$1" in
+    ssh-terminal) [[ "$2" =~ ^(auto|xterm-256color)$ ]] ;;
     layout) [[ "$2" =~ ^(auto|side|top)$ ]] ;;
     tab-label) [[ "$2" =~ ^(folder|program)$ ]] ;;
     width) [[ "$2" =~ ^[0-9]{1,4}$ ]] && (( 10#$2 >= 8 )) ;;
@@ -400,6 +417,7 @@ config_command() {
   else
     printf '%s: %s -> %s' "$key" "$old" "$value"
     (( applied > 0 )) && printf ' (applied to %s open mbx ui)' "$applied"
+    [[ "$key" != ssh-terminal ]] || printf ' (takes effect on the next SSH attachment)'
     printf '\n'
   fi
   if [[ -n "${!setting_row[0]:-}" ]]; then
@@ -775,7 +793,7 @@ ui_get() {
 # (80), and runs again whenever the window is resized (a phone turned
 # sideways) or a setting changes.
 ui_layout() {
-  local ui="$1" sidebar layout cols below
+  local ui="$1" sidebar layout cols below current
   sidebar="$(ui_get "$ui" @mbx_sidebar_pane)"
   [[ -n "$sidebar" ]] || return 0
   layout="$(ui_get "$ui" @mbx_layout_choice)"
@@ -786,12 +804,16 @@ ui_layout() {
     layout=side
     [[ "$cols" =~ ^[0-9]+$ ]] && (( cols < below )) && layout=top
   fi
+  current="$(ui_get "$ui" @mbx_layout)"
+  # Rebuilding an unchanged layout briefly halves the view, sending needless
+  # resizes to the nested terminal when a phone keyboard opens or closes.
   # The sidebar pane comes first, so even layouts put it left or on top.
   if [[ "$layout" == top ]]; then
-    tmux select-layout -t "$sidebar" even-vertical \; resize-pane -t "$sidebar" -y 1
+    [[ "$current" == top ]] || tmux select-layout -t "$sidebar" even-vertical
+    tmux resize-pane -t "$sidebar" -y 1
   else
-    tmux select-layout -t "$sidebar" even-horizontal \; \
-      resize-pane -t "$sidebar" -x "$(ui_get "$ui" @mbx_width)"
+    [[ "$current" == side ]] || tmux select-layout -t "$sidebar" even-horizontal
+    tmux resize-pane -t "$sidebar" -x "$(ui_get "$ui" @mbx_width)"
   fi
   tmux set-option -t "=$ui:" @mbx_layout "$layout"
   ui_redraw "$ui"
@@ -844,6 +866,7 @@ open_ui() {
   local width layout tabs_below tab_label quiet self ui initial view sidebar click event
   local size=()
   need_tmux
+  prepare_terminal
   width="$(setting width)"
   layout="$(setting layout)"
   tabs_below="$(setting tabs-below)"
