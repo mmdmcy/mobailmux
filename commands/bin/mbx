@@ -997,40 +997,59 @@ ui_view() {
   done
 }
 
-ui_render() {
-  local ui="$1" width view_session client line rows="" out="" now threshold
-  local name command path dead activity slot dot label dir selected
-  local panes="" layout tab_label plus=0
-  local tab_slots=() tab_dots=() tab_labels=() tab_selected=()
-  width="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null || echo 16)"
-  now="$(date +%s)"
-  threshold="$(ui_get "$ui" @mbx_quiet)"
-  [[ "$threshold" =~ ^[1-9][0-9]*$ ]] || threshold=5
-  layout="$(ui_get "$ui" @mbx_layout)"
-  tab_label="$(ui_get "$ui" @mbx_tab_label)"
-  first_slot empty >/dev/null && plus=1
+# Everything one frame needs, from one tmux call: the sidebar's width and the
+# UI's settings, then a line per pane (P) and per client (C), fields split by
+# "|" (a tab would merge empty fields; the path, last, may hold a "|"). The
+# call fails once the UI session is gone, which ends the drawing loop.
+ui_state() {
+  tmux display-message -p -t "${TMUX_PANE:-}" \
+    '#{pane_width}|#{@mbx_quiet}|#{@mbx_layout}|#{@mbx_tab_label}|#{@mbx_view}|#{@mbx_view_pane}' \; \
+    list-panes -a -F \
+    'P|#{session_name}|#{&&:#{window_active},#{pane_active}}|#{pane_id}|#{pane_tty}|#{pane_dead}|#{window_activity}|#{pane_current_command}|#{pane_current_path}' \; \
+    list-clients -F 'C|#{client_tty}|#{client_session}'
+}
 
-  view_session="$(ui_get "$ui" @mbx_view)"
-  if client="$(ui_view_client "$ui")"; then
-    name="${client#* }"
-    if [[ -n "$name" && "$name" != "$view_session" ]]; then
-      view_session="$name"
-      tmux set-option -t "=$ui:" @mbx_view "$name"
+# Builds the frame from ui_state's text into the caller's frame, map_name and
+# map, forking nothing: ui_draw writes it only when it differs from the last.
+ui_render() {
+  local ui="$1" state="$2" width threshold layout tab_label view_session view_pane
+  local kind name active pane tty command path dead activity view_tty="" client_session=""
+  local slot dot label dir selected plus=0 rows=".." out now
+  local -A current=() cwd=() is_dead=() active_at=() alive=()
+  local tab_slots=() tab_dots=() tab_labels=() tab_selected=()
+  IFS='|' read -r width threshold layout tab_label view_session view_pane <<<"${state%%$'\n'*}"
+  [[ "$width" =~ ^[0-9]+$ ]] || width=16
+  [[ "$threshold" =~ ^[1-9][0-9]*$ ]] || threshold=5
+  printf -v now '%(%s)T' -1
+  while IFS='|' read -r kind name active pane tty dead activity command path; do
+    if [[ "$kind" == P ]]; then
+      alive["$name"]=1
+      [[ "$pane" == "$view_pane" ]] && view_tty="$tty"
+      [[ "$active" == 1 && -z "${current[$name]+set}" ]] || continue
+      current["$name"]="$command" cwd["$name"]="$path"
+      is_dead["$name"]="$dead" active_at["$name"]="$activity"
+    elif [[ "$kind" == C && -n "$view_tty" && "$name" == "$view_tty" ]]; then
+      client_session="$active"
     fi
+  done <<<"${state#*$'\n'}"
+  # The nested client may have switched slots on its own (Ctrl-b s).
+  if [[ -n "$client_session" && "$client_session" != "$view_session" ]]; then
+    view_session="$client_session"
+    tmux set-option -t "=$ui:" @mbx_view "$view_session"
   fi
 
-  panes="$(tmux list-panes -a -F \
-    '#{?#{&&:#{window_active},#{pane_active}},#{session_name},}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}	#{window_activity}' \
-    2>/dev/null || true)"
-
-  out+=$'\033[?7h\033[1m'"$(printf ' %-*.*s' "$((width - 1))" "$((width - 1))" MOBAILMUX)"$'\033[0m\033[K\n\033[K\n'
-  rows+=".."
+  out=$'\033[?7h\033[1m'
+  printf -v label ' %-*.*s' "$((width - 1))" "$((width - 1))" MOBAILMUX
+  out+="$label"$'\033[0m\033[K\n\033[K\n'
   for slot in a b c d e f g h i j; do
-    name="$(session_name "$slot")"
-    line="$(grep -m 1 "^$name"$'\t' <<<"$panes" || true)"
-    [[ -n "$line" ]] || continue
-    IFS=$'\t' read -r _ command path dead activity <<<"$line"
-    if [[ "$dead" == 1 ]]; then
+    name="${MBX_SESSION_PREFIX:-mbx}-$slot"
+    if [[ -z "${alive[$name]+set}" ]]; then
+      plus=1
+      continue
+    fi
+    [[ -n "${current[$name]+set}" ]] || continue
+    command="${current[$name]}" path="${cwd[$name]}" activity="${active_at[$name]}"
+    if [[ "${is_dead[$name]}" == 1 ]]; then
       dot=$'\033[31m✕'
     elif is_shell "$command"; then
       dot=$'\033[2m○'
@@ -1047,28 +1066,28 @@ ui_render() {
       tab_slots+=("$slot") tab_dots+=("$dot") tab_labels+=("${dir:-/}") tab_selected+=("$selected")
       continue
     fi
-    label="$(printf '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}")"
-    dir="$(printf '%-*.*s' "$((width - 3))" "$((width - 3))" "${dir:-/}")"
+    printf -v label '%-*.*s' "$((width - 5))" "$((width - 5))" "${command:-?}"
+    printf -v dir '%-*.*s' "$((width - 3))" "$((width - 3))" "${dir:-/}"
     out+="$selected $slot $dot"$'\033[0m'"$selected $label"$'\033[0m\033[K\n'
     out+="$selected   "$'\033[2m'"$dir"$'\033[0m\033[K\n'
     rows+="$slot$slot"
   done
   if [[ "$layout" == top ]]; then
-    ui_tabs "$ui" "$width" "$plus"
+    ui_tabs "$width" "$plus"
     return 0
   fi
   if (( plus )); then
     out+=$'\033[K\n'" "$'\033[36m'"+ new"$'\033[0m\033[K\n'
     rows+=".+"
   fi
-  tmux set-option -t "=$ui:" @mbx_rows "$rows"
-  printf '\033[H%s\033[J' "$out"
+  map_name=@mbx_rows map="$rows"
+  frame=$'\033[H'"$out"$'\033[J'
 }
 
 # One row of tabs, " a● folder ", from the tab_* arrays of ui_render. Labels
 # shrink evenly until every tab fits, then go; the bar never wraps.
 ui_tabs() {
-  local ui="$1" width="$2" plus="$3" n="${#tab_slots[@]}" budget cap=0 used len
+  local width="$1" plus="$2" n="${#tab_slots[@]}" budget cap=0 used len
   local i label tab_width fill bar=$'\033[?7l' cols=""
   budget=$(( width - 1 - 4 * n - 3 * plus ))
   for label in "${tab_labels[@]}"; do
@@ -1096,8 +1115,8 @@ ui_tabs() {
     bar+=" "$'\033[36m'"+"$'\033[0m'" "
     cols+="+++"
   fi
-  tmux set-option -t "=$ui:" @mbx_cols "$cols"
-  printf '\033[H\033[J%s' "$bar"
+  map_name=@mbx_cols map="$cols"
+  frame=$'\033[H\033[J'"$bar"
 }
 
 ui_sidebar() {
@@ -1112,12 +1131,23 @@ ui_sidebar() {
   done
 }
 
+# Looks every MBX_UI_REFRESH seconds (1) with one tmux call and draws only
+# what changed: a slot started or stopped, a program or folder, a dot, the
+# view, the width. A tap or a setting (USR1) wakes it at once and draws anew.
 ui_draw() {
-  local ui="$1"
-  trap ':' USR1
+  local ui="$1" state frame="" last="" map_name="" map="" last_map=""
+  trap 'last=' USR1
   tmux set-option -p -t "${TMUX_PANE:-}" @mbx_pid "$BASHPID" 2>/dev/null || true
-  while tmux has-session -t "=$ui" 2>/dev/null; do
-    ui_render "$ui"
+  while state="$(ui_state "$ui" 2>/dev/null)"; do
+    ui_render "$ui" "$state"
+    if [[ "$map_name:$map" != "$last_map" ]]; then
+      tmux set-option -t "=$ui:" "$map_name" "$map"
+      last_map="$map_name:$map"
+    fi
+    if [[ "$frame" != "$last" ]]; then
+      printf '%s' "$frame"
+      last="$frame"
+    fi
     sleep "${MBX_UI_REFRESH:-1}" &
     wait $! 2>/dev/null || kill $! 2>/dev/null || true
   done
